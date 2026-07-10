@@ -70,9 +70,20 @@ research/            # product research + requirements + ADR
 scripts/             # model download helper
 ```
 
+## Polish (smart cleanup)
+
+After STT, **smart** mode (default) runs offline rules:
+
+- Filler removal (`um`, `uh`, `you know`, …)
+- Spoken punctuation (`question mark` → `?`)
+- Backtrack (`scratch that`, `2 actually 3`)
+- Capitalization + trailing period
+
+Switch to **verbatim** in the UI for raw Whisper output. Raw + polished text both appear in the window after each dictation.
+
 ## What’s next
 
-- [ ] Deterministic polish (fillers, punctuation, backtrack)
+- [x] Deterministic polish (fillers, punctuation, backtrack)
 - [ ] llama.cpp Command Mode / optional rewrite
 - [ ] Push-to-talk hold (not only toggle)
 - [ ] Linux Wayland hotkey/paste hardening

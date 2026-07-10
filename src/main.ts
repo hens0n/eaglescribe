@@ -2,12 +2,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 type DictationStatus = "idle" | "recording" | "transcribing" | "error";
+type PolishMode = "smart" | "verbatim";
 
 interface StatusSnapshot {
   status: DictationStatus;
   model_path: string;
   model_loaded: boolean;
+  polish_mode: PolishMode;
   last_transcript: string | null;
+  last_raw_transcript: string | null;
   last_error: string | null;
   log: string[];
 }
@@ -15,14 +18,19 @@ interface StatusSnapshot {
 const els = {
   badge: () => document.querySelector("#status-badge") as HTMLElement,
   modelLoaded: () => document.querySelector("#model-loaded") as HTMLElement,
+  polishMode: () => document.querySelector("#polish-mode") as HTMLElement,
   modelPath: () => document.querySelector("#model-path") as HTMLInputElement,
   transcript: () => document.querySelector("#transcript") as HTMLElement,
+  transcriptRaw: () => document.querySelector("#transcript-raw") as HTMLElement,
   log: () => document.querySelector("#log") as HTMLElement,
   error: () => document.querySelector("#error") as HTMLElement,
   btnToggle: () => document.querySelector("#btn-toggle") as HTMLButtonElement,
   btnCancel: () => document.querySelector("#btn-cancel") as HTMLButtonElement,
   btnSave: () => document.querySelector("#btn-save-path") as HTMLButtonElement,
   btnLoad: () => document.querySelector("#btn-load") as HTMLButtonElement,
+  polishSmart: () => document.querySelector("#polish-smart") as HTMLInputElement,
+  polishVerbatim: () =>
+    document.querySelector("#polish-verbatim") as HTMLInputElement,
 };
 
 function applyStatus(s: StatusSnapshot) {
@@ -31,9 +39,17 @@ function applyStatus(s: StatusSnapshot) {
   badge.className = `badge ${s.status}`;
 
   els.modelLoaded().textContent = s.model_loaded ? "loaded" : "not loaded";
+  els.polishMode().textContent = s.polish_mode;
   els.modelPath().value = s.model_path;
   els.transcript().textContent = s.last_transcript ?? "—";
+  els.transcriptRaw().textContent = s.last_raw_transcript ?? "—";
   els.log().textContent = s.log.join("\n");
+
+  if (s.polish_mode === "verbatim") {
+    els.polishVerbatim().checked = true;
+  } else {
+    els.polishSmart().checked = true;
+  }
 
   const err = els.error();
   if (s.last_error) {
@@ -99,6 +115,23 @@ window.addEventListener("DOMContentLoaded", async () => {
     } finally {
       els.btnLoad().disabled = false;
     }
+  });
+
+  const onPolishChange = async (mode: PolishMode) => {
+    try {
+      const s = await invoke<StatusSnapshot>("set_polish_mode", { mode });
+      applyStatus(s);
+    } catch (e) {
+      console.error(e);
+      await refresh();
+    }
+  };
+
+  els.polishSmart().addEventListener("change", () => {
+    if (els.polishSmart().checked) void onPolishChange("smart");
+  });
+  els.polishVerbatim().addEventListener("change", () => {
+    if (els.polishVerbatim().checked) void onPolishChange("verbatim");
   });
 
   await listen<StatusSnapshot>("dictation-status", (event) => {

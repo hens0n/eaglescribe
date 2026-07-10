@@ -25,6 +25,7 @@ hound = "3.5"
 arboard = "3"
 enigo = "0.3"
 dirs = "6"
+regex = "1"
 # Local speech-to-text via whisper.cpp. Enable Metal with --features metal on macOS.
 whisper-rs = { version = "0.14", default-features = true }
 

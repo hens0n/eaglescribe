@@ -1,10 +1,12 @@
 mod audio;
 mod error;
 mod inject;
+mod polish;
 mod state;
 mod stt;
 
 use error::{AppError, AppResult};
+use polish::PolishMode;
 use state::{AppState, SharedState, StatusSnapshot};
 use stt::resolve_model_path;
 use std::sync::Arc;
@@ -25,6 +27,24 @@ fn set_model_path(path: String, state: tauri::State<'_, SharedState>) -> AppResu
         return Err(AppError::from("Model path is empty"));
     }
     state.inner().set_model_path(std::path::PathBuf::from(path));
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
+fn set_polish_mode(
+    mode: String,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    let mode = match mode.to_lowercase().as_str() {
+        "smart" => PolishMode::Smart,
+        "verbatim" => PolishMode::Verbatim,
+        other => {
+            return Err(AppError::from(format!(
+                "Unknown polish mode '{other}' (use smart or verbatim)"
+            )))
+        }
+    };
+    state.inner().set_polish_mode(mode);
     Ok(state.inner().snapshot())
 }
 
@@ -88,6 +108,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             set_model_path,
+            set_polish_mode,
             load_model,
             toggle_dictation,
             cancel_dictation,
@@ -98,19 +119,23 @@ pub fn run() {
 
             let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
 
-            app.global_shortcut().on_shortcut(shortcut, move |_app, _sc, event| {
-                if event.state != ShortcutState::Pressed {
-                    return;
-                }
-                if let Err(e) = toggle_dictation_inner(&handle, &state) {
-                    state.push_log(format!("Hotkey error: {e}"));
-                    let _ = handle.emit("dictation-status", state.snapshot());
-                }
-            })?;
+            app.global_shortcut()
+                .on_shortcut(shortcut, move |_app, _sc, event| {
+                    if event.state != ShortcutState::Pressed {
+                        return;
+                    }
+                    if let Err(e) = toggle_dictation_inner(&handle, &state) {
+                        state.push_log(format!("Hotkey error: {e}"));
+                        let _ = handle.emit("dictation-status", state.snapshot());
+                    }
+                })?;
 
             let state = app.state::<SharedState>().inner();
-            state.push_log(format!("Global hotkey registered: {DEFAULT_HOTKEY_LABEL}"));
+            state.push_log(format!(
+                "Global hotkey registered: {DEFAULT_HOTKEY_LABEL}"
+            ));
             state.push_log(format!("Model path: {}", state.snapshot().model_path));
+            state.push_log("Polish: smart (toggle in UI for verbatim)");
 
             Ok(())
         })

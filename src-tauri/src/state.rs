@@ -1,5 +1,6 @@
 use crate::audio::RecordingSession;
 use crate::error::{AppError, AppResult};
+use crate::polish::{self, PolishMode};
 use crate::stt::WhisperEngine;
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -24,7 +25,9 @@ struct InnerState {
     model_path: PathBuf,
     engine: Option<WhisperEngine>,
     session: Option<RecordingSession>,
+    polish_mode: PolishMode,
     last_transcript: Option<String>,
+    last_raw_transcript: Option<String>,
     last_error: Option<String>,
     log: Vec<String>,
 }
@@ -37,9 +40,11 @@ impl AppState {
                 model_path,
                 engine: None,
                 session: None,
+                polish_mode: PolishMode::Smart,
                 last_transcript: None,
+                last_raw_transcript: None,
                 last_error: None,
-                log: vec!["TalonType spike ready.".into()],
+                log: vec!["TalonType ready.".into()],
             }),
         }
     }
@@ -50,7 +55,9 @@ impl AppState {
             status: g.status,
             model_path: g.model_path.display().to_string(),
             model_loaded: g.engine.is_some(),
+            polish_mode: g.polish_mode,
             last_transcript: g.last_transcript.clone(),
+            last_raw_transcript: g.last_raw_transcript.clone(),
             last_error: g.last_error.clone(),
             log: g.log.clone(),
         }
@@ -71,7 +78,14 @@ impl AppState {
         let mut g = self.inner.lock();
         g.model_path = path;
         g.engine = None;
-        g.log.push("Model path updated; will reload on next dictation.".into());
+        g.log
+            .push("Model path updated; will reload on next dictation.".into());
+    }
+
+    pub fn set_polish_mode(&self, mode: PolishMode) {
+        let mut g = self.inner.lock();
+        g.polish_mode = mode;
+        g.log.push(format!("Polish mode: {mode:?}"));
     }
 
     pub fn ensure_engine(&self) -> AppResult<()> {
@@ -105,13 +119,12 @@ impl AppState {
         g.session = Some(session);
         g.status = DictationStatus::Recording;
         g.last_error = None;
-        g.log.push("Recording… (toggle hotkey again to stop)".into());
+        g.log
+            .push("Recording… (toggle hotkey again to stop)".into());
         Ok(())
     }
 
-    /// Stop mic, transcribe, inject. Returns transcript text.
-    ///
-    /// `app` is required so paste runs on the main thread (macOS requirement).
+    /// Stop mic, transcribe, polish, inject. Returns polished (or raw) text.
     pub fn stop_and_transcribe<R: Runtime>(&self, app: &AppHandle<R>) -> AppResult<String> {
         let session = {
             let mut g = self.inner.lock();
@@ -123,7 +136,6 @@ impl AppState {
                 .ok_or_else(|| AppError::from("Missing recording session"))?
         };
 
-        // Ensure model is loaded before stopping feels "stuck"
         if let Err(e) = self.ensure_engine() {
             let mut g = self.inner.lock();
             g.status = DictationStatus::Error;
@@ -154,9 +166,7 @@ impl AppState {
             audio.len()
         ));
 
-        // Clone audio path result without holding the lock during heavy STT.
-        // Take a temporary reference under the lock only for the call.
-        let text = {
+        let raw = {
             let g = self.inner.lock();
             let engine = g
                 .engine
@@ -165,7 +175,7 @@ impl AppState {
             engine.transcribe_16k_mono(&audio)
         };
 
-        let text = match text {
+        let raw = match raw {
             Ok(t) => t,
             Err(e) => {
                 let mut g = self.inner.lock();
@@ -175,7 +185,7 @@ impl AppState {
             }
         };
 
-        if text.is_empty() {
+        if raw.trim().is_empty() {
             let mut g = self.inner.lock();
             g.status = DictationStatus::Idle;
             g.last_error = Some("Empty transcript (try speaking longer)".into());
@@ -183,10 +193,31 @@ impl AppState {
             return Err(AppError::from("Empty transcript"));
         }
 
-        // Paste must run on the main thread on macOS (see inject.rs).
+        let mode = self.inner.lock().polish_mode;
+        let polished = polish::polish(&raw, mode);
+        if polished.changed {
+            self.push_log(format!(
+                "Polished: {} → {}",
+                truncate(&polished.raw, 40),
+                truncate(&polished.polished, 40)
+            ));
+        } else {
+            self.push_log("Polish: no changes (or verbatim mode)");
+        }
+
+        let text = polished.polished.clone();
+        if text.is_empty() {
+            let mut g = self.inner.lock();
+            g.status = DictationStatus::Idle;
+            g.last_raw_transcript = Some(polished.raw);
+            g.last_error = Some("Transcript empty after polish".into());
+            return Err(AppError::from("Transcript empty after polish"));
+        }
+
         match crate::inject::inject_text(app, &text) {
             Ok(result) => {
                 let mut g = self.inner.lock();
+                g.last_raw_transcript = Some(polished.raw);
                 g.last_transcript = Some(result.text.clone());
                 g.status = DictationStatus::Idle;
                 if result.pasted {
@@ -201,9 +232,9 @@ impl AppState {
                 Ok(result.text)
             }
             Err(e) => {
-                // Last resort: still try clipboard so the user doesn't lose text.
                 let _ = crate::inject::copy_to_clipboard(&text);
                 let mut g = self.inner.lock();
+                g.last_raw_transcript = Some(polished.raw);
                 g.last_transcript = Some(text.clone());
                 g.status = DictationStatus::Idle;
                 g.last_error = Some(e.to_string());
@@ -231,7 +262,9 @@ pub struct StatusSnapshot {
     pub status: DictationStatus,
     pub model_path: String,
     pub model_loaded: bool,
+    pub polish_mode: PolishMode,
     pub last_transcript: Option<String>,
+    pub last_raw_transcript: Option<String>,
     pub last_error: Option<String>,
     pub log: Vec<String>,
 }

@@ -29,6 +29,10 @@
           <span class="label">Model</span>
           <span id="model-loaded" class="muted">not loaded</span>
         </div>
+        <div class="status-row">
+          <span class="label">Polish</span>
+          <span id="polish-mode" class="muted">smart</span>
+        </div>
       </section>
 
       <section class="card">
@@ -49,6 +53,22 @@
         </p>
       </section>
 
+      <section class="card">
+        <span class="label">Cleanup</span>
+        <div class="row polish-row">
+          <label class="check-label">
+            <input id="polish-smart" type="radio" name="polish" value="smart" checked />
+            Smart
+            <span class="hint-inline">fillers · punctuation · backtrack</span>
+          </label>
+          <label class="check-label">
+            <input id="polish-verbatim" type="radio" name="polish" value="verbatim" />
+            Verbatim
+            <span class="hint-inline">raw STT only</span>
+          </label>
+        </div>
+      </section>
+
       <section class="card actions">
         <button id="btn-toggle" type="button" class="primary">
           Start / stop dictation
@@ -59,6 +79,8 @@
       <section class="card">
         <span class="label">Last transcript</span>
         <p id="transcript" class="transcript">—</p>
+        <span class="label raw-label">Raw (before polish)</span>
+        <p id="transcript-raw" class="transcript raw">—</p>
       </section>
 
       <section class="card">

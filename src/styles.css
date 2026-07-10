@@ -228,3 +228,37 @@ kbd {
   color: var(--danger);
   font-size: 0.85rem;
 }
+
+.polish-row {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.55rem;
+}
+
+.check-label {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.check-label input {
+  accent-color: var(--accent);
+}
+
+.hint-inline {
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 400;
+}
+
+.raw-label {
+  margin-top: 0.5rem;
+}
+
+.transcript.raw {
+  color: var(--muted);
+  font-size: 0.9rem;
+  min-height: 1.5rem;
+}
