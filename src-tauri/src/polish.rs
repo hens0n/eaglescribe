@@ -1,12 +1,12 @@
 //! Deterministic post-STT polish (offline, no LLM).
 //!
 //! Pipeline when enabled:
-//! 1. Normalize whitespace
-//! 2. Spoken punctuation commands → symbols
-//! 3. Backtrack / self-corrections
-//! 4. Filler-word removal
-//! 5. Capitalize sentence starts + trailing period when appropriate
-//! 6. Collapse whitespace again
+//! 1. Filler-word removal
+//! 2. Backtrack / self-corrections
+//! 3. Spoken punctuation commands → symbols
+//! 4. List detection/formatting (`one… two…`, `first… second…`, digits)
+//! 5. Capitalize sentence / list-item starts
+//! 6. Trailing punctuation cleanup (preserve multi-line lists)
 //!
 //! When disabled (verbatim), only light whitespace normalization is applied.
 
@@ -58,16 +58,18 @@ fn smart_polish(input: &str) -> String {
     // 1) Fillers/backtrack while correction cues are still words.
     // 2) Spoken punctuation after backtrack so a leftover "question mark"
     //    in the suffix (when "three question mark" was split) still converts.
-    // 3) Capitalize / terminal punct last.
+    // 3) List formatting (needs markers still as words or digits).
+    // 4) Capitalize / terminal punct last — preserve newlines for lists.
     text = remove_fillers(&text);
     text = apply_backtrack(&text);
     text = apply_spoken_punctuation(&text);
     // Second pass: STT sometimes leaves "question mark" after other rewrites.
     text = apply_spoken_punctuation(&text);
+    text = format_lists(&text);
     text = capitalize_sentences(&text);
     text = ensure_terminal_punctuation(&text);
     text = cleanup_double_terminal_punct(&text);
-    normalize_whitespace(&text)
+    normalize_whitespace_preserve_newlines(&text)
 }
 
 fn normalize_whitespace(s: &str) -> String {
@@ -372,6 +374,10 @@ fn ensure_terminal_punctuation(input: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
+    // Numbered / bulleted multi-line lists: leave as-is (no trailing period on the block).
+    if looks_like_formatted_list(trimmed) {
+        return trimmed.to_string();
+    }
     let last_char = trimmed.chars().last().unwrap_or(' ');
     if matches!(last_char, '.' | '!' | '?' | '…' | ':' | '"' | '\'' | ')') {
         return trimmed.to_string();
@@ -380,6 +386,203 @@ fn ensure_terminal_punctuation(input: &str) -> String {
         return trimmed.to_string();
     }
     format!("{trimmed}.")
+}
+
+fn looks_like_formatted_list(s: &str) -> bool {
+    let lines: Vec<&str> = s
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() < 2 {
+        return false;
+    }
+    let item_re = list_item_line_re();
+    let item_lines = lines.iter().filter(|l| item_re.is_match(l)).count();
+    item_lines >= 2
+}
+
+fn list_item_line_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(?:\d+\.|[-*•])\s+\S").expect("regex"))
+}
+
+// ---------------------------------------------------------------------------
+// List detection & formatting
+// ---------------------------------------------------------------------------
+
+/// Spoken / typed markers that open a numbered list item.
+const CARDINAL_MARKERS: &[&str] = &[
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+];
+const ORDINAL_MARKERS: &[&str] = &[
+    "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
+    "ninth", "tenth",
+];
+/// Bullet-style spoken cues → `-` list (not numbered).
+const BULLET_MARKERS: &[&str] = &["bullet", "dash", "asterisk", "next item", "next bullet"];
+
+/// Detect spoken lists and rewrite as numbered or bulleted multi-line text.
+///
+/// Examples:
+/// - `goals are one finish the report two send the deck`
+///   → intro + `1. Finish the report` / `2. Send the deck`
+/// - `first open the app second log in`
+/// - `buy milk 1 eggs 2 bread` (digit markers)
+/// - `bullet milk bullet eggs` → `- Milk` / `- Eggs`
+///
+/// Requires **at least two** items. Single uses of "one" / "first" stay prose.
+fn format_lists(input: &str) -> String {
+    if input.trim().is_empty() {
+        return input.to_string();
+    }
+    // Prefer longer multi-word bullet markers, then ordinals, then cardinals, then digits.
+    if let Some(out) = try_format_with_word_markers(input, BULLET_MARKERS, ListStyle::Bullet) {
+        return out;
+    }
+    if let Some(out) = try_format_with_word_markers(input, ORDINAL_MARKERS, ListStyle::Numbered) {
+        return out;
+    }
+    if let Some(out) = try_format_with_word_markers(input, CARDINAL_MARKERS, ListStyle::Numbered) {
+        return out;
+    }
+    if let Some(out) = try_format_digit_markers(input) {
+        return out;
+    }
+    input.to_string()
+}
+
+#[derive(Clone, Copy)]
+enum ListStyle {
+    Numbered,
+    Bullet,
+}
+
+fn try_format_with_word_markers(
+    input: &str,
+    markers: &[&str],
+    style: ListStyle,
+) -> Option<String> {
+    // Longest first so "next item" wins over bare words if both were present.
+    let mut sorted: Vec<&str> = markers.to_vec();
+    sorted.sort_by_key(|m| std::cmp::Reverse(m.len()));
+    let alt = sorted
+        .iter()
+        .map(|m| regex::escape(m))
+        .collect::<Vec<_>>()
+        .join("|");
+    let re = Regex::new(&format!(r"(?i)\b(?:{alt})\b")).ok()?;
+    let hits: Vec<_> = re.find_iter(input).collect();
+    if hits.len() < 2 {
+        return None;
+    }
+    build_list_from_hits(input, &hits, style)
+}
+
+fn try_format_digit_markers(input: &str) -> Option<String> {
+    // Standalone 1–20 as list markers (avoid years like 2024 by limiting length).
+    let re = digit_list_marker_re();
+    let hits: Vec<_> = re.find_iter(input).collect();
+    if hits.len() < 2 {
+        return None;
+    }
+    // Prefer ascending or restart-from-1 sequences; still accept appearance order.
+    build_list_from_hits(input, &hits, ListStyle::Numbered)
+}
+
+fn digit_list_marker_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // Word-boundary digits 1–20 only.
+    RE.get_or_init(|| Regex::new(r"\b(?:[1-9]|1[0-9]|20)\b").expect("regex"))
+}
+
+fn build_list_from_hits(
+    input: &str,
+    hits: &[regex::Match<'_>],
+    style: ListStyle,
+) -> Option<String> {
+    let mut items: Vec<String> = Vec::new();
+    for (i, m) in hits.iter().enumerate() {
+        let start = m.end();
+        let end = if i + 1 < hits.len() {
+            hits[i + 1].start()
+        } else {
+            input.len()
+        };
+        let raw_item = input.get(start..end).unwrap_or("").trim();
+        let item = clean_list_item(raw_item);
+        if !item.is_empty() {
+            items.push(capitalize_item(&item));
+        }
+    }
+    if items.len() < 2 {
+        return None;
+    }
+
+    let mut prefix = input.get(..hits[0].start()).unwrap_or("").trim().to_string();
+    // Drop trailing glue words/punct before the list.
+    prefix = trim_list_prefix(&prefix);
+
+    let mut out = String::new();
+    if !prefix.is_empty() {
+        out.push_str(prefix.trim_end_matches(':'));
+        out.push_str(":\n");
+    }
+    for (i, item) in items.iter().enumerate() {
+        match style {
+            ListStyle::Numbered => {
+                out.push_str(&format!("{}. {}\n", i + 1, item));
+            }
+            ListStyle::Bullet => {
+                out.push_str(&format!("- {}\n", item));
+            }
+        }
+    }
+    Some(out.trim_end().to_string())
+}
+
+fn clean_list_item(s: &str) -> String {
+    s.trim()
+        .trim_matches(|c: char| matches!(c, ',' | ';' | ':' | '.' | '—' | '-'))
+        .trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn capitalize_item(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() => {
+            let mut out = c.to_uppercase().collect::<String>();
+            out.push_str(chars.as_str());
+            out
+        }
+        _ => s.to_string(),
+    }
+}
+
+fn trim_list_prefix(prefix: &str) -> String {
+    let mut p = prefix.trim().to_string();
+    // Strip trailing connectors often spoken before lists.
+    let trailers = [
+        r"(?i)\bare\s*$",
+        r"(?i)\bis\s*$",
+        r"(?i)\binclude\s*$",
+        r"(?i)\bincludes\s*$",
+        r"(?i)\bincluding\s*$",
+        r"(?i)\blike\s*$",
+        r"(?i)\bsuch as\s*$",
+        r"(?i)\bas follows\s*$",
+        r"(?i)\bthe following\s*$",
+        r"[:,\-—]\s*$",
+    ];
+    for pat in trailers {
+        let re = Regex::new(pat).expect("prefix regex");
+        p = re.replace(&p, "").into_owned();
+        p = p.trim().to_string();
+    }
+    p
 }
 
 /// Collapse accidental doubles like `?.` `!.` `..` left by mixed spoken+auto punct.
@@ -548,5 +751,92 @@ mod tests {
             PolishMode::Smart,
         );
         assert_eq!(r.polished, "Let's meet at three.");
+    }
+
+    #[test]
+    fn formats_cardinal_list() {
+        let r = polish(
+            "my top goals this week are one finish the report two send the presentation",
+            PolishMode::Smart,
+        );
+        assert!(
+            r.polished.contains("1. Finish the report"),
+            "got: {}",
+            r.polished
+        );
+        assert!(
+            r.polished.contains("2. Send the presentation"),
+            "got: {}",
+            r.polished
+        );
+        assert!(
+            r.polished.contains('\n'),
+            "list should be multi-line, got: {}",
+            r.polished
+        );
+        assert!(
+            r.polished.to_lowercase().contains("goals"),
+            "keep intro, got: {}",
+            r.polished
+        );
+    }
+
+    #[test]
+    fn formats_ordinal_list() {
+        let r = polish(
+            "steps first open the app second log in third create a project",
+            PolishMode::Smart,
+        );
+        assert!(r.polished.contains("1. Open the app"), "got: {}", r.polished);
+        assert!(r.polished.contains("2. Log in"), "got: {}", r.polished);
+        assert!(
+            r.polished.contains("3. Create a project"),
+            "got: {}",
+            r.polished
+        );
+    }
+
+    #[test]
+    fn formats_digit_list() {
+        let r = polish(
+            "shopping list 1 milk 2 eggs 3 bread",
+            PolishMode::Smart,
+        );
+        assert!(r.polished.contains("1. Milk"), "got: {}", r.polished);
+        assert!(r.polished.contains("2. Eggs"), "got: {}", r.polished);
+        assert!(r.polished.contains("3. Bread"), "got: {}", r.polished);
+    }
+
+    #[test]
+    fn formats_bullet_list() {
+        let r = polish("bullet milk bullet eggs", PolishMode::Smart);
+        assert!(r.polished.contains("- Milk"), "got: {}", r.polished);
+        assert!(r.polished.contains("- Eggs"), "got: {}", r.polished);
+    }
+
+    #[test]
+    fn single_number_word_is_not_a_list() {
+        let r = polish("I only need one thing from the store", PolishMode::Smart);
+        assert!(
+            !r.polished.contains("1."),
+            "should not listify single marker: {}",
+            r.polished
+        );
+    }
+
+    #[test]
+    fn time_correction_is_not_a_list() {
+        // Regression: "two actually three" must not become a two-item list.
+        let r = polish("meet at two actually three", PolishMode::Smart);
+        assert!(
+            !r.polished.contains("1."),
+            "got: {}",
+            r.polished
+        );
+        assert!(
+            r.polished.to_lowercase().contains("three"),
+            "got: {}",
+            r.polished
+        );
     }
 }
