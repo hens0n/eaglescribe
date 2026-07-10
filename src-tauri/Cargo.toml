@@ -1,0 +1,45 @@
+[package]
+name = "talontype"
+version = "0.1.0"
+description = "Local voice dictation for macOS and Linux"
+authors = ["TalonType"]
+edition = "2021"
+
+[lib]
+name = "talontype_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+parking_lot = "0.12"
+cpal = "0.15"
+hound = "3.5"
+arboard = "3"
+enigo = "0.3"
+dirs = "6"
+# Local speech-to-text via whisper.cpp. Enable Metal with --features metal on macOS.
+whisper-rs = { version = "0.14", default-features = true }
+
+[features]
+default = []
+# Apple Silicon / macOS GPU acceleration for whisper.cpp
+metal = ["whisper-rs/metal"]
+# NVIDIA (Linux) — requires CUDA toolkit when building
+cuda = ["whisper-rs/cuda"]
+# Portable GPU path (Linux)
+vulkan = ["whisper-rs/vulkan"]
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = true
+codegen-units = 1

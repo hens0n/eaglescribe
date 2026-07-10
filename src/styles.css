@@ -1,0 +1,230 @@
+:root {
+  font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+  color: #e8e6e1;
+  background: #12141a;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+
+  --bg: #12141a;
+  --card: #1a1d27;
+  --border: #2a2f3d;
+  --muted: #9aa3b5;
+  --accent: #6ee7b7;
+  --accent-dim: #2d6a55;
+  --danger: #f87171;
+  --idle: #64748b;
+  --recording: #fbbf24;
+  --transcribing: #60a5fa;
+  --error: #f87171;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(ellipse 80% 50% at 20% -10%, #1e3a2f55, transparent),
+    var(--bg);
+}
+
+.container {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 1.75rem 1.25rem 2.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 1.75rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.tagline {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1rem 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-weight: 600;
+  min-width: 4.5rem;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.badge.idle {
+  background: color-mix(in srgb, var(--idle) 25%, transparent);
+  color: #cbd5e1;
+}
+.badge.recording {
+  background: color-mix(in srgb, var(--recording) 25%, transparent);
+  color: var(--recording);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+.badge.transcribing {
+  background: color-mix(in srgb, var(--transcribing) 25%, transparent);
+  color: var(--transcribing);
+}
+.badge.error {
+  background: color-mix(in srgb, var(--error) 25%, transparent);
+  color: var(--error);
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.65;
+  }
+}
+
+.row {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+input[type="text"] {
+  flex: 1 1 200px;
+  min-width: 0;
+  background: #0e1016;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: inherit;
+  padding: 0.55rem 0.7rem;
+  font: inherit;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.85rem;
+}
+
+input:focus {
+  outline: 2px solid var(--accent-dim);
+  border-color: var(--accent);
+}
+
+button {
+  font: inherit;
+  font-weight: 600;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #252a38;
+  color: inherit;
+  padding: 0.55rem 0.9rem;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #2e3548;
+}
+
+button.primary {
+  background: var(--accent-dim);
+  border-color: #3d8f72;
+  color: #ecfdf5;
+}
+
+button.primary:hover {
+  background: #357a62;
+}
+
+button.secondary {
+  background: transparent;
+}
+
+.actions {
+  flex-direction: row;
+  flex-wrap: wrap;
+}
+
+.hint {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.hint code,
+code {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.8em;
+  background: #0e1016;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+kbd {
+  font-family: inherit;
+  font-size: 0.8rem;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  padding: 0.1rem 0.4rem;
+  background: #0e1016;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.transcript {
+  margin: 0;
+  min-height: 2.5rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 1rem;
+}
+
+.log {
+  margin: 0;
+  max-height: 180px;
+  overflow: auto;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 0.85rem;
+}

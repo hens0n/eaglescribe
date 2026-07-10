@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TalonType</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <main class="container">
+      <header class="header">
+        <h1>TalonType</h1>
+        <p class="tagline">Local voice dictation · offline by default</p>
+      </header>
+
+      <section class="card status-card">
+        <div class="status-row">
+          <span class="label">Status</span>
+          <span id="status-badge" class="badge idle">idle</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Hotkey</span>
+          <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd>
+          <span class="hint">toggle listen</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Model</span>
+          <span id="model-loaded" class="muted">not loaded</span>
+        </div>
+      </section>
+
+      <section class="card">
+        <label class="label" for="model-path">Whisper model path (ggml)</label>
+        <div class="row">
+          <input
+            id="model-path"
+            type="text"
+            spellcheck="false"
+            placeholder="/path/to/ggml-base.en.bin"
+          />
+          <button id="btn-save-path" type="button">Save</button>
+          <button id="btn-load" type="button" class="secondary">Load</button>
+        </div>
+        <p class="hint">
+          Or set <code>TALONTYPE_WHISPER_MODEL</code>. Default:
+          <code>models/ggml-base.en.bin</code>
+        </p>
+      </section>
+
+      <section class="card actions">
+        <button id="btn-toggle" type="button" class="primary">
+          Start / stop dictation
+        </button>
+        <button id="btn-cancel" type="button" class="secondary">Cancel</button>
+      </section>
+
+      <section class="card">
+        <span class="label">Last transcript</span>
+        <p id="transcript" class="transcript">—</p>
+      </section>
+
+      <section class="card">
+        <span class="label">Log</span>
+        <pre id="log" class="log"></pre>
+        <p id="error" class="error" hidden></p>
+      </section>
+    </main>
+  </body>
+</html>
