@@ -3,19 +3,21 @@ mod dictionary;
 mod error;
 mod inject;
 mod polish;
+mod settings;
 mod snippets;
 mod state;
 mod stt;
 
 use error::{AppError, AppResult};
 use polish::PolishMode;
+use settings::HotkeyMode;
 use state::{AppState, SharedState, StatusSnapshot};
 use stt::resolve_model_path;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
-const DEFAULT_HOTKEY_LABEL: &str = "Ctrl+Shift+Space (hold)";
+const DEFAULT_HOTKEY_COMBO: &str = "Ctrl+Shift+Space";
 
 #[tauri::command]
 fn get_status(state: tauri::State<'_, SharedState>) -> StatusSnapshot {
@@ -47,6 +49,16 @@ fn set_polish_mode(
         }
     };
     state.inner().set_polish_mode(mode);
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
+fn set_hotkey_mode(
+    mode: String,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    let mode = HotkeyMode::parse(&mode)?;
+    state.inner().set_hotkey_mode(mode)?;
     Ok(state.inner().snapshot())
 }
 
@@ -166,9 +178,16 @@ fn toggle_dictation_inner(app: &AppHandle, state: &SharedState) -> AppResult<()>
 }
 
 fn handle_hotkey(app: &AppHandle, state: &SharedState, key_state: ShortcutState) {
-    let result = match key_state {
-        ShortcutState::Pressed => start_dictation(app, state),
-        ShortcutState::Released => stop_dictation(app, state),
+    let result = match state.hotkey_mode() {
+        HotkeyMode::Hold => match key_state {
+            ShortcutState::Pressed => start_dictation(app, state),
+            ShortcutState::Released => stop_dictation(app, state),
+        },
+        HotkeyMode::Toggle => match key_state {
+            // Only act on press — ignore release so it behaves like the old toggle.
+            ShortcutState::Pressed => toggle_dictation_inner(app, state),
+            ShortcutState::Released => Ok(()),
+        },
     };
     if let Err(e) = result {
         state.push_log(format!("Hotkey error: {e}"));
@@ -189,6 +208,7 @@ pub fn run() {
             get_status,
             set_model_path,
             set_polish_mode,
+            set_hotkey_mode,
             dictionary_add,
             dictionary_remove,
             snippet_add,
@@ -209,11 +229,13 @@ pub fn run() {
                 })?;
 
             let state = app.state::<SharedState>().inner();
+            let mode = state.hotkey_mode();
             state.push_log(format!(
-                "Global hotkey registered: {DEFAULT_HOTKEY_LABEL}"
+                "Global hotkey registered: {DEFAULT_HOTKEY_COMBO} ({})",
+                mode.as_str()
             ));
-            state.push_log("Hold hotkey to talk; release to transcribe.");
-            state.push_log("UI button still toggles listen without holding.");
+            state.push_log(format!("Hotkey: {}", mode.label()));
+            state.push_log("Change hold vs toggle in the UI; choice is saved.");
             state.push_log(format!("Model path: {}", state.snapshot().model_path));
             state.push_log("Polish: smart (toggle in UI for verbatim)");
 

@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 
 type DictationStatus = "idle" | "recording" | "transcribing" | "error";
 type PolishMode = "smart" | "verbatim";
+type HotkeyMode = "hold" | "toggle";
 
 interface DictEntry {
   from: string;
@@ -19,6 +20,7 @@ interface StatusSnapshot {
   model_path: string;
   model_loaded: boolean;
   polish_mode: PolishMode;
+  hotkey_mode: HotkeyMode;
   dictionary_path: string;
   dictionary: DictEntry[];
   snippets_path: string;
@@ -29,10 +31,19 @@ interface StatusSnapshot {
   log: string[];
 }
 
+const HOTKEY_HINTS: Record<HotkeyMode, string> = {
+  hold: "hold to talk · release to paste",
+  toggle: "press to start · press again to paste",
+};
+
 const els = {
   badge: () => document.querySelector("#status-badge") as HTMLElement,
   modelLoaded: () => document.querySelector("#model-loaded") as HTMLElement,
   polishMode: () => document.querySelector("#polish-mode") as HTMLElement,
+  hotkeyMode: () => document.querySelector("#hotkey-mode") as HTMLElement,
+  hotkeyHint: () => document.querySelector("#hotkey-hint") as HTMLElement,
+  hotkeyHold: () => document.querySelector("#hotkey-hold") as HTMLInputElement,
+  hotkeyToggle: () => document.querySelector("#hotkey-toggle") as HTMLInputElement,
   modelPath: () => document.querySelector("#model-path") as HTMLInputElement,
   transcript: () => document.querySelector("#transcript") as HTMLElement,
   transcriptRaw: () => document.querySelector("#transcript-raw") as HTMLElement,
@@ -159,6 +170,9 @@ function applyStatus(s: StatusSnapshot) {
 
   els.modelLoaded().textContent = s.model_loaded ? "loaded" : "not loaded";
   els.polishMode().textContent = s.polish_mode;
+  const hotkeyMode = s.hotkey_mode ?? "hold";
+  els.hotkeyMode().textContent = hotkeyMode;
+  els.hotkeyHint().textContent = HOTKEY_HINTS[hotkeyMode] ?? HOTKEY_HINTS.hold;
   els.modelPath().value = s.model_path;
   els.transcript().textContent = s.last_transcript ?? "—";
   els.transcriptRaw().textContent = s.last_raw_transcript ?? "—";
@@ -170,6 +184,12 @@ function applyStatus(s: StatusSnapshot) {
     els.polishVerbatim().checked = true;
   } else {
     els.polishSmart().checked = true;
+  }
+
+  if (hotkeyMode === "toggle") {
+    els.hotkeyToggle().checked = true;
+  } else {
+    els.hotkeyHold().checked = true;
   }
 
   const err = els.error();
@@ -255,6 +275,23 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   els.polishVerbatim().addEventListener("change", () => {
     if (els.polishVerbatim().checked) void onPolishChange("verbatim");
+  });
+
+  const onHotkeyModeChange = async (mode: HotkeyMode) => {
+    try {
+      const s = await invoke<StatusSnapshot>("set_hotkey_mode", { mode });
+      applyStatus(s);
+    } catch (e) {
+      console.error(e);
+      await refresh();
+    }
+  };
+
+  els.hotkeyHold().addEventListener("change", () => {
+    if (els.hotkeyHold().checked) void onHotkeyModeChange("hold");
+  });
+  els.hotkeyToggle().addEventListener("change", () => {
+    if (els.hotkeyToggle().checked) void onHotkeyModeChange("toggle");
   });
 
   const addDict = async () => {

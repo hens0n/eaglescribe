@@ -12,7 +12,7 @@ Research and requirements live under [`research/`](./research/).
 | Shell | Tauri 2 |
 | STT | whisper.cpp (`whisper-rs`) |
 | LLM polish | *not in spike* — llama.cpp next |
-| Hotkey | `Ctrl+Shift+Space` (**hold** to talk; release to paste) |
+| Hotkey | `Ctrl+Shift+Space` — **hold** or **toggle** (choose in UI) |
 
 See [research/stack-decision.md](./research/stack-decision.md).
 
@@ -54,9 +54,9 @@ npm run desktop
 ## Using the spike
 
 1. Click **Load** (or the first release will load the model).
-2. Focus a text field in another app.
-3. **Hold** **Ctrl+Shift+Space**, speak, then **release** → on-device transcription → clipboard + paste.
-4. Or use the in-app button to **toggle** listen without holding a key.
+2. Choose **Hold to talk** or **Toggle** under Dictation hotkey (saved locally).
+3. Focus a text field in another app.
+4. Use **Ctrl+Shift+Space** according to that mode (or the UI button, which always toggles).
 
 If paste fails, the text stays on the clipboard — paste manually (`Cmd+V` / `Ctrl+V`).
 

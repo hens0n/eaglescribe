@@ -2,6 +2,7 @@ use crate::audio::RecordingSession;
 use crate::dictionary::{self, DictEntry, Dictionary};
 use crate::error::{AppError, AppResult};
 use crate::polish::{self, PolishMode};
+use crate::settings::{self, AppSettings, HotkeyMode};
 use crate::snippets::{self, Snippet, SnippetBook};
 use crate::stt::WhisperEngine;
 use parking_lot::Mutex;
@@ -25,6 +26,8 @@ pub struct AppState {
 struct InnerState {
     status: DictationStatus,
     model_path: PathBuf,
+    settings_path: PathBuf,
+    settings: AppSettings,
     dictionary_path: PathBuf,
     dictionary: Dictionary,
     snippets_path: PathBuf,
@@ -40,6 +43,9 @@ struct InnerState {
 
 impl AppState {
     pub fn new(model_path: PathBuf) -> Self {
+        let settings_path = settings::default_settings_path();
+        let settings = AppSettings::load_or_default(&settings_path);
+
         let dictionary_path = dictionary::default_dictionary_path();
         let dictionary = Dictionary::load_or_default(&dictionary_path);
         let entry_count = dictionary.entries.len();
@@ -48,10 +54,14 @@ impl AppState {
         let snippets = SnippetBook::load_or_default(&snippets_path);
         let snippet_count = snippets.snippets.len();
 
+        let hotkey_mode = settings.hotkey_mode;
+
         Self {
             inner: Mutex::new(InnerState {
                 status: DictationStatus::Idle,
                 model_path,
+                settings_path: settings_path.clone(),
+                settings,
                 dictionary_path: dictionary_path.clone(),
                 dictionary,
                 snippets_path: snippets_path.clone(),
@@ -64,6 +74,11 @@ impl AppState {
                 last_error: None,
                 log: {
                     let mut log = vec!["TalonType ready.".into()];
+                    log.push(format!(
+                        "Hotkey mode: {} ({})",
+                        hotkey_mode.as_str(),
+                        hotkey_mode.label()
+                    ));
                     log.push(format!(
                         "Dictionary: {} ({} entries)",
                         dictionary_path.display(),
@@ -87,6 +102,7 @@ impl AppState {
             model_path: g.model_path.display().to_string(),
             model_loaded: g.engine.is_some(),
             polish_mode: g.polish_mode,
+            hotkey_mode: g.settings.hotkey_mode,
             dictionary_path: g.dictionary_path.display().to_string(),
             dictionary: g.dictionary.list(),
             snippets_path: g.snippets_path.display().to_string(),
@@ -96,6 +112,10 @@ impl AppState {
             last_error: g.last_error.clone(),
             log: g.log.clone(),
         }
+    }
+
+    pub fn hotkey_mode(&self) -> HotkeyMode {
+        self.inner.lock().settings.hotkey_mode
     }
 
     pub fn push_log(&self, msg: impl Into<String>) {
@@ -121,6 +141,18 @@ impl AppState {
         let mut g = self.inner.lock();
         g.polish_mode = mode;
         g.log.push(format!("Polish mode: {mode:?}"));
+    }
+
+    pub fn set_hotkey_mode(&self, mode: HotkeyMode) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        g.settings.hotkey_mode = mode;
+        g.settings.save(&g.settings_path)?;
+        g.log.push(format!(
+            "Hotkey mode: {} ({})",
+            mode.as_str(),
+            mode.label()
+        ));
+        Ok(())
     }
 
     pub fn dictionary_add(&self, from: &str, to: &str) -> AppResult<()> {
@@ -372,6 +404,7 @@ pub struct StatusSnapshot {
     pub model_path: String,
     pub model_loaded: bool,
     pub polish_mode: PolishMode,
+    pub hotkey_mode: HotkeyMode,
     pub dictionary_path: String,
     pub dictionary: Vec<DictEntry>,
     pub snippets_path: String,

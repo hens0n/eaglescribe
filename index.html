@@ -23,7 +23,7 @@
         <div class="status-row">
           <span class="label">Hotkey</span>
           <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd>
-          <span class="hint">hold to talk · release to paste</span>
+          <span id="hotkey-hint" class="hint">hold to talk · release to paste</span>
         </div>
         <div class="status-row">
           <span class="label">Model</span>
@@ -32,6 +32,30 @@
         <div class="status-row">
           <span class="label">Polish</span>
           <span id="polish-mode" class="muted">smart</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Mode</span>
+          <span id="hotkey-mode" class="muted">hold</span>
+        </div>
+      </section>
+
+      <section class="card">
+        <span class="label">Dictation hotkey</span>
+        <p class="hint">
+          <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd> — choose how it
+          behaves. Saved locally.
+        </p>
+        <div class="row polish-row">
+          <label class="check-label">
+            <input id="hotkey-hold" type="radio" name="hotkey" value="hold" checked />
+            Hold to talk
+            <span class="hint-inline">press &amp; hold · release to paste</span>
+          </label>
+          <label class="check-label">
+            <input id="hotkey-toggle" type="radio" name="hotkey" value="toggle" />
+            Toggle
+            <span class="hint-inline">press to start · press again to paste</span>
+          </label>
         </div>
       </section>
 
@@ -133,8 +157,8 @@
         </button>
         <button id="btn-cancel" type="button" class="secondary">Cancel</button>
         <p class="hint">
-          Hotkey is <strong>hold-to-talk</strong>. This button toggles listen if
-          you prefer not to hold a key.
+          This button always <strong>toggles</strong> listen, regardless of the
+          hotkey mode above.
         </p>
       </section>
 
