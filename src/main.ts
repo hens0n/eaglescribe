@@ -185,7 +185,9 @@ function applyStatus(s: StatusSnapshot) {
   els.btnToggle().disabled = busy;
   els.btnCancel().disabled = s.status !== "recording";
   els.btnToggle().textContent =
-    s.status === "recording" ? "Stop & transcribe" : "Start / stop dictation";
+    s.status === "recording"
+      ? "Stop & transcribe (toggle)"
+      : "Start dictation (toggle)";
 }
 
 async function refresh() {

@@ -207,7 +207,7 @@ impl AppState {
         g.status = DictationStatus::Recording;
         g.last_error = None;
         g.log
-            .push("Recording… (toggle hotkey again to stop)".into());
+            .push("Recording… (release hotkey or use Stop to finish)".into());
         Ok(())
     }
 

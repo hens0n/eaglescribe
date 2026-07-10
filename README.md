@@ -12,7 +12,7 @@ Research and requirements live under [`research/`](./research/).
 | Shell | Tauri 2 |
 | STT | whisper.cpp (`whisper-rs`) |
 | LLM polish | *not in spike* — llama.cpp next |
-| Hotkey | `Ctrl+Shift+Space` (toggle) |
+| Hotkey | `Ctrl+Shift+Space` (**hold** to talk; release to paste) |
 
 See [research/stack-decision.md](./research/stack-decision.md).
 
@@ -53,10 +53,10 @@ npm run desktop
 
 ## Using the spike
 
-1. Click **Load** (or the first stop will load the model).
+1. Click **Load** (or the first release will load the model).
 2. Focus a text field in another app.
-3. Press **Ctrl+Shift+Space** (or the in-app button) → speak.
-4. Press the hotkey again → on-device transcription → clipboard + paste.
+3. **Hold** **Ctrl+Shift+Space**, speak, then **release** → on-device transcription → clipboard + paste.
+4. Or use the in-app button to **toggle** listen without holding a key.
 
 If paste fails, the text stays on the clipboard — paste manually (`Cmd+V` / `Ctrl+V`).
 
@@ -94,8 +94,8 @@ Map a short **cue** to a longer **expansion** (signatures, links, templates). If
 - [x] Deterministic polish (fillers, punctuation, backtrack)
 - [x] Personal dictionary
 - [x] Snippets
+- [x] Push-to-talk hold (UI button still toggles)
 - [ ] llama.cpp Command Mode / optional rewrite
-- [ ] Push-to-talk hold (not only toggle)
 - [ ] Linux Wayland hotkey/paste hardening
 - [ ] System tray / hide window
 

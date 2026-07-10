@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
-const DEFAULT_HOTKEY_LABEL: &str = "Ctrl+Shift+Space";
+const DEFAULT_HOTKEY_LABEL: &str = "Ctrl+Shift+Space (hold)";
 
 #[tauri::command]
 fn get_status(state: tauri::State<'_, SharedState>) -> StatusSnapshot {
@@ -94,6 +94,7 @@ fn load_model(state: tauri::State<'_, SharedState>) -> AppResult<StatusSnapshot>
     Ok(state.inner().snapshot())
 }
 
+/// UI button: toggle listen (for when you cannot hold a key).
 #[tauri::command]
 fn toggle_dictation(
     app: AppHandle,
@@ -109,7 +110,7 @@ fn cancel_dictation(state: tauri::State<'_, SharedState>) -> AppResult<StatusSna
     Ok(state.inner().snapshot())
 }
 
-fn toggle_dictation_inner(app: &AppHandle, state: &SharedState) -> AppResult<()> {
+fn start_dictation(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     let status = state.snapshot().status;
     match status {
         state::DictationStatus::Idle | state::DictationStatus::Error => {
@@ -117,6 +118,19 @@ fn toggle_dictation_inner(app: &AppHandle, state: &SharedState) -> AppResult<()>
             let _ = app.emit("dictation-status", state.snapshot());
             Ok(())
         }
+        state::DictationStatus::Recording => {
+            // Already holding / recording — ignore repeat Pressed events.
+            Ok(())
+        }
+        state::DictationStatus::Transcribing => {
+            Err(AppError::from("Already transcribing — please wait"))
+        }
+    }
+}
+
+fn stop_dictation(app: &AppHandle, state: &SharedState) -> AppResult<()> {
+    let status = state.snapshot().status;
+    match status {
         state::DictationStatus::Recording => {
             let app_bg = app.clone();
             let state_bg = Arc::clone(state);
@@ -130,9 +144,35 @@ fn toggle_dictation_inner(app: &AppHandle, state: &SharedState) -> AppResult<()>
             let _ = app.emit("dictation-status", state.snapshot());
             Ok(())
         }
+        state::DictationStatus::Idle | state::DictationStatus::Error => {
+            // Release without a prior press — ignore.
+            Ok(())
+        }
         state::DictationStatus::Transcribing => {
             Err(AppError::from("Already transcribing — please wait"))
         }
+    }
+}
+
+fn toggle_dictation_inner(app: &AppHandle, state: &SharedState) -> AppResult<()> {
+    let status = state.snapshot().status;
+    match status {
+        state::DictationStatus::Idle | state::DictationStatus::Error => start_dictation(app, state),
+        state::DictationStatus::Recording => stop_dictation(app, state),
+        state::DictationStatus::Transcribing => {
+            Err(AppError::from("Already transcribing — please wait"))
+        }
+    }
+}
+
+fn handle_hotkey(app: &AppHandle, state: &SharedState, key_state: ShortcutState) {
+    let result = match key_state {
+        ShortcutState::Pressed => start_dictation(app, state),
+        ShortcutState::Released => stop_dictation(app, state),
+    };
+    if let Err(e) = result {
+        state.push_log(format!("Hotkey error: {e}"));
+        let _ = app.emit("dictation-status", state.snapshot());
     }
 }
 
@@ -165,19 +205,15 @@ pub fn run() {
 
             app.global_shortcut()
                 .on_shortcut(shortcut, move |_app, _sc, event| {
-                    if event.state != ShortcutState::Pressed {
-                        return;
-                    }
-                    if let Err(e) = toggle_dictation_inner(&handle, &state) {
-                        state.push_log(format!("Hotkey error: {e}"));
-                        let _ = handle.emit("dictation-status", state.snapshot());
-                    }
+                    handle_hotkey(&handle, &state, event.state);
                 })?;
 
             let state = app.state::<SharedState>().inner();
             state.push_log(format!(
                 "Global hotkey registered: {DEFAULT_HOTKEY_LABEL}"
             ));
+            state.push_log("Hold hotkey to talk; release to transcribe.");
+            state.push_log("UI button still toggles listen without holding.");
             state.push_log(format!("Model path: {}", state.snapshot().model_path));
             state.push_log("Polish: smart (toggle in UI for verbatim)");
 
