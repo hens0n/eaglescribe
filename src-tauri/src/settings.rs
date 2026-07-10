@@ -1,6 +1,7 @@
-//! Lightweight local preferences (hotkey mode, etc.).
+//! Lightweight local preferences (hotkey mode, LLM endpoint, etc.).
 
 use crate::error::{AppError, AppResult};
+use crate::llm::LlmConfig;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,17 +46,43 @@ impl HotkeyMode {
 pub struct AppSettings {
     #[serde(default)]
     pub hotkey_mode: HotkeyMode,
+    /// OpenAI-compatible base URL on localhost (Ollama / llama-server).
+    #[serde(default = "default_llm_base_url")]
+    pub llm_base_url: String,
+    #[serde(default = "default_llm_model")]
+    pub llm_model: String,
+    #[serde(default)]
+    pub llm_api_key: String,
+}
+
+fn default_llm_base_url() -> String {
+    "http://127.0.0.1:11434/v1".into()
+}
+
+fn default_llm_model() -> String {
+    "llama3.2".into()
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             hotkey_mode: HotkeyMode::Hold,
+            llm_base_url: default_llm_base_url(),
+            llm_model: default_llm_model(),
+            llm_api_key: String::new(),
         }
     }
 }
 
 impl AppSettings {
+    pub fn llm_config(&self) -> LlmConfig {
+        LlmConfig {
+            base_url: self.llm_base_url.clone(),
+            model: self.llm_model.clone(),
+            api_key: self.llm_api_key.clone(),
+        }
+    }
+
     pub fn load_or_default(path: &Path) -> Self {
         match Self::load(path) {
             Ok(s) => s,

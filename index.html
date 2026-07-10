@@ -151,14 +151,48 @@
         </p>
       </section>
 
+      <section class="card">
+        <span class="label">Command Mode (local LLM)</span>
+        <p class="hint">
+          Select text → hold <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> →
+          speak an instruction (e.g. “make this more concise”). Uses a
+          local OpenAI-compatible server (Ollama / llama-server). Nothing
+          is sent to the cloud.
+        </p>
+        <div class="row">
+          <input
+            id="llm-url"
+            type="text"
+            spellcheck="false"
+            placeholder="http://127.0.0.1:11434/v1"
+          />
+        </div>
+        <div class="row">
+          <input
+            id="llm-model"
+            type="text"
+            spellcheck="false"
+            placeholder="model name (e.g. llama3.2)"
+          />
+          <button id="btn-llm-save" type="button">Save LLM</button>
+        </div>
+        <p class="hint">
+          Example: install <a href="https://ollama.com" target="_blank" rel="noreferrer">Ollama</a>,
+          run <code>ollama pull llama3.2</code>, keep Ollama running.
+        </p>
+      </section>
+
       <section class="card actions">
         <button id="btn-toggle" type="button" class="primary">
           Start / stop dictation
         </button>
+        <button id="btn-command" type="button" class="secondary">
+          Command Mode
+        </button>
         <button id="btn-cancel" type="button" class="secondary">Cancel</button>
         <p class="hint">
-          This button always <strong>toggles</strong> listen, regardless of the
-          hotkey mode above.
+          Dictation button always <strong>toggles</strong>. Command Mode button
+          toggles instruction capture (hotkey is hold).
         </p>
       </section>
 

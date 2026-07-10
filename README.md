@@ -95,9 +95,19 @@ Map a short **cue** to a longer **expansion** (signatures, links, templates). If
 - [x] Personal dictionary
 - [x] Snippets
 - [x] Push-to-talk hold (UI button still toggles)
-- [ ] llama.cpp Command Mode / optional rewrite
+- [x] Command Mode via local OpenAI-compatible LLM (Ollama / llama-server)
 - [ ] Linux Wayland hotkey/paste hardening
 - [ ] System tray / hide window
+
+## Command Mode
+
+1. Run a local LLM server (recommended: [Ollama](https://ollama.com) + `ollama pull llama3.2`).
+2. In TalonType, set base URL `http://127.0.0.1:11434/v1` and model name, click **Save LLM**.
+3. Select text in any app.
+4. Hold **Ctrl+Shift+C**, speak an instruction (e.g. “make this more professional”), release.
+5. Rewritten text is pasted (selection was copied first via Cmd/Ctrl+C).
+
+Works with any OpenAI-compatible local server (`llama-server`, LM Studio, etc.). Traffic stays on localhost.
 
 ## License
 

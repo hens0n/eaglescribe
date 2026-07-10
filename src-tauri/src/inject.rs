@@ -22,6 +22,9 @@ use tauri::{AppHandle, Runtime};
 /// `kVK_ANSI_V` — used so we never call TSM/layout APIs.
 #[cfg(target_os = "macos")]
 const KEYCODE_V: u16 = 0x09;
+/// `kVK_ANSI_C`
+#[cfg(target_os = "macos")]
+const KEYCODE_C: u16 = 0x08;
 
 /// Copy `text` to the clipboard and paste into the focused app.
 ///
@@ -55,6 +58,56 @@ pub fn copy_to_clipboard(text: &str) -> AppResult<()> {
     Ok(())
 }
 
+pub fn read_clipboard_text() -> AppResult<String> {
+    let mut clipboard = Clipboard::new()
+        .map_err(|e| AppError::from(format!("Clipboard unavailable: {e}")))?;
+    clipboard
+        .get_text()
+        .map_err(|e| AppError::from(format!("Failed to read clipboard: {e}")))
+}
+
+/// Capture the current selection by simulating copy on the main thread.
+///
+/// Returns selected text (may be empty if nothing was selected). Best-effort:
+/// restores the previous clipboard contents when possible.
+pub fn capture_selection<R: Runtime>(app: &AppHandle<R>) -> AppResult<String> {
+    let previous = read_clipboard_text().ok();
+
+    // Clear so we can detect a failed copy (selection empty).
+    let _ = copy_to_clipboard("");
+
+    run_copy_on_main_thread(app)?;
+    thread::sleep(Duration::from_millis(80));
+
+    let selected = read_clipboard_text().unwrap_or_default();
+
+    if let Some(prev) = previous {
+        // Don't restore if we successfully captured selection — user expects
+        // the rewritten text path next. Only restore when selection was empty
+        // so we don't wipe their clipboard with "".
+        if selected.trim().is_empty() {
+            let _ = copy_to_clipboard(&prev);
+        }
+    }
+
+    Ok(selected)
+}
+
+fn run_copy_on_main_thread<R: Runtime>(app: &AppHandle<R>) -> AppResult<()> {
+    let (tx, rx) = mpsc::channel();
+    app.run_on_main_thread(move || {
+        let result = simulate_copy();
+        let _ = tx.send(result);
+    })
+    .map_err(|e| AppError::from(format!("Failed to schedule copy on main thread: {e}")))?;
+
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(AppError::from("Copy timed out waiting for main thread")),
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct InjectResult {
     pub pasted: bool,
@@ -86,36 +139,54 @@ fn run_paste_on_main_thread<R: Runtime>(app: &AppHandle<R>) -> AppResult<bool> {
 
 /// Simulate platform paste shortcut. **Must run on the main thread on macOS.**
 fn simulate_paste() -> AppResult<()> {
+    chord_mod_key('v', KEYCODE_V_OR_UNICODE)
+}
+
+/// Simulate platform copy shortcut. **Must run on the main thread on macOS.**
+fn simulate_copy() -> AppResult<()> {
+    chord_mod_key('c', KEYCODE_C_OR_UNICODE)
+}
+
+#[cfg(target_os = "macos")]
+const KEYCODE_V_OR_UNICODE: u32 = KEYCODE_V as u32;
+#[cfg(target_os = "macos")]
+const KEYCODE_C_OR_UNICODE: u32 = KEYCODE_C as u32;
+
+#[cfg(not(target_os = "macos"))]
+const KEYCODE_V_OR_UNICODE: u32 = 0;
+#[cfg(not(target_os = "macos"))]
+const KEYCODE_C_OR_UNICODE: u32 = 0;
+
+fn chord_mod_key(letter: char, macos_keycode: u32) -> AppResult<()> {
     let mut enigo = Enigo::new(&Settings::default())
         .map_err(|e| AppError::from(format!("Input simulation unavailable: {e}")))?;
 
     #[cfg(target_os = "macos")]
     {
-        // Prefer physical keycode — never Key::Unicode (triggers TSM on macOS).
+        let _ = letter;
         enigo
             .key(Key::Meta, Direction::Press)
-            .map_err(|e| AppError::from(format!("Paste failed: {e}")))?;
+            .map_err(|e| AppError::from(format!("Key chord failed: {e}")))?;
         enigo
-            .key(Key::Other(KEYCODE_V as u32), Direction::Click)
-            .map_err(|e| AppError::from(format!("Paste failed: {e}")))?;
+            .key(Key::Other(macos_keycode), Direction::Click)
+            .map_err(|e| AppError::from(format!("Key chord failed: {e}")))?;
         enigo
             .key(Key::Meta, Direction::Release)
-            .map_err(|e| AppError::from(format!("Paste failed: {e}")))?;
+            .map_err(|e| AppError::from(format!("Key chord failed: {e}")))?;
     }
 
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = macos_keycode;
         enigo
             .key(Key::Control, Direction::Press)
-            .map_err(|e| AppError::from(format!("Paste failed: {e}")))?;
-        // 'v' virtual key is fine on Linux X11 without macOS TSM constraints;
-        // still avoid Unicode when a raw code is available later.
+            .map_err(|e| AppError::from(format!("Key chord failed: {e}")))?;
         enigo
-            .key(Key::Unicode('v'), Direction::Click)
-            .map_err(|e| AppError::from(format!("Paste failed: {e}")))?;
+            .key(Key::Unicode(letter), Direction::Click)
+            .map_err(|e| AppError::from(format!("Key chord failed: {e}")))?;
         enigo
             .key(Key::Control, Direction::Release)
-            .map_err(|e| AppError::from(format!("Paste failed: {e}")))?;
+            .map_err(|e| AppError::from(format!("Key chord failed: {e}")))?;
     }
 
     Ok(())

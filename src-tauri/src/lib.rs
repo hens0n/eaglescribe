@@ -2,6 +2,7 @@ mod audio;
 mod dictionary;
 mod error;
 mod inject;
+mod llm;
 mod polish;
 mod settings;
 mod snippets;
@@ -18,6 +19,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 const DEFAULT_HOTKEY_COMBO: &str = "Ctrl+Shift+Space";
+const COMMAND_HOTKEY_COMBO: &str = "Ctrl+Shift+C";
 
 #[tauri::command]
 fn get_status(state: tauri::State<'_, SharedState>) -> StatusSnapshot {
@@ -59,6 +61,19 @@ fn set_hotkey_mode(
 ) -> AppResult<StatusSnapshot> {
     let mode = HotkeyMode::parse(&mode)?;
     state.inner().set_hotkey_mode(mode)?;
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
+fn set_llm_settings(
+    base_url: String,
+    model: String,
+    api_key: String,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    state
+        .inner()
+        .set_llm_settings(&base_url, &model, &api_key)?;
     Ok(state.inner().snapshot())
 }
 
@@ -116,6 +131,16 @@ fn toggle_dictation(
     Ok(state.inner().snapshot())
 }
 
+/// UI button: run one Command Mode capture (toggle-style).
+#[tauri::command]
+fn toggle_command_mode(
+    app: AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    toggle_command_inner(&app, state.inner())?;
+    Ok(state.inner().snapshot())
+}
+
 #[tauri::command]
 fn cancel_dictation(state: tauri::State<'_, SharedState>) -> AppResult<StatusSnapshot> {
     state.inner().cancel_recording()?;
@@ -130,17 +155,29 @@ fn start_dictation(app: &AppHandle, state: &SharedState) -> AppResult<()> {
             let _ = app.emit("dictation-status", state.snapshot());
             Ok(())
         }
-        state::DictationStatus::Recording => {
-            // Already holding / recording — ignore repeat Pressed events.
-            Ok(())
-        }
+        state::DictationStatus::Recording => Ok(()),
         state::DictationStatus::Transcribing => {
             Err(AppError::from("Already transcribing — please wait"))
         }
     }
 }
 
-fn stop_dictation(app: &AppHandle, state: &SharedState) -> AppResult<()> {
+fn start_command(app: &AppHandle, state: &SharedState) -> AppResult<()> {
+    let status = state.snapshot().status;
+    match status {
+        state::DictationStatus::Idle | state::DictationStatus::Error => {
+            state.start_command_recording(app)?;
+            let _ = app.emit("dictation-status", state.snapshot());
+            Ok(())
+        }
+        state::DictationStatus::Recording => Ok(()),
+        state::DictationStatus::Transcribing => {
+            Err(AppError::from("Already transcribing — please wait"))
+        }
+    }
+}
+
+fn stop_session(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     let status = state.snapshot().status;
     match status {
         state::DictationStatus::Recording => {
@@ -156,10 +193,7 @@ fn stop_dictation(app: &AppHandle, state: &SharedState) -> AppResult<()> {
             let _ = app.emit("dictation-status", state.snapshot());
             Ok(())
         }
-        state::DictationStatus::Idle | state::DictationStatus::Error => {
-            // Release without a prior press — ignore.
-            Ok(())
-        }
+        state::DictationStatus::Idle | state::DictationStatus::Error => Ok(()),
         state::DictationStatus::Transcribing => {
             Err(AppError::from("Already transcribing — please wait"))
         }
@@ -170,27 +204,49 @@ fn toggle_dictation_inner(app: &AppHandle, state: &SharedState) -> AppResult<()>
     let status = state.snapshot().status;
     match status {
         state::DictationStatus::Idle | state::DictationStatus::Error => start_dictation(app, state),
-        state::DictationStatus::Recording => stop_dictation(app, state),
+        state::DictationStatus::Recording => stop_session(app, state),
         state::DictationStatus::Transcribing => {
             Err(AppError::from("Already transcribing — please wait"))
         }
     }
 }
 
-fn handle_hotkey(app: &AppHandle, state: &SharedState, key_state: ShortcutState) {
+fn toggle_command_inner(app: &AppHandle, state: &SharedState) -> AppResult<()> {
+    let status = state.snapshot().status;
+    match status {
+        state::DictationStatus::Idle | state::DictationStatus::Error => start_command(app, state),
+        state::DictationStatus::Recording => stop_session(app, state),
+        state::DictationStatus::Transcribing => {
+            Err(AppError::from("Already transcribing — please wait"))
+        }
+    }
+}
+
+fn handle_dictation_hotkey(app: &AppHandle, state: &SharedState, key_state: ShortcutState) {
     let result = match state.hotkey_mode() {
         HotkeyMode::Hold => match key_state {
             ShortcutState::Pressed => start_dictation(app, state),
-            ShortcutState::Released => stop_dictation(app, state),
+            ShortcutState::Released => stop_session(app, state),
         },
         HotkeyMode::Toggle => match key_state {
-            // Only act on press — ignore release so it behaves like the old toggle.
             ShortcutState::Pressed => toggle_dictation_inner(app, state),
             ShortcutState::Released => Ok(()),
         },
     };
     if let Err(e) = result {
         state.push_log(format!("Hotkey error: {e}"));
+        let _ = app.emit("dictation-status", state.snapshot());
+    }
+}
+
+/// Command Mode always uses hold semantics on its own hotkey for predictability.
+fn handle_command_hotkey(app: &AppHandle, state: &SharedState, key_state: ShortcutState) {
+    let result = match key_state {
+        ShortcutState::Pressed => start_command(app, state),
+        ShortcutState::Released => stop_session(app, state),
+    };
+    if let Err(e) = result {
+        state.push_log(format!("Command hotkey error: {e}"));
         let _ = app.emit("dictation-status", state.snapshot());
     }
 }
@@ -209,35 +265,57 @@ pub fn run() {
             set_model_path,
             set_polish_mode,
             set_hotkey_mode,
+            set_llm_settings,
             dictionary_add,
             dictionary_remove,
             snippet_add,
             snippet_remove,
             load_model,
             toggle_dictation,
+            toggle_command_mode,
             cancel_dictation,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
             let state = Arc::clone(app.state::<SharedState>().inner());
 
-            let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
+            let dictation_shortcut =
+                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
+            let command_shortcut =
+                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyC);
 
-            app.global_shortcut()
-                .on_shortcut(shortcut, move |_app, _sc, event| {
-                    handle_hotkey(&handle, &state, event.state);
-                })?;
+            {
+                let handle = handle.clone();
+                let state = Arc::clone(&state);
+                app.global_shortcut()
+                    .on_shortcut(dictation_shortcut, move |_app, _sc, event| {
+                        handle_dictation_hotkey(&handle, &state, event.state);
+                    })?;
+            }
+
+            {
+                let handle = handle.clone();
+                let state = Arc::clone(&state);
+                app.global_shortcut()
+                    .on_shortcut(command_shortcut, move |_app, _sc, event| {
+                        handle_command_hotkey(&handle, &state, event.state);
+                    })?;
+            }
 
             let state = app.state::<SharedState>().inner();
             let mode = state.hotkey_mode();
             state.push_log(format!(
-                "Global hotkey registered: {DEFAULT_HOTKEY_COMBO} ({})",
+                "Dictation hotkey: {DEFAULT_HOTKEY_COMBO} ({})",
                 mode.as_str()
             ));
+            state.push_log(format!("Command Mode hotkey: {COMMAND_HOTKEY_COMBO} (hold)"));
             state.push_log(format!("Hotkey: {}", mode.label()));
-            state.push_log("Change hold vs toggle in the UI; choice is saved.");
             state.push_log(format!("Model path: {}", state.snapshot().model_path));
-            state.push_log("Polish: smart (toggle in UI for verbatim)");
+            state.push_log(format!(
+                "LLM: {} / {}",
+                state.snapshot().llm_base_url,
+                state.snapshot().llm_model
+            ));
 
             Ok(())
         })

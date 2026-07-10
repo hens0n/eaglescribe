@@ -21,6 +21,8 @@ interface StatusSnapshot {
   model_loaded: boolean;
   polish_mode: PolishMode;
   hotkey_mode: HotkeyMode;
+  llm_base_url: string;
+  llm_model: string;
   dictionary_path: string;
   dictionary: DictEntry[];
   snippets_path: string;
@@ -29,6 +31,7 @@ interface StatusSnapshot {
   last_raw_transcript: string | null;
   last_error: string | null;
   log: string[];
+  session_kind: string;
 }
 
 const HOTKEY_HINTS: Record<HotkeyMode, string> = {
@@ -50,9 +53,13 @@ const els = {
   log: () => document.querySelector("#log") as HTMLElement,
   error: () => document.querySelector("#error") as HTMLElement,
   btnToggle: () => document.querySelector("#btn-toggle") as HTMLButtonElement,
+  btnCommand: () => document.querySelector("#btn-command") as HTMLButtonElement,
   btnCancel: () => document.querySelector("#btn-cancel") as HTMLButtonElement,
   btnSave: () => document.querySelector("#btn-save-path") as HTMLButtonElement,
   btnLoad: () => document.querySelector("#btn-load") as HTMLButtonElement,
+  llmUrl: () => document.querySelector("#llm-url") as HTMLInputElement,
+  llmModel: () => document.querySelector("#llm-model") as HTMLInputElement,
+  btnLlmSave: () => document.querySelector("#btn-llm-save") as HTMLButtonElement,
   polishSmart: () => document.querySelector("#polish-smart") as HTMLInputElement,
   polishVerbatim: () =>
     document.querySelector("#polish-verbatim") as HTMLInputElement,
@@ -174,6 +181,12 @@ function applyStatus(s: StatusSnapshot) {
   els.hotkeyMode().textContent = hotkeyMode;
   els.hotkeyHint().textContent = HOTKEY_HINTS[hotkeyMode] ?? HOTKEY_HINTS.hold;
   els.modelPath().value = s.model_path;
+  if (document.activeElement !== els.llmUrl()) {
+    els.llmUrl().value = s.llm_base_url ?? "";
+  }
+  if (document.activeElement !== els.llmModel()) {
+    els.llmModel().value = s.llm_model ?? "";
+  }
   els.transcript().textContent = s.last_transcript ?? "—";
   els.transcriptRaw().textContent = s.last_raw_transcript ?? "—";
   els.log().textContent = s.log.join("\n");
@@ -202,12 +215,19 @@ function applyStatus(s: StatusSnapshot) {
   }
 
   const busy = s.status === "transcribing";
-  els.btnToggle().disabled = busy;
-  els.btnCancel().disabled = s.status !== "recording";
+  const recording = s.status === "recording";
+  const isCommand = s.session_kind === "command";
+  els.btnToggle().disabled = busy || (recording && isCommand);
+  els.btnCommand().disabled = busy || (recording && !isCommand);
+  els.btnCancel().disabled = !recording;
   els.btnToggle().textContent =
-    s.status === "recording"
+    recording && !isCommand
       ? "Stop & transcribe (toggle)"
       : "Start dictation (toggle)";
+  els.btnCommand().textContent =
+    recording && isCommand
+      ? "Stop command (run LLM)"
+      : "Command Mode";
 }
 
 async function refresh() {
@@ -223,6 +243,30 @@ window.addEventListener("DOMContentLoaded", async () => {
     } catch (e) {
       console.error(e);
       await refresh();
+    }
+  });
+
+  els.btnCommand().addEventListener("click", async () => {
+    try {
+      const s = await invoke<StatusSnapshot>("toggle_command_mode");
+      applyStatus(s);
+    } catch (e) {
+      console.error(e);
+      alert(String(e));
+      await refresh();
+    }
+  });
+
+  els.btnLlmSave().addEventListener("click", async () => {
+    try {
+      const s = await invoke<StatusSnapshot>("set_llm_settings", {
+        baseUrl: els.llmUrl().value,
+        model: els.llmModel().value,
+        apiKey: "",
+      });
+      applyStatus(s);
+    } catch (e) {
+      alert(String(e));
     }
   });
 

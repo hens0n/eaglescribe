@@ -1,6 +1,7 @@
 use crate::audio::RecordingSession;
 use crate::dictionary::{self, DictEntry, Dictionary};
 use crate::error::{AppError, AppResult};
+use crate::llm;
 use crate::polish::{self, PolishMode};
 use crate::settings::{self, AppSettings, HotkeyMode};
 use crate::snippets::{self, Snippet, SnippetBook};
@@ -19,12 +20,21 @@ pub enum DictationStatus {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionKind {
+    Dictation,
+    Command,
+}
+
 pub struct AppState {
     inner: Mutex<InnerState>,
 }
 
 struct InnerState {
     status: DictationStatus,
+    session_kind: SessionKind,
+    /// Selected text captured at the start of Command Mode (may be empty).
+    command_selection: Option<String>,
     model_path: PathBuf,
     settings_path: PathBuf,
     settings: AppSettings,
@@ -59,6 +69,8 @@ impl AppState {
         Self {
             inner: Mutex::new(InnerState {
                 status: DictationStatus::Idle,
+                session_kind: SessionKind::Dictation,
+                command_selection: None,
                 model_path,
                 settings_path: settings_path.clone(),
                 settings,
@@ -89,6 +101,9 @@ impl AppState {
                         snippets_path.display(),
                         snippet_count
                     ));
+                    log.push(
+                        "Command Mode: Ctrl+Shift+C (select text, hold, speak instruction)".into(),
+                    );
                     log
                 },
             }),
@@ -103,6 +118,8 @@ impl AppState {
             model_loaded: g.engine.is_some(),
             polish_mode: g.polish_mode,
             hotkey_mode: g.settings.hotkey_mode,
+            llm_base_url: g.settings.llm_base_url.clone(),
+            llm_model: g.settings.llm_model.clone(),
             dictionary_path: g.dictionary_path.display().to_string(),
             dictionary: g.dictionary.list(),
             snippets_path: g.snippets_path.display().to_string(),
@@ -111,6 +128,10 @@ impl AppState {
             last_raw_transcript: g.last_raw_transcript.clone(),
             last_error: g.last_error.clone(),
             log: g.log.clone(),
+            session_kind: match g.session_kind {
+                SessionKind::Dictation => "dictation".into(),
+                SessionKind::Command => "command".into(),
+            },
         }
     }
 
@@ -152,6 +173,20 @@ impl AppState {
             mode.as_str(),
             mode.label()
         ));
+        Ok(())
+    }
+
+    pub fn set_llm_settings(&self, base_url: &str, model: &str, api_key: &str) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        g.settings.llm_base_url = base_url.trim().to_string();
+        g.settings.llm_model = model.trim().to_string();
+        g.settings.llm_api_key = api_key.to_string();
+        g.settings.save(&g.settings_path)?;
+        let msg = format!(
+            "LLM: {} model={}",
+            g.settings.llm_base_url, g.settings.llm_model
+        );
+        g.log.push(msg);
         Ok(())
     }
 
@@ -236,6 +271,8 @@ impl AppState {
 
         let session = RecordingSession::start()?;
         g.session = Some(session);
+        g.session_kind = SessionKind::Dictation;
+        g.command_selection = None;
         g.status = DictationStatus::Recording;
         g.last_error = None;
         g.log
@@ -243,16 +280,58 @@ impl AppState {
         Ok(())
     }
 
+    /// Command Mode: capture selection, then record a spoken instruction.
+    pub fn start_command_recording<R: Runtime>(&self, app: &AppHandle<R>) -> AppResult<()> {
+        {
+            let g = self.inner.lock();
+            if g.status == DictationStatus::Recording {
+                return Err(AppError::from("Already recording"));
+            }
+            if g.status == DictationStatus::Transcribing {
+                return Err(AppError::from("Busy transcribing"));
+            }
+        }
+
+        self.push_log("Command Mode: capturing selection (Cmd/Ctrl+C)…");
+        let selection = crate::inject::capture_selection(app).unwrap_or_default();
+        if selection.trim().is_empty() {
+            self.push_log("Command Mode: no selection — will generate at cursor.");
+        } else {
+            self.push_log(format!(
+                "Command Mode: {} chars selected",
+                selection.chars().count()
+            ));
+        }
+
+        let session = RecordingSession::start()?;
+        let mut g = self.inner.lock();
+        g.session = Some(session);
+        g.session_kind = SessionKind::Command;
+        g.command_selection = Some(selection);
+        g.status = DictationStatus::Recording;
+        g.last_error = None;
+        g.log.push(
+            "Command Mode recording… speak your instruction (e.g. make this more concise)".into(),
+        );
+        Ok(())
+    }
+
     /// Stop mic, transcribe, polish, dictionary, snippets, inject.
+    /// For Command Mode, runs local LLM rewrite instead of normal paste pipeline.
     pub fn stop_and_transcribe<R: Runtime>(&self, app: &AppHandle<R>) -> AppResult<String> {
-        let session = {
+        let (session, kind, command_selection) = {
             let mut g = self.inner.lock();
             if g.status != DictationStatus::Recording {
                 return Err(AppError::from("Not recording"));
             }
-            g.session
+            let session = g
+                .session
                 .take()
-                .ok_or_else(|| AppError::from("Missing recording session"))?
+                .ok_or_else(|| AppError::from("Missing recording session"))?;
+            let kind = g.session_kind;
+            let sel = g.command_selection.take();
+            g.session_kind = SessionKind::Dictation;
+            (session, kind, sel)
         };
 
         if let Err(e) = self.ensure_engine() {
@@ -312,6 +391,10 @@ impl AppState {
             return Err(AppError::from("Empty transcript"));
         }
 
+        if kind == SessionKind::Command {
+            return self.finish_command_mode(app, &raw, command_selection.unwrap_or_default());
+        }
+
         let (mode, dictionary, snippets) = {
             let g = self.inner.lock();
             (g.polish_mode, g.dictionary.clone(), g.snippets.clone())
@@ -355,10 +438,55 @@ impl AppState {
             return Err(AppError::from("Transcript empty after polish"));
         }
 
-        match crate::inject::inject_text(app, &text) {
+        self.finish_inject(app, &polished.raw, &text)
+    }
+
+    fn finish_command_mode<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        instruction_raw: &str,
+        selection: String,
+    ) -> AppResult<String> {
+        let mode = self.inner.lock().polish_mode;
+        let instruction = polish::polish(instruction_raw, mode).polished;
+        self.push_log(format!(
+            "Command instruction: {}",
+            truncate(&instruction, 80)
+        ));
+
+        let llm = self.inner.lock().settings.llm_config();
+        let (system, user) = llm::build_rewrite_prompt(&instruction, &selection);
+
+        self.push_log(format!(
+            "Command Mode: calling local LLM {} …",
+            llm.model
+        ));
+
+        let rewritten = match llm::complete(&llm, &system, &user) {
+            Ok(t) => t,
+            Err(e) => {
+                let mut g = self.inner.lock();
+                g.status = DictationStatus::Error;
+                g.last_error = Some(e.to_string());
+                g.last_raw_transcript = Some(instruction_raw.to_string());
+                return Err(e);
+            }
+        };
+
+        self.push_log(format!("Command result: {}", truncate(&rewritten, 80)));
+        self.finish_inject(app, instruction_raw, &rewritten)
+    }
+
+    fn finish_inject<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        raw: &str,
+        text: &str,
+    ) -> AppResult<String> {
+        match crate::inject::inject_text(app, text) {
             Ok(result) => {
                 let mut g = self.inner.lock();
-                g.last_raw_transcript = Some(polished.raw);
+                g.last_raw_transcript = Some(raw.to_string());
                 g.last_transcript = Some(result.text.clone());
                 g.status = DictationStatus::Idle;
                 if result.pasted {
@@ -373,15 +501,15 @@ impl AppState {
                 Ok(result.text)
             }
             Err(e) => {
-                let _ = crate::inject::copy_to_clipboard(&text);
+                let _ = crate::inject::copy_to_clipboard(text);
                 let mut g = self.inner.lock();
-                g.last_raw_transcript = Some(polished.raw);
-                g.last_transcript = Some(text.clone());
+                g.last_raw_transcript = Some(raw.to_string());
+                g.last_transcript = Some(text.to_string());
                 g.status = DictationStatus::Idle;
                 g.last_error = Some(e.to_string());
                 g.log
                     .push(format!("Transcript on clipboard; inject failed: {e}"));
-                Ok(text)
+                Ok(text.to_string())
             }
         }
     }
@@ -392,6 +520,8 @@ impl AppState {
             return Err(AppError::from("Not recording"));
         }
         let _ = g.session.take();
+        g.command_selection = None;
+        g.session_kind = SessionKind::Dictation;
         g.status = DictationStatus::Idle;
         g.log.push("Recording cancelled.".into());
         Ok(())
@@ -405,6 +535,8 @@ pub struct StatusSnapshot {
     pub model_loaded: bool,
     pub polish_mode: PolishMode,
     pub hotkey_mode: HotkeyMode,
+    pub llm_base_url: String,
+    pub llm_model: String,
     pub dictionary_path: String,
     pub dictionary: Vec<DictEntry>,
     pub snippets_path: String,
@@ -413,6 +545,7 @@ pub struct StatusSnapshot {
     pub last_raw_transcript: Option<String>,
     pub last_error: Option<String>,
     pub log: Vec<String>,
+    pub session_kind: String,
 }
 
 fn truncate(s: &str, max: usize) -> String {
