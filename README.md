@@ -2,16 +2,18 @@
 
 Local-first voice dictation for **macOS** and **Linux**. Speak → on-device Whisper transcription → paste into the focused app. No cloud required.
 
-Research and requirements live under [`research/`](./research/).
+**Session handoff / status & gaps:** [`research/STATUS.md`](./research/STATUS.md)  
+Research and requirements: [`research/`](./research/).
 
-## Stack (spike)
+## Stack
 
 | Layer | Choice |
 | --- | --- |
 | Language | Rust |
 | Shell | Tauri 2 |
 | STT | whisper.cpp (`whisper-rs`) |
-| LLM polish | *not in spike* — llama.cpp next |
+| Offline polish | Rules in `polish.rs` (fillers, punct, backtrack, lists) |
+| Command Mode LLM | Local OpenAI-compatible HTTP (Ollama / llama-server) |
 | Hotkey | `Ctrl+Shift+Space` — **hold** or **toggle** (choose in UI) |
 
 See [research/stack-decision.md](./research/stack-decision.md).
@@ -92,7 +94,9 @@ Map a short **cue** to a longer **expansion** (signatures, links, templates). If
 
 ## What’s next
 
-- [x] Deterministic polish (fillers, punctuation, backtrack)
+See [research/STATUS.md](./research/STATUS.md) for the full status and gap list.
+
+- [x] Deterministic polish (fillers, punctuation, backtrack, lists)
 - [x] Personal dictionary
 - [x] Snippets
 - [x] Push-to-talk hold (UI button still toggles)
