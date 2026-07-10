@@ -96,6 +96,37 @@
         </p>
       </section>
 
+      <section class="card">
+        <span class="label">Snippets</span>
+        <p class="hint">
+          Speak a short cue to insert a longer block of text. Whole-utterance
+          cues expand fully; cues inside a sentence expand in place.
+        </p>
+        <div class="row">
+          <input
+            id="snip-cue"
+            type="text"
+            spellcheck="false"
+            placeholder="cue (e.g. calendar link)"
+          />
+        </div>
+        <div class="row">
+          <textarea
+            id="snip-expansion"
+            rows="3"
+            spellcheck="false"
+            placeholder="Full text to insert…"
+          ></textarea>
+        </div>
+        <div class="row">
+          <button id="btn-snip-add" type="button">Add snippet</button>
+        </div>
+        <ul id="snip-list" class="dict-list"></ul>
+        <p class="hint">
+          File: <code id="snip-path">—</code>
+        </p>
+      </section>
+
       <section class="card actions">
         <button id="btn-toggle" type="button" class="primary">
           Start / stop dictation

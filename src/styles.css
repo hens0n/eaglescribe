@@ -307,3 +307,34 @@ kbd {
   font-size: 0.85rem;
   padding: 0.25rem 0;
 }
+
+textarea {
+  flex: 1 1 100%;
+  width: 100%;
+  min-height: 4.5rem;
+  resize: vertical;
+  background: #0e1016;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: inherit;
+  padding: 0.55rem 0.7rem;
+  font: inherit;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.85rem;
+}
+
+textarea:focus {
+  outline: 2px solid var(--accent-dim);
+  border-color: var(--accent);
+}
+
+.snip-preview {
+  display: block;
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin-top: 0.15rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}

@@ -2,6 +2,7 @@ use crate::audio::RecordingSession;
 use crate::dictionary::{self, DictEntry, Dictionary};
 use crate::error::{AppError, AppResult};
 use crate::polish::{self, PolishMode};
+use crate::snippets::{self, Snippet, SnippetBook};
 use crate::stt::WhisperEngine;
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -26,6 +27,8 @@ struct InnerState {
     model_path: PathBuf,
     dictionary_path: PathBuf,
     dictionary: Dictionary,
+    snippets_path: PathBuf,
+    snippets: SnippetBook,
     engine: Option<WhisperEngine>,
     session: Option<RecordingSession>,
     polish_mode: PolishMode,
@@ -41,12 +44,18 @@ impl AppState {
         let dictionary = Dictionary::load_or_default(&dictionary_path);
         let entry_count = dictionary.entries.len();
 
+        let snippets_path = snippets::default_snippets_path();
+        let snippets = SnippetBook::load_or_default(&snippets_path);
+        let snippet_count = snippets.snippets.len();
+
         Self {
             inner: Mutex::new(InnerState {
                 status: DictationStatus::Idle,
                 model_path,
                 dictionary_path: dictionary_path.clone(),
                 dictionary,
+                snippets_path: snippets_path.clone(),
+                snippets,
                 engine: None,
                 session: None,
                 polish_mode: PolishMode::Smart,
@@ -59,6 +68,11 @@ impl AppState {
                         "Dictionary: {} ({} entries)",
                         dictionary_path.display(),
                         entry_count
+                    ));
+                    log.push(format!(
+                        "Snippets: {} ({} cues)",
+                        snippets_path.display(),
+                        snippet_count
                     ));
                     log
                 },
@@ -75,6 +89,8 @@ impl AppState {
             polish_mode: g.polish_mode,
             dictionary_path: g.dictionary_path.display().to_string(),
             dictionary: g.dictionary.list(),
+            snippets_path: g.snippets_path.display().to_string(),
+            snippets: g.snippets.list(),
             last_transcript: g.last_transcript.clone(),
             last_raw_transcript: g.last_raw_transcript.clone(),
             last_error: g.last_error.clone(),
@@ -133,6 +149,32 @@ impl AppState {
         Ok(())
     }
 
+    pub fn snippet_add(&self, cue: &str, expansion: &str) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        g.snippets.upsert(cue, expansion)?;
+        g.snippets.save(&g.snippets_path)?;
+        g.log.push(format!(
+            "Snippet: {:?} → {} chars",
+            cue.trim(),
+            expansion.trim().chars().count()
+        ));
+        Ok(())
+    }
+
+    pub fn snippet_remove(&self, cue: &str) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        if !g.snippets.remove(cue) {
+            return Err(AppError::from(format!(
+                "No snippet for cue {:?}",
+                cue.trim()
+            )));
+        }
+        g.snippets.save(&g.snippets_path)?;
+        g.log
+            .push(format!("Snippet removed: {:?}", cue.trim()));
+        Ok(())
+    }
+
     pub fn ensure_engine(&self) -> AppResult<()> {
         let mut g = self.inner.lock();
         if g.engine.is_some() {
@@ -169,7 +211,7 @@ impl AppState {
         Ok(())
     }
 
-    /// Stop mic, transcribe, polish, dictionary, inject.
+    /// Stop mic, transcribe, polish, dictionary, snippets, inject.
     pub fn stop_and_transcribe<R: Runtime>(&self, app: &AppHandle<R>) -> AppResult<String> {
         let session = {
             let mut g = self.inner.lock();
@@ -238,9 +280,9 @@ impl AppState {
             return Err(AppError::from("Empty transcript"));
         }
 
-        let (mode, dictionary) = {
+        let (mode, dictionary, snippets) = {
             let g = self.inner.lock();
-            (g.polish_mode, g.dictionary.clone())
+            (g.polish_mode, g.dictionary.clone(), g.snippets.clone())
         };
 
         let polished = polish::polish(&raw, mode);
@@ -263,7 +305,16 @@ impl AppState {
             ));
         }
 
-        let text = after_dict;
+        let (after_snip, snip_changed) = snippets.apply(&after_dict);
+        if snip_changed {
+            self.push_log(format!(
+                "Snippet: {} → {}",
+                truncate(&after_dict, 40),
+                truncate(&after_snip, 40)
+            ));
+        }
+
+        let text = after_snip;
         if text.is_empty() {
             let mut g = self.inner.lock();
             g.status = DictationStatus::Idle;
@@ -323,6 +374,8 @@ pub struct StatusSnapshot {
     pub polish_mode: PolishMode,
     pub dictionary_path: String,
     pub dictionary: Vec<DictEntry>,
+    pub snippets_path: String,
+    pub snippets: Vec<Snippet>,
     pub last_transcript: Option<String>,
     pub last_raw_transcript: Option<String>,
     pub last_error: Option<String>,

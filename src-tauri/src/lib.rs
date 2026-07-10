@@ -3,6 +3,7 @@ mod dictionary;
 mod error;
 mod inject;
 mod polish;
+mod snippets;
 mod state;
 mod stt;
 
@@ -69,6 +70,25 @@ fn dictionary_remove(
 }
 
 #[tauri::command]
+fn snippet_add(
+    cue: String,
+    expansion: String,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    state.inner().snippet_add(&cue, &expansion)?;
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
+fn snippet_remove(
+    cue: String,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    state.inner().snippet_remove(&cue)?;
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
 fn load_model(state: tauri::State<'_, SharedState>) -> AppResult<StatusSnapshot> {
     state.inner().ensure_engine()?;
     Ok(state.inner().snapshot())
@@ -131,6 +151,8 @@ pub fn run() {
             set_polish_mode,
             dictionary_add,
             dictionary_remove,
+            snippet_add,
+            snippet_remove,
             load_model,
             toggle_dictation,
             cancel_dictation,

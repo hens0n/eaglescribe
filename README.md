@@ -85,14 +85,18 @@ Switch to **verbatim** in the UI for raw Whisper output. Raw + polished text bot
 
 Add preferred spellings (names, product terms) in the UI. Matching is case-insensitive with word boundaries; longer phrases win. Applied after polish. Stored only on disk under the OS app data dir (`…/talontype/dictionary.json`).
 
+## Snippets
+
+Map a short **cue** to a longer **expansion** (signatures, links, templates). If the whole utterance is the cue (ignoring trailing `.`/`?`), the expansion replaces it. Cues inside a sentence expand in place. Applied after dictionary. File: `…/talontype/snippets.json`.
+
 ## What’s next
 
 - [x] Deterministic polish (fillers, punctuation, backtrack)
 - [x] Personal dictionary
+- [x] Snippets
 - [ ] llama.cpp Command Mode / optional rewrite
 - [ ] Push-to-talk hold (not only toggle)
 - [ ] Linux Wayland hotkey/paste hardening
-- [ ] Snippets
 - [ ] System tray / hide window
 
 ## License
