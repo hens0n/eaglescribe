@@ -31,7 +31,7 @@ impl RecordingSession {
         let sample_rate_t = Arc::clone(&sample_rate);
 
         let join = thread::Builder::new()
-            .name("talontype-mic".into())
+            .name("eaglescribe-mic".into())
             .spawn(move || run_capture(stop_flag_t, samples_t, sample_rate_t))
             .map_err(|e| AppError::from(format!("Failed to spawn mic thread: {e}")))?;
 
@@ -154,7 +154,7 @@ where
     T: Sample + cpal::SizedSample + Send + 'static,
     f32: FromSample<T>,
 {
-    let err_fn = |err| eprintln!("[talontype] audio stream error: {err}");
+    let err_fn = |err| eprintln!("[eaglescribe] audio stream error: {err}");
 
     device
         .build_input_stream(

@@ -49,6 +49,11 @@ body {
   letter-spacing: -0.02em;
 }
 
+.header .tray-hint {
+  margin: 0.5rem 0 0;
+  max-width: 36rem;
+}
+
 .tagline {
   margin: 0.25rem 0 0;
   color: var(--muted);
@@ -119,6 +124,38 @@ body {
   display: flex;
   gap: 0.5rem;
   flex-wrap: wrap;
+}
+
+.hotkey-bind-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.hotkey-bind-label {
+  min-width: 7.5rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.hotkey-display {
+  flex: 1 1 auto;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.85rem;
+  padding: 0.35rem 0.55rem;
+  background: #0e1016;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.hotkey-display.listening {
+  border-color: var(--recording);
+  color: var(--recording);
+}
+
+.capture-status {
+  color: var(--recording) !important;
 }
 
 input[type="text"] {

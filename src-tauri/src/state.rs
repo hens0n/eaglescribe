@@ -3,6 +3,7 @@ use crate::dictionary::{self, DictEntry, Dictionary};
 use crate::error::{AppError, AppResult};
 use crate::llm;
 use crate::polish::{self, PolishMode};
+use crate::hotkey;
 use crate::settings::{self, AppSettings, HotkeyMode};
 use crate::snippets::{self, Snippet, SnippetBook};
 use crate::stt::WhisperEngine;
@@ -72,6 +73,8 @@ impl AppState {
         let snippet_count = snippets.snippets.len();
 
         let hotkey_mode = settings.hotkey_mode;
+        let command_hotkey = settings.command_hotkey.clone();
+        let dictation_hotkey = settings.dictation_hotkey.clone();
 
         Self {
             suppress_command_release: AtomicBool::new(false),
@@ -94,11 +97,15 @@ impl AppState {
                 last_raw_transcript: None,
                 last_error: None,
                 log: {
-                    let mut log = vec!["TalonType ready.".into()];
+                    let mut log = vec!["EagleScribe ready.".into()];
                     log.push(format!(
                         "Hotkey mode: {} ({})",
                         hotkey_mode.as_str(),
                         hotkey_mode.label()
+                    ));
+                    log.push(format!("Dictation hotkey: {dictation_hotkey}"));
+                    log.push(format!(
+                        "Command Mode: {command_hotkey} (select text, hold, speak instruction)"
                     ));
                     log.push(format!(
                         "Dictionary: {} ({} entries)",
@@ -110,9 +117,6 @@ impl AppState {
                         snippets_path.display(),
                         snippet_count
                     ));
-                    log.push(
-                        "Command Mode: Ctrl+Shift+X (select text, hold, speak instruction)".into(),
-                    );
                     log
                 },
             }),
@@ -138,6 +142,8 @@ impl AppState {
             model_loaded: g.engine.is_some(),
             polish_mode: g.polish_mode,
             hotkey_mode: g.settings.hotkey_mode,
+            dictation_hotkey: g.settings.dictation_hotkey.clone(),
+            command_hotkey: g.settings.command_hotkey.clone(),
             llm_base_url: g.settings.llm_base_url.clone(),
             llm_model: g.settings.llm_model.clone(),
             dictionary_path: g.dictionary_path.display().to_string(),
@@ -159,10 +165,18 @@ impl AppState {
         self.inner.lock().settings.hotkey_mode
     }
 
+    pub fn dictation_hotkey(&self) -> String {
+        self.inner.lock().settings.dictation_hotkey.clone()
+    }
+
+    pub fn command_hotkey(&self) -> String {
+        self.inner.lock().settings.command_hotkey.clone()
+    }
+
     pub fn push_log(&self, msg: impl Into<String>) {
         let mut g = self.inner.lock();
         let msg = msg.into();
-        eprintln!("[talontype] {msg}");
+        eprintln!("[eaglescribe] {msg}");
         g.log.push(msg);
         if g.log.len() > 100 {
             let drain = g.log.len() - 100;
@@ -193,6 +207,18 @@ impl AppState {
             mode.as_str(),
             mode.label()
         ));
+        Ok(())
+    }
+
+    /// Persist validated hotkey combos (caller re-registers OS shortcuts).
+    pub fn set_hotkey_bindings(&self, dictation: &str, command: &str) -> AppResult<()> {
+        let (dictation, command) = hotkey::validate_pair(dictation, command)?;
+        let mut g = self.inner.lock();
+        g.settings.dictation_hotkey = dictation.clone();
+        g.settings.command_hotkey = command.clone();
+        g.settings.save(&g.settings_path)?;
+        g.log
+            .push(format!("Dictation hotkey: {dictation} · Command: {command}"));
         Ok(())
     }
 
@@ -570,6 +596,8 @@ pub struct StatusSnapshot {
     pub model_loaded: bool,
     pub polish_mode: PolishMode,
     pub hotkey_mode: HotkeyMode,
+    pub dictation_hotkey: String,
+    pub command_hotkey: String,
     pub llm_base_url: String,
     pub llm_model: String,
     pub dictionary_path: String,

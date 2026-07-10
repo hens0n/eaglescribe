@@ -166,7 +166,7 @@ fn replace_cue(text: &str, cue: &str, expansion: &str) -> String {
 
 pub fn default_snippets_path() -> PathBuf {
     if let Some(data) = dirs::data_local_dir() {
-        return data.join("talontype").join("snippets.json");
+        return data.join("eaglescribe").join("snippets.json");
     }
     PathBuf::from("snippets.json")
 }

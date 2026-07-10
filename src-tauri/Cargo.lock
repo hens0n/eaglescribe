@@ -1038,6 +1038,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "eaglescribe"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "cpal",
+ "dirs",
+ "enigo",
+ "hound",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-global-shortcut",
+ "tauri-plugin-opener",
+ "thiserror 2.0.18",
+ "ureq",
+ "whisper-rs",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3816,28 +3838,6 @@ dependencies = [
  "pkg-config",
  "toml 0.8.2",
  "version-compare",
-]
-
-[[package]]
-name = "talontype"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "cpal",
- "dirs",
- "enigo",
- "hound",
- "parking_lot",
- "regex",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-global-shortcut",
- "tauri-plugin-opener",
- "thiserror 2.0.18",
- "ureq",
- "whisper-rs",
 ]
 
 [[package]]

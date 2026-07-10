@@ -1,4 +1,4 @@
-# TalonType
+# EagleScribe
 
 Local-first voice dictation for **macOS** and **Linux**. Speak → on-device Whisper transcription → paste into the focused app. No cloud required.
 
@@ -14,7 +14,7 @@ Research and requirements: [`research/`](./research/).
 | STT | whisper.cpp (`whisper-rs`) |
 | Offline polish | Rules in `polish.rs` (fillers, punct, backtrack, lists) |
 | Command Mode LLM | Local OpenAI-compatible HTTP (Ollama / llama-server) |
-| Hotkey | `Ctrl+Shift+Space` — **hold** or **toggle** (choose in UI) |
+| Hotkey | Rebindable in UI (defaults: `Ctrl+Shift+Space` dictation, `Ctrl+Shift+X` Command Mode) |
 
 See [research/stack-decision.md](./research/stack-decision.md).
 
@@ -49,18 +49,27 @@ cd src-tauri && cargo build --features metal
 Optional: point at any ggml model:
 
 ```bash
-export TALONTYPE_WHISPER_MODEL=/path/to/ggml-small.en.bin
+export EAGLESCRIBE_WHISPER_MODEL=/path/to/ggml-small.en.bin
 npm run desktop
 ```
 
 ## Using the spike
 
 1. Click **Load** (or the first release will load the model).
-2. Choose **Hold to talk** or **Toggle** under Dictation hotkey (saved locally).
+2. Choose **Hold to talk** or **Toggle**, and optionally **Change** the global hotkeys (saved locally).
 3. Focus a text field in another app.
-4. Use **Ctrl+Shift+Space** according to that mode (or the UI button, which always toggles).
+4. Use the dictation hotkey (default **Ctrl+Shift+Space**) according to that mode (or the UI button, which always toggles).
 
 If paste fails, the text stays on the clipboard — paste manually (`Cmd+V` / `Ctrl+V`).
+
+### System tray
+
+EagleScribe stays in the **menu bar** (macOS) or **system tray** (Linux/Windows):
+
+- **Close** the window → hides to tray; global hotkeys keep working
+- **macOS menu bar** shows **ES** — **left-click** restores the window
+- **Right-click** the tray item → Show Window, Hide Window, **Quit EagleScribe**
+- **Dock** click also restores when the window was hidden
 
 ## Project layout
 
@@ -86,11 +95,11 @@ Switch to **verbatim** in the UI for raw Whisper output. Raw + polished text bot
 
 ## Dictionary
 
-Add preferred spellings (names, product terms) in the UI. Matching is case-insensitive with word boundaries; longer phrases win. Applied after polish. Stored only on disk under the OS app data dir (`…/talontype/dictionary.json`).
+Add preferred spellings (names, product terms) in the UI. Matching is case-insensitive with word boundaries; longer phrases win. Applied after polish. Stored only on disk under the OS app data dir (`…/eaglescribe/dictionary.json`).
 
 ## Snippets
 
-Map a short **cue** to a longer **expansion** (signatures, links, templates). If the whole utterance is the cue (ignoring trailing `.`/`?`), the expansion replaces it. Cues inside a sentence expand in place. Applied after dictionary. File: `…/talontype/snippets.json`.
+Map a short **cue** to a longer **expansion** (signatures, links, templates). If the whole utterance is the cue (ignoring trailing `.`/`?`), the expansion replaces it. Cues inside a sentence expand in place. Applied after dictionary. File: `…/eaglescribe/snippets.json`.
 
 ## What’s next
 
@@ -101,13 +110,13 @@ See [research/STATUS.md](./research/STATUS.md) for the full status and gap list.
 - [x] Snippets
 - [x] Push-to-talk hold (UI button still toggles)
 - [x] Command Mode via local OpenAI-compatible LLM (Ollama / llama-server)
+- [x] System tray / hide window (close hides to tray; Quit from tray menu)
 - [ ] Linux Wayland hotkey/paste hardening
-- [ ] System tray / hide window
 
 ## Command Mode
 
 1. Run a local LLM server (recommended: [Ollama](https://ollama.com) + `ollama pull llama3.2`).
-2. In TalonType, set base URL `http://127.0.0.1:11434/v1` and model name, click **Save LLM**.
+2. In EagleScribe, set base URL `http://127.0.0.1:11434/v1` and model name, click **Save LLM**.
 3. Select text in any app.
 4. Hold **Ctrl+Shift+X**, speak an instruction (e.g. “make this more professional”), release.
 5. Rewritten text is pasted (selection was copied first via Cmd/Ctrl+C).

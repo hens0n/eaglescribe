@@ -4,15 +4,20 @@
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>TalonType</title>
+    <title>EagleScribe</title>
     <script type="module" src="/src/main.ts" defer></script>
   </head>
 
   <body>
     <main class="container">
       <header class="header">
-        <h1>TalonType</h1>
+        <h1>EagleScribe</h1>
         <p class="tagline">Local voice dictation · offline by default</p>
+        <p class="hint tray-hint">
+          Lives in the menu bar as <strong>ES</strong>. Close this window to hide —
+          hotkeys keep working. <strong>Left-click</strong> ES to show again;
+          <strong>right-click</strong> for Show / Hide / Quit. Dock icon also restores.
+        </p>
       </header>
 
       <section class="card status-card">
@@ -21,9 +26,14 @@
           <span id="status-badge" class="badge idle">idle</span>
         </div>
         <div class="status-row">
-          <span class="label">Hotkey</span>
-          <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd>
+          <span class="label">Dictation</span>
+          <kbd id="status-dictation-hotkey">Ctrl+Shift+Space</kbd>
           <span id="hotkey-hint" class="hint">hold to talk · release to paste</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Command</span>
+          <kbd id="status-command-hotkey">Ctrl+Shift+X</kbd>
+          <span class="hint">hold · rewrite selection</span>
         </div>
         <div class="status-row">
           <span class="label">Model</span>
@@ -40,11 +50,33 @@
       </section>
 
       <section class="card">
-        <span class="label">Dictation hotkey</span>
+        <span class="label">Hotkeys</span>
         <p class="hint">
-          <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd> — choose how it
-          behaves. Saved locally.
+          Click <strong>Change</strong>, then press a chord (needs at least one
+          modifier). Esc cancels. Saved locally. Command Mode cannot use the
+          <kbd>C</kbd> key.
         </p>
+        <div class="hotkey-bind-row">
+          <span class="hotkey-bind-label">Dictation</span>
+          <kbd id="dictation-hotkey-display" class="hotkey-display">Ctrl+Shift+Space</kbd>
+          <button id="btn-change-dictation" type="button" class="secondary">
+            Change
+          </button>
+        </div>
+        <div class="hotkey-bind-row">
+          <span class="hotkey-bind-label">Command Mode</span>
+          <kbd id="command-hotkey-display" class="hotkey-display">Ctrl+Shift+X</kbd>
+          <button id="btn-change-command" type="button" class="secondary">
+            Change
+          </button>
+        </div>
+        <div class="row">
+          <button id="btn-reset-hotkeys" type="button" class="secondary">
+            Reset defaults
+          </button>
+        </div>
+        <p id="hotkey-capture-status" class="hint capture-status" hidden></p>
+        <span class="label">Dictation mode</span>
         <div class="row polish-row">
           <label class="check-label">
             <input id="hotkey-hold" type="radio" name="hotkey" value="hold" checked />
@@ -72,7 +104,7 @@
           <button id="btn-load" type="button" class="secondary">Load</button>
         </div>
         <p class="hint">
-          Or set <code>TALONTYPE_WHISPER_MODEL</code>. Default:
+          Or set <code>EAGLESCRIBE_WHISPER_MODEL</code>. Default:
           <code>models/ggml-base.en.bin</code>
         </p>
       </section>
@@ -104,13 +136,13 @@
             id="dict-from"
             type="text"
             spellcheck="false"
-            placeholder="what you say (e.g. talon type)"
+            placeholder="what you say (e.g. eagle scribe)"
           />
           <input
             id="dict-to"
             type="text"
             spellcheck="false"
-            placeholder="write as (e.g. TalonType)"
+            placeholder="write as (e.g. EagleScribe)"
           />
           <button id="btn-dict-add" type="button">Add</button>
         </div>

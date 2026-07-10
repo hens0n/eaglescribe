@@ -21,6 +21,8 @@ interface StatusSnapshot {
   model_loaded: boolean;
   polish_mode: PolishMode;
   hotkey_mode: HotkeyMode;
+  dictation_hotkey: string;
+  command_hotkey: string;
   llm_base_url: string;
   llm_model: string;
   dictionary_path: string;
@@ -39,6 +41,13 @@ const HOTKEY_HINTS: Record<HotkeyMode, string> = {
   toggle: "press to start · press again to paste",
 };
 
+type CaptureTarget = "dictation" | "command" | null;
+
+let captureTarget: CaptureTarget = null;
+/** Latest known bindings (for partial updates while capturing). */
+let currentDictationHotkey = "Ctrl+Shift+Space";
+let currentCommandHotkey = "Ctrl+Shift+X";
+
 const els = {
   badge: () => document.querySelector("#status-badge") as HTMLElement,
   modelLoaded: () => document.querySelector("#model-loaded") as HTMLElement,
@@ -47,6 +56,22 @@ const els = {
   hotkeyHint: () => document.querySelector("#hotkey-hint") as HTMLElement,
   hotkeyHold: () => document.querySelector("#hotkey-hold") as HTMLInputElement,
   hotkeyToggle: () => document.querySelector("#hotkey-toggle") as HTMLInputElement,
+  statusDictationHotkey: () =>
+    document.querySelector("#status-dictation-hotkey") as HTMLElement,
+  statusCommandHotkey: () =>
+    document.querySelector("#status-command-hotkey") as HTMLElement,
+  dictationHotkeyDisplay: () =>
+    document.querySelector("#dictation-hotkey-display") as HTMLElement,
+  commandHotkeyDisplay: () =>
+    document.querySelector("#command-hotkey-display") as HTMLElement,
+  btnChangeDictation: () =>
+    document.querySelector("#btn-change-dictation") as HTMLButtonElement,
+  btnChangeCommand: () =>
+    document.querySelector("#btn-change-command") as HTMLButtonElement,
+  btnResetHotkeys: () =>
+    document.querySelector("#btn-reset-hotkeys") as HTMLButtonElement,
+  hotkeyCaptureStatus: () =>
+    document.querySelector("#hotkey-capture-status") as HTMLElement,
   modelPath: () => document.querySelector("#model-path") as HTMLInputElement,
   transcript: () => document.querySelector("#transcript") as HTMLElement,
   transcriptRaw: () => document.querySelector("#transcript-raw") as HTMLElement,
@@ -75,6 +100,77 @@ const els = {
   snipPath: () => document.querySelector("#snip-path") as HTMLElement,
   btnSnipAdd: () => document.querySelector("#btn-snip-add") as HTMLButtonElement,
 };
+
+/** Map a KeyboardEvent to a global-hotkey string (modifiers + e.code). */
+function eventToHotkeyString(e: KeyboardEvent): string | null {
+  const code = e.code;
+  if (
+    code === "ControlLeft" ||
+    code === "ControlRight" ||
+    code === "ShiftLeft" ||
+    code === "ShiftRight" ||
+    code === "AltLeft" ||
+    code === "AltRight" ||
+    code === "MetaLeft" ||
+    code === "MetaRight" ||
+    code === "OSLeft" ||
+    code === "OSRight"
+  ) {
+    return null;
+  }
+
+  const parts: string[] = [];
+  if (e.ctrlKey) parts.push("Ctrl");
+  if (e.metaKey) parts.push("Cmd");
+  if (e.altKey) parts.push("Alt");
+  if (e.shiftKey) parts.push("Shift");
+  if (parts.length === 0) return null;
+
+  // e.code is already "KeyX", "Space", "Digit1", "F5", … — accepted by the parser.
+  parts.push(code);
+  return parts.join("+");
+}
+
+function setCaptureUi(target: CaptureTarget) {
+  captureTarget = target;
+  const status = els.hotkeyCaptureStatus();
+  const dDisp = els.dictationHotkeyDisplay();
+  const cDisp = els.commandHotkeyDisplay();
+  dDisp.classList.toggle("listening", target === "dictation");
+  cDisp.classList.toggle("listening", target === "command");
+  els.btnChangeDictation().disabled = target !== null;
+  els.btnChangeCommand().disabled = target !== null;
+  els.btnResetHotkeys().disabled = target !== null;
+
+  if (!target) {
+    status.hidden = true;
+    status.textContent = "";
+    return;
+  }
+  status.hidden = false;
+  status.textContent =
+    target === "dictation"
+      ? "Listening for dictation hotkey… (Esc to cancel)"
+      : "Listening for Command Mode hotkey… (Esc to cancel)";
+}
+
+function stopCapture() {
+  setCaptureUi(null);
+}
+
+async function applyHotkeys(dictation: string, command: string) {
+  const s = await invoke<StatusSnapshot>("set_hotkeys", { dictation, command });
+  applyStatus(s);
+}
+
+function updateHotkeyDisplays(dictation: string, command: string) {
+  currentDictationHotkey = dictation;
+  currentCommandHotkey = command;
+  els.statusDictationHotkey().textContent = dictation;
+  els.statusCommandHotkey().textContent = command;
+  els.dictationHotkeyDisplay().textContent = dictation;
+  els.commandHotkeyDisplay().textContent = command;
+}
 
 function renderDictionary(entries: DictEntry[], path: string) {
   els.dictPath().textContent = path || "—";
@@ -180,6 +276,10 @@ function applyStatus(s: StatusSnapshot) {
   const hotkeyMode = s.hotkey_mode ?? "hold";
   els.hotkeyMode().textContent = hotkeyMode;
   els.hotkeyHint().textContent = HOTKEY_HINTS[hotkeyMode] ?? HOTKEY_HINTS.hold;
+  updateHotkeyDisplays(
+    s.dictation_hotkey ?? "Ctrl+Shift+Space",
+    s.command_hotkey ?? "Ctrl+Shift+X",
+  );
   els.modelPath().value = s.model_path;
   if (document.activeElement !== els.llmUrl()) {
     els.llmUrl().value = s.llm_base_url ?? "";
@@ -337,6 +437,57 @@ window.addEventListener("DOMContentLoaded", async () => {
   els.hotkeyToggle().addEventListener("change", () => {
     if (els.hotkeyToggle().checked) void onHotkeyModeChange("toggle");
   });
+
+  els.btnChangeDictation().addEventListener("click", () => {
+    setCaptureUi("dictation");
+  });
+  els.btnChangeCommand().addEventListener("click", () => {
+    setCaptureUi("command");
+  });
+  els.btnResetHotkeys().addEventListener("click", async () => {
+    stopCapture();
+    try {
+      const s = await invoke<StatusSnapshot>("reset_hotkeys");
+      applyStatus(s);
+    } catch (e) {
+      alert(String(e));
+      await refresh();
+    }
+  });
+
+  window.addEventListener(
+    "keydown",
+    (e) => {
+      if (!captureTarget) return;
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (e.key === "Escape") {
+        stopCapture();
+        return;
+      }
+
+      const combo = eventToHotkeyString(e);
+      if (!combo) return;
+
+      const target = captureTarget;
+      stopCapture();
+
+      void (async () => {
+        try {
+          if (target === "dictation") {
+            await applyHotkeys(combo, currentCommandHotkey);
+          } else if (target === "command") {
+            await applyHotkeys(currentDictationHotkey, combo);
+          }
+        } catch (err) {
+          alert(String(err));
+          await refresh();
+        }
+      })();
+    },
+    true,
+  );
 
   const addDict = async () => {
     const from = els.dictFrom().value.trim();

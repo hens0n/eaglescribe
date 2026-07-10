@@ -92,7 +92,7 @@ pub fn resolve_model_path(override_path: Option<&str>) -> PathBuf {
         }
     }
 
-    if let Ok(env_path) = std::env::var("TALONTYPE_WHISPER_MODEL") {
+    if let Ok(env_path) = std::env::var("EAGLESCRIBE_WHISPER_MODEL") {
         if !env_path.is_empty() {
             return PathBuf::from(env_path);
         }
@@ -106,7 +106,7 @@ pub fn resolve_model_path(override_path: Option<&str>) -> PathBuf {
     }
 
     if let Some(data) = dirs::data_local_dir() {
-        return data.join("talontype").join("models").join("ggml-base.en.bin");
+        return data.join("eaglescribe").join("models").join("ggml-base.en.bin");
     }
 
     PathBuf::from("models/ggml-base.en.bin")

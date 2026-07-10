@@ -3,7 +3,7 @@
 //! **macOS:** HIToolbox / Text Input Source APIs used by layout-dependent keys
 //! (`Key::Unicode`) must run on the main thread. Calling them from the
 //! transcription worker thread aborts with `EXC_BREAKPOINT` /
-//! `_dispatch_assert_queue_fail` (see DiagnosticReports for talontype).
+//! `_dispatch_assert_queue_fail` (see DiagnosticReports for eaglescribe).
 //!
 //! We therefore:
 //! 1. Set the clipboard on any thread (safe).
@@ -127,11 +127,11 @@ fn run_paste_on_main_thread<R: Runtime>(app: &AppHandle<R>) -> AppResult<bool> {
     match rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok(())) => Ok(true),
         Ok(Err(e)) => {
-            eprintln!("[talontype] paste simulation failed (text is on clipboard): {e}");
+            eprintln!("[eaglescribe] paste simulation failed (text is on clipboard): {e}");
             Ok(false)
         }
         Err(_) => {
-            eprintln!("[talontype] paste timed out waiting for main thread (text is on clipboard)");
+            eprintln!("[eaglescribe] paste timed out waiting for main thread (text is on clipboard)");
             Ok(false)
         }
     }
@@ -214,6 +214,6 @@ mod tests {
     #[test]
     fn copy_to_clipboard_accepts_text() {
         // May fail in headless CI without pasteboard; skip soft-fail.
-        let _ = copy_to_clipboard("talontype-test");
+        let _ = copy_to_clipboard("eaglescribe-test");
     }
 }

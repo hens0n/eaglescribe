@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DictEntry {
-    /// What STT typically produces (or a phrase to match), e.g. "talon type".
+    /// What STT typically produces (or a phrase to match), e.g. "eagle scribe".
     pub from: String,
-    /// Preferred spelling to insert, e.g. "TalonType".
+    /// Preferred spelling to insert, e.g. "EagleScribe".
     pub to: String,
 }
 
@@ -174,11 +174,11 @@ fn adapt_casing(matched: &str, replacement: &str) -> String {
     replacement.to_string()
 }
 
-/// Default path: `~/Library/Application Support/talontype/dictionary.json` (macOS)
+/// Default path: `~/Library/Application Support/eaglescribe/dictionary.json` (macOS)
 /// or platform equivalent via `dirs::data_local_dir`.
 pub fn default_dictionary_path() -> PathBuf {
     if let Some(data) = dirs::data_local_dir() {
-        return data.join("talontype").join("dictionary.json");
+        return data.join("eaglescribe").join("dictionary.json");
     }
     PathBuf::from("dictionary.json")
 }
@@ -190,20 +190,20 @@ mod tests {
     #[test]
     fn replaces_phrase_case_insensitive() {
         let mut d = Dictionary::default();
-        d.upsert("talon type", "TalonType").unwrap();
+        d.upsert("eagle scribe", "EagleScribe").unwrap();
         assert_eq!(
-            d.apply("I love talon type so much"),
-            "I love TalonType so much"
+            d.apply("I love eagle scribe so much"),
+            "I love EagleScribe so much"
         );
-        assert_eq!(d.apply("TALON TYPE rocks"), "TALONTYPE rocks");
+        assert_eq!(d.apply("EAGLE SCRIBE rocks"), "EAGLESCRIBE rocks");
     }
 
     #[test]
     fn longer_phrase_wins() {
         let mut d = Dictionary::default();
         d.upsert("type", "TYPE").unwrap();
-        d.upsert("talon type", "TalonType").unwrap();
-        assert_eq!(d.apply("use talon type please"), "use TalonType please");
+        d.upsert("eagle scribe", "EagleScribe").unwrap();
+        assert_eq!(d.apply("use eagle scribe please"), "use EagleScribe please");
     }
 
     #[test]

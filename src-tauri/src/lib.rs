@@ -1,6 +1,7 @@
 mod audio;
 mod dictionary;
 mod error;
+mod hotkey;
 mod inject;
 mod llm;
 mod polish;
@@ -10,18 +11,18 @@ mod state;
 mod stt;
 
 use error::{AppError, AppResult};
+use hotkey::{parse_shortcut, DEFAULT_COMMAND_HOTKEY, DEFAULT_DICTATION_HOTKEY};
 use polish::PolishMode;
 use settings::HotkeyMode;
 use state::{AppState, SharedState, StatusSnapshot};
 use stt::resolve_model_path;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
-
-const DEFAULT_HOTKEY_COMBO: &str = "Ctrl+Shift+Space";
-/// Must not use `C` — selection capture synthesizes Cmd/Ctrl+C and would
-/// immediately fire Released if the command hotkey also used C.
-const COMMAND_HOTKEY_COMBO: &str = "Ctrl+Shift+X";
+use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, RunEvent, WindowEvent,
+};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 #[tauri::command]
 fn get_status(state: tauri::State<'_, SharedState>) -> StatusSnapshot {
@@ -64,6 +65,42 @@ fn set_hotkey_mode(
     let mode = HotkeyMode::parse(&mode)?;
     state.inner().set_hotkey_mode(mode)?;
     Ok(state.inner().snapshot())
+}
+
+/// Rebind global dictation and/or Command Mode hotkeys (persisted + re-registered).
+#[tauri::command]
+fn set_hotkeys(
+    dictation: String,
+    command: String,
+    app: AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    let prev_d = state.inner().dictation_hotkey();
+    let prev_c = state.inner().command_hotkey();
+
+    state.inner().set_hotkey_bindings(&dictation, &command)?;
+    if let Err(e) = register_app_hotkeys(&app, state.inner()) {
+        // Roll back settings + OS registration.
+        let _ = state.inner().set_hotkey_bindings(&prev_d, &prev_c);
+        let _ = register_app_hotkeys(&app, state.inner());
+        return Err(AppError::from(format!(
+            "Could not register hotkeys (maybe in use by another app?): {e}"
+        )));
+    }
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
+fn reset_hotkeys(
+    app: AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    set_hotkeys(
+        DEFAULT_DICTATION_HOTKEY.to_string(),
+        DEFAULT_COMMAND_HOTKEY.to_string(),
+        app,
+        state,
+    )
 }
 
 #[tauri::command]
@@ -261,6 +298,128 @@ fn handle_command_hotkey(app: &AppHandle, state: &SharedState, key_state: Shortc
     }
 }
 
+/// Stable tray menu item ids (must match `handle_tray_menu_id`).
+const TRAY_SHOW: &str = "tray-show";
+const TRAY_HIDE: &str = "tray-hide";
+const TRAY_QUIT: &str = "tray-quit";
+
+fn main_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
+    app.get_webview_window("main")
+        .or_else(|| app.webview_windows().into_values().next())
+}
+
+fn show_main_window(app: &AppHandle) {
+    // On macOS, unhide the app first so a previously hidden window can appear
+    // after close-to-tray (and when the Dock icon is clicked).
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.show();
+    }
+    if let Some(window) = main_window(app) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn hide_main_window(app: &AppHandle) {
+    if let Some(window) = main_window(app) {
+        let _ = window.hide();
+    }
+}
+
+fn handle_tray_menu_id(app: &AppHandle, id: &str) {
+    match id {
+        TRAY_SHOW => show_main_window(app),
+        TRAY_HIDE => hide_main_window(app),
+        TRAY_QUIT => app.exit(0),
+        _ => {}
+    }
+}
+
+/// Unregister all global shortcuts, then register dictation + command from settings.
+fn register_app_hotkeys(app: &AppHandle, state: &SharedState) -> AppResult<()> {
+    let dictation_str = state.dictation_hotkey();
+    let command_str = state.command_hotkey();
+    let dictation = parse_shortcut(&dictation_str)?;
+    let command = parse_shortcut(&command_str)?;
+
+    // Clear previous bindings so rebind is clean.
+    let _ = app.global_shortcut().unregister_all();
+
+    {
+        let handle = app.clone();
+        let state = Arc::clone(state);
+        app.global_shortcut()
+            .on_shortcut(dictation, move |_app, _sc, event| {
+                handle_dictation_hotkey(&handle, &state, event.state);
+            })
+            .map_err(|e| AppError::from(format!("Register dictation hotkey failed: {e}")))?;
+    }
+
+    {
+        let handle = app.clone();
+        let state = Arc::clone(state);
+        app.global_shortcut()
+            .on_shortcut(command, move |_app, _sc, event| {
+                handle_command_hotkey(&handle, &state, event.state);
+            })
+            .map_err(|e| AppError::from(format!("Register command hotkey failed: {e}")))?;
+    }
+
+    Ok(())
+}
+
+/// Menu bar / system tray: stay available while the main window is hidden.
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show_i = MenuItem::with_id(app, TRAY_SHOW, "Show Window", true, None::<&str>)?;
+    let hide_i = MenuItem::with_id(app, TRAY_HIDE, "Hide Window", true, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(app)?;
+    let quit_i = MenuItem::with_id(app, TRAY_QUIT, "Quit EagleScribe", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_i, &hide_i, &sep, &quit_i])?;
+
+    // App-level listener: tray menu events are delivered as global MenuEvents.
+    // Relying only on TrayIconBuilder::on_menu_event has been flaky on macOS.
+    app.on_menu_event(|app, event| {
+        handle_tray_menu_id(app, event.id().as_ref());
+    });
+
+    let mut builder = TrayIconBuilder::with_id("eaglescribe-tray")
+        .menu(&menu)
+        // Left-click: show window. Right-click: open menu (macOS/Windows).
+        // Linux: tray click events unsupported — use the menu.
+        .show_menu_on_left_click(false)
+        .tooltip("EagleScribe — local dictation")
+        .on_menu_event(|app, event| {
+            handle_tray_menu_id(app, event.id().as_ref());
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon() {
+        // Do NOT set icon_as_template: the default app icon is full-color; as a
+        // macOS template it often becomes invisible in the menu bar.
+        builder = builder.icon(icon.clone());
+    }
+
+    // Text fallback so the tray entry is findable even if the glyph is subtle.
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.title("ES");
+    }
+
+    let _tray = builder.build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let model_path = resolve_model_path(None);
@@ -275,6 +434,8 @@ pub fn run() {
             set_model_path,
             set_polish_mode,
             set_hotkey_mode,
+            set_hotkeys,
+            reset_hotkeys,
             set_llm_settings,
             dictionary_add,
             dictionary_remove,
@@ -285,40 +446,30 @@ pub fn run() {
             toggle_command_mode,
             cancel_dictation,
         ])
+        // Closing the window hides to tray so hotkeys keep working.
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
-            let handle = app.handle().clone();
             let state = Arc::clone(app.state::<SharedState>().inner());
 
-            let dictation_shortcut =
-                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
-            let command_shortcut =
-                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyX);
+            setup_tray(app)?;
+            register_app_hotkeys(app.handle(), &state)
+                .map_err(|e| e.to_string())?;
 
-            {
-                let handle = handle.clone();
-                let state = Arc::clone(&state);
-                app.global_shortcut()
-                    .on_shortcut(dictation_shortcut, move |_app, _sc, event| {
-                        handle_dictation_hotkey(&handle, &state, event.state);
-                    })?;
-            }
-
-            {
-                let handle = handle.clone();
-                let state = Arc::clone(&state);
-                app.global_shortcut()
-                    .on_shortcut(command_shortcut, move |_app, _sc, event| {
-                        handle_command_hotkey(&handle, &state, event.state);
-                    })?;
-            }
-
-            let state = app.state::<SharedState>().inner();
             let mode = state.hotkey_mode();
             state.push_log(format!(
-                "Dictation hotkey: {DEFAULT_HOTKEY_COMBO} ({})",
+                "Dictation: {} ({})",
+                state.dictation_hotkey(),
                 mode.as_str()
             ));
-            state.push_log(format!("Command Mode hotkey: {COMMAND_HOTKEY_COMBO} (hold)"));
+            state.push_log(format!(
+                "Command Mode: {} (hold)",
+                state.command_hotkey()
+            ));
             state.push_log(format!("Hotkey: {}", mode.label()));
             state.push_log(format!("Model path: {}", state.snapshot().model_path));
             state.push_log(format!(
@@ -326,9 +477,27 @@ pub fn run() {
                 state.snapshot().llm_base_url,
                 state.snapshot().llm_model
             ));
+            state.push_log(
+                "Tray: close hides · click menu-bar “ES” / Show Window · Dock click also restores · Quit from tray",
+            );
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running TalonType");
+        .build(tauri::generate_context!())
+        .expect("error while building EagleScribe")
+        .run(|app, event| match event {
+            // Backup path for tray/window menu activation.
+            RunEvent::MenuEvent(e) => {
+                handle_tray_menu_id(app, e.id().as_ref());
+            }
+            // Dock icon click while all windows are hidden.
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } => {
+                show_main_window(app);
+            }
+            _ => {}
+        });
 }

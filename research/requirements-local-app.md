@@ -1,4 +1,4 @@
-# TalonType — Requirements for a Fully Local Dictation App
+# EagleScribe — Requirements for a Fully Local Dictation App
 
 **Status:** Working requirements (v1 restore)  
 **Date:** 2026-07-10  
@@ -9,7 +9,7 @@
 
 ## 1. Product thesis
 
-**TalonType** is a system-wide voice dictation app for people who want **Wispr Flow–class speed and polish** without sending audio or transcripts to a vendor cloud.
+**EagleScribe** is a system-wide voice dictation app for people who want **Wispr Flow–class speed and polish** without sending audio or transcripts to a vendor cloud.
 
 **One-liner:** Speak → on-device STT → local polish → paste into any app. Offline by default.
 
@@ -301,7 +301,7 @@ Hard rule: no audio/transcript leaves the device on the default path.
 
 ### MVP
 
-1. **As a** user, **I want** a global hotkey to start/stop listening **so that** I can dictate into any app without switching focus to TalonType.  
+1. **As a** user, **I want** a global hotkey to start/stop listening **so that** I can dictate into any app without switching focus to EagleScribe.  
 2. **As a** user, **I want** my speech transcribed on-device **so that** I can work offline and keep content private.  
 3. **As a** user, **I want** filler words removed and basic punctuation **so that** output is usable without heavy editing.  
 4. **As a** user, **I want** text pasted into the focused field or left on the clipboard **so that** dictation never “disappears.”  
@@ -354,7 +354,7 @@ MVP is accepted when **all** of the following pass on a developer Mac (and docum
 
 ## 11. Competitive positioning
 
-| Dimension | Wispr Flow | TalonType |
+| Dimension | Wispr Flow | EagleScribe |
 | --- | --- | --- |
 | STT location | **Always cloud** | **Always local (default)** |
 | Offline | No | **Yes** |
@@ -369,7 +369,7 @@ MVP is accepted when **all** of the following pass on a developer Mac (and docum
 
 **Positioning statement:**
 
-> TalonType is local-first dictation with Flow-inspired UX: hold a hotkey, speak, get clean text in any app—without a subscription meter and without uploading your voice.
+> EagleScribe is local-first dictation with Flow-inspired UX: hold a hotkey, speak, get clean text in any app—without a subscription meter and without uploading your voice.
 
 ---
 
@@ -385,12 +385,12 @@ MVP is accepted when **all** of the following pass on a developer Mac (and docum
 | OD-06 | VAD library | energy threshold vs silero | Spike complexity |
 | OD-07 | Command Mode model size | 1B–8B class GGUF | Hardware floor |
 | OD-08 | Windows priority vs Linux polish | Sequence | ADR currently Mac+Linux |
-| OD-09 | Brand name “TalonType” | Keep / rename | Legal check |
+| OD-09 | Brand name “EagleScribe” | Keep / rename | Legal check |
 | OD-10 | Accessibility API inject (Mac) | Beyond paste | Reliability vs complexity |
 
 ---
 
-## 13. Traceability: Wispr capabilities → TalonType requirements
+## 13. Traceability: Wispr capabilities → EagleScribe requirements
 
 | Wispr capability | Local response | Requirement IDs |
 | --- | --- | --- |

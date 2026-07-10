@@ -1,8 +1,9 @@
-# TalonType — project status & session handoff
+# EagleScribe — project status & session handoff
 
 **Last updated:** 2026-07-10  
-**Branch:** `main` (synced with `origin/main` as of latest push)  
-**Latest commit (as of write-up):** `99fd3d1` — list formatting in smart polish  
+**Branch:** `main`  
+**Latest focus:** Rebindable hotkeys (**implemented**, uncommitted until you commit)  
+**Previous commit (as of handoff):** `99fd3d1` — list formatting in smart polish  
 
 Use this document to resume work in a **new session**. For product research and full requirements, see:
 
@@ -17,7 +18,7 @@ Use this document to resume work in a **new session**. For product research and 
 
 ## 1. What we are building
 
-**TalonType** is a **fully local** voice-dictation desktop app inspired by Wispr Flow:
+**EagleScribe** is a **fully local** voice-dictation desktop app inspired by Wispr Flow:
 
 - Global hotkey → mic → **on-device Whisper** → **offline polish** → optional dictionary/snippets → paste into the focused app  
 - **Command Mode**: select text → speak an instruction → rewrite via a **localhost** OpenAI-compatible LLM (Ollama / llama-server)  
@@ -38,7 +39,7 @@ Primary platforms: **macOS** (validated), **Linux** (intended; less hardened).
 | Inject | Clipboard + simulated paste/copy on **main thread** (`enigo`, physical keycodes on macOS) |
 | Polish | Rule-based in `polish.rs` (no LLM) |
 | Command LLM | HTTP to **localhost** only (`ureq` → `/v1/chat/completions`) |
-| Persistence | JSON under OS app data dir (`…/talontype/`) |
+| Persistence | JSON under OS app data dir (`…/eaglescribe/`) |
 
 **Not used in-process:** llama.cpp linked into the binary (Command Mode uses local HTTP instead, to avoid heavy dual C++ link cost).
 
@@ -93,7 +94,7 @@ Select text in any app
 | Hold vs toggle (user choice) | Saved in `settings.json` |
 | UI always-toggle button | Independent of hotkey mode |
 | Cancel recording | UI Cancel |
-| Local Whisper model path | UI + `TALONTYPE_WHISPER_MODEL` + `models/ggml-base.en.bin` |
+| Local Whisper model path | UI + `EAGLESCRIBE_WHISPER_MODEL` + `models/ggml-base.en.bin` |
 | Smart polish | Fillers, spoken punct, backtrack, **lists**, cap + period |
 | Verbatim mode | Raw-ish STT (whitespace only) |
 | Raw + polished shown in UI | After each dictation |
@@ -101,10 +102,13 @@ Select text in any app
 | Snippets | `snippets.json`; whole-utterance or in-place |
 | Command Mode + LLM settings | `settings.json` (`llm_base_url`, `llm_model`) |
 | List formatting | Cardinal / ordinal / digit / bullet markers (need ≥2 items) |
+| System tray | Icon + menu: Show / Hide / Quit; left-click toggles window |
+| Hide on close | Window close hides to tray; hotkeys stay active until Quit |
+| Rebindable hotkeys | Dictation + Command Mode chords in settings; capture UI; conflict + KeyC checks |
 
 ### Local data files (macOS example)
 
-Under `~/Library/Application Support/talontype/` (via `dirs::data_local_dir`):
+Under `~/Library/Application Support/eaglescribe/` (via `dirs::data_local_dir`):
 
 - `settings.json` — hotkey mode, LLM URL/model  
 - `dictionary.json`  
@@ -120,9 +124,8 @@ Whisper weights: repo `models/*.bin` (gitignored) or user path.
 
 | Priority | Gap | Why |
 | --- | --- | --- |
-| **High (macOS UX)** | System tray / menu bar; hide main window | Always-on dictation without a large window |
 | **High (Linux)** | Wayland global hotkeys + paste reliability | X11-oriented crates; needs explicit Wayland path |
-| Medium | Rebindable hotkeys | Hardcoded combos today |
+| Medium (tray polish) | Dedicated monochrome tray glyph; optional dock-hide (LS accessory) | Default app icon + template; dock still shows |
 | Medium | Escape cancel (global) | Cancel exists in UI only |
 | Medium | Mic device picker | Uses default input only |
 | Medium | Optional transcript history | Not stored beyond “last” in UI |
@@ -156,7 +159,8 @@ src-tauri/src/
   snippets.rs     # Cue → expansion
   inject.rs       # Clipboard, paste/copy on main thread
   llm.rs          # Local OpenAI-compatible HTTP client
-  settings.rs     # Hotkey mode + LLM prefs
+  settings.rs     # Hotkey mode + bindings + LLM prefs
+  hotkey.rs       # Parse/validate rebindable global shortcuts
   error.rs
 
 src/
@@ -173,7 +177,7 @@ models/           # ggml weights (not in git)
 ## 7. How to run (new machine / session)
 
 ```bash
-cd /path/to/talontype
+cd /path/to/eaglescribe
 npm install
 npm run model:download          # ~140MB ggml-base.en.bin
 npm run desktop                 # tauri dev
@@ -182,7 +186,7 @@ npm run desktop                 # tauri dev
 Optional:
 
 ```bash
-export TALONTYPE_WHISPER_MODEL=/path/to/ggml-small.en.bin
+export EAGLESCRIBE_WHISPER_MODEL=/path/to/ggml-small.en.bin
 cd src-tauri && cargo build --features metal   # Apple Silicon STT
 ```
 
@@ -205,13 +209,13 @@ cd src-tauri && cargo test
 
 Pick one vertical slice:
 
-1. **System tray** (macOS first): tray icon, show/hide window, quit; keep hotkeys while “hidden”.  
-2. **Linux pass**: document distro deps; test hotkey + paste on X11 vs Wayland; fallbacks.  
-3. **Hotkey rebinding** + conflict warnings.  
-4. **History** of last N transcripts (local, optional, clearable).  
-5. **Packaging**: `tauri build`, dmg/appimage notes.
+1. **Linux pass**: document distro deps; test hotkey + paste on X11 vs Wayland; fallbacks.  
+2. **History** of last N transcripts (local, optional, clearable).  
+3. **Packaging**: `tauri build`, dmg/appimage notes.  
+4. **Tray polish**: custom template icon; optional “run as menu-bar only” (no dock).  
+5. **Escape cancel** (global) while recording.
 
-Default recommendation: **(1) system tray** for daily-driver feel on the Mac where the app is already proven.
+Default recommendation: **(2) history** for Mac dogfooding, or **(1) Linux pass** if shipping multi-platform soon.
 
 ---
 
@@ -226,6 +230,9 @@ Default recommendation: **(1) system tray** for daily-driver feel on the Mac whe
 | `0052a79` / `1d65f9d` | Hold-to-talk + GUI hold/toggle |
 | `cbf0849` / `dc33936` | Command Mode + hotkey fix |
 | `99fd3d1` | List formatting |
+| *(session)* | System tray + hide-on-close |
+| *(session)* | Rename → EagleScribe |
+| *(session)* | Rebindable hotkeys |
 
 ---
 

@@ -1,6 +1,6 @@
 # Wispr Flow — Product Research
 
-**Purpose:** Competitive and product research for designing **TalonType**, a fully local dictation alternative.  
+**Purpose:** Competitive and product research for designing **EagleScribe**, a fully local dictation alternative.  
 **Date:** 2026-07-10  
 **Related:** [requirements-local-app.md](./requirements-local-app.md), [stack-decision.md](./stack-decision.md)
 
@@ -18,7 +18,7 @@ Core product loop:
 4. Inject formatted text into the active app  
 5. Optionally transform text via **Command Mode** (Pro)
 
-**Strategic takeaway for TalonType:** Flow’s UX bar (hotkeys, polish, dictionary, snippets, context-aware style) is excellent, but its **architecture is cloud-only STT**. Privacy Mode and Cloud Sync only govern *training* and *storage*—not whether audio leaves the device. That gap is TalonType’s primary wedge: **Wispr-class UX with on-device inference by default**.
+**Strategic takeaway for EagleScribe:** Flow’s UX bar (hotkeys, polish, dictionary, snippets, context-aware style) is excellent, but its **architecture is cloud-only STT**. Privacy Mode and Cloud Sync only govern *training* and *storage*—not whether audio leaves the device. That gap is EagleScribe’s primary wedge: **Wispr-class UX with on-device inference by default**.
 
 ---
 
@@ -298,14 +298,14 @@ Independent of Cloud Sync:
 - SOC 2 / ISO 27001 program (see Security FAQ for current attestation status)  
 - Third-party LLM/STT subprocessors: Wispr claims ZDR agreements so *subprocessors* don’t train/store—**Wispr itself** still processes cloud audio  
 
-### 5.6 Mental model for TalonType
+### 5.6 Mental model for EagleScribe
 
 ```
 Wispr Flow (default path):
   Mic → client → CLOUD STT → CLOUD polish/LLM → client inject
   Privacy toggles only affect training + retention, not the hop off-device.
 
-TalonType (target path):
+EagleScribe (target path):
   Mic → local STT → local polish (± local LLM) → inject
   Network never on the critical path by default.
 ```
@@ -341,7 +341,7 @@ Primary source: [wisprflow.ai/pricing](https://wisprflow.ai/pricing) (as of rese
 
 ### 7.2 Differentiating architecture
 
-| Flow | TalonType target |
+| Flow | EagleScribe target |
 | --- | --- |
 | Cloud STT always | **whisper.cpp** (or equivalent) on-device |
 | Cloud LLM for Command Mode | **llama.cpp** / local GGUF optional |
@@ -368,7 +368,7 @@ Primary source: [wisprflow.ai/pricing](https://wisprflow.ai/pricing) (as of rese
 
 ### 7.5 Suggested stack alignment (see ADR)
 
-Already decided for TalonType:
+Already decided for EagleScribe:
 
 - Rust + Tauri 2  
 - whisper.cpp via whisper-rs  
@@ -387,8 +387,8 @@ Already decided for TalonType:
 | **macOS / Windows built-in dictation** | Free, limited polish | Baseline Flow beats on formatting & cross-app AI edits |
 | **Dragon / Nuance** | Enterprise classic | Heavy, expensive, legacy positioning |
 | **Otter / Fireflies / etc.** | Meeting notes, not system dictation | Adjacent, not direct |
-| **Whisper-based open tools** | DIY local | Accuracy/UX gap; TalonType productizes this |
-| **TalonType (this project)** | **Local-first** Mac + Linux | Compete on privacy + unlimited offline; match Flow UX over time |
+| **Whisper-based open tools** | DIY local | Accuracy/UX gap; EagleScribe productizes this |
+| **EagleScribe (this project)** | **Local-first** Mac + Linux | Compete on privacy + unlimited offline; match Flow UX over time |
 
 Positioning options:
 
@@ -401,7 +401,7 @@ Positioning options:
 
 ## 9. Gaps & Opportunities
 
-### Flow gaps (opportunities for TalonType)
+### Flow gaps (opportunities for EagleScribe)
 
 1. **No true offline / local STT** — airplane mode, air-gapped, sensitive orgs  
 2. **Not E2E encrypted** — provider can read content in transit processing  
@@ -422,7 +422,7 @@ Positioning options:
 6. Enterprise sales motion (HIPAA, SSO, admin)  
 7. Brand and distribution  
 
-### Priority bets for TalonType
+### Priority bets for EagleScribe
 
 | Priority | Bet |
 | --- | --- |
@@ -493,8 +493,8 @@ Positioning options:
 | Mac hotkey? | **Fn** (PTT) |
 | Windows hotkey? | **Ctrl+Win** (PTT) |
 | Command Mode? | Pro; desktop; transform selected/inline text |
-| TalonType wedge? | Same UX goals, **fully local** STT/polish |
+| EagleScribe wedge? | Same UX goals, **fully local** STT/polish |
 
 ---
 
-*Research compiled for TalonType product design. Pricing and policy details change; re-verify primary URLs before external claims.*
+*Research compiled for EagleScribe product design. Pricing and policy details change; re-verify primary URLs before external claims.*

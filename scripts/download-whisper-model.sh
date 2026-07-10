@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download a small English Whisper ggml model for the TalonType spike.
+# Download a small English Whisper ggml model for the EagleScribe spike.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -17,4 +17,4 @@ fi
 
 echo "Downloading ${MODEL} → ${DEST}"
 curl -fL --progress-bar -o "${DEST}" "${URL}"
-echo "Done. Set TALONTYPE_WHISPER_MODEL=${DEST} if needed."
+echo "Done. Set EAGLESCRIBE_WHISPER_MODEL=${DEST} if needed."

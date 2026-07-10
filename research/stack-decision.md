@@ -2,7 +2,7 @@
 
 **Status:** Accepted  
 **Date:** 2026-07-10  
-**Context:** Mac + Linux local dictation app (TalonType), Wispr Flow–class UX, fully offline by default.  
+**Context:** Mac + Linux local dictation app (EagleScribe), Wispr Flow–class UX, fully offline by default.  
 **Related:** [wispr-flow.md](./wispr-flow.md), [requirements-local-app.md](./requirements-local-app.md)
 
 ---

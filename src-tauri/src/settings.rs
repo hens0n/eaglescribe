@@ -1,6 +1,7 @@
-//! Lightweight local preferences (hotkey mode, LLM endpoint, etc.).
+//! Lightweight local preferences (hotkey mode, bindings, LLM endpoint, etc.).
 
 use crate::error::{AppError, AppResult};
+use crate::hotkey::{DEFAULT_COMMAND_HOTKEY, DEFAULT_DICTATION_HOTKEY};
 use crate::llm::LlmConfig;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -46,6 +47,12 @@ impl HotkeyMode {
 pub struct AppSettings {
     #[serde(default)]
     pub hotkey_mode: HotkeyMode,
+    /// Global dictation chord, e.g. `Ctrl+Shift+Space`.
+    #[serde(default = "default_dictation_hotkey")]
+    pub dictation_hotkey: String,
+    /// Global Command Mode chord, e.g. `Ctrl+Shift+X` (must not use C).
+    #[serde(default = "default_command_hotkey")]
+    pub command_hotkey: String,
     /// OpenAI-compatible base URL on localhost (Ollama / llama-server).
     #[serde(default = "default_llm_base_url")]
     pub llm_base_url: String,
@@ -53,6 +60,14 @@ pub struct AppSettings {
     pub llm_model: String,
     #[serde(default)]
     pub llm_api_key: String,
+}
+
+fn default_dictation_hotkey() -> String {
+    DEFAULT_DICTATION_HOTKEY.into()
+}
+
+fn default_command_hotkey() -> String {
+    DEFAULT_COMMAND_HOTKEY.into()
 }
 
 fn default_llm_base_url() -> String {
@@ -67,6 +82,8 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             hotkey_mode: HotkeyMode::Hold,
+            dictation_hotkey: default_dictation_hotkey(),
+            command_hotkey: default_command_hotkey(),
             llm_base_url: default_llm_base_url(),
             llm_model: default_llm_model(),
             llm_api_key: String::new(),
@@ -118,7 +135,7 @@ impl AppSettings {
 
 pub fn default_settings_path() -> PathBuf {
     if let Some(data) = dirs::data_local_dir() {
-        return data.join("talontype").join("settings.json");
+        return data.join("eaglescribe").join("settings.json");
     }
     PathBuf::from("settings.json")
 }
