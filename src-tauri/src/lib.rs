@@ -19,7 +19,9 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 const DEFAULT_HOTKEY_COMBO: &str = "Ctrl+Shift+Space";
-const COMMAND_HOTKEY_COMBO: &str = "Ctrl+Shift+C";
+/// Must not use `C` — selection capture synthesizes Cmd/Ctrl+C and would
+/// immediately fire Released if the command hotkey also used C.
+const COMMAND_HOTKEY_COMBO: &str = "Ctrl+Shift+X";
 
 #[tauri::command]
 fn get_status(state: tauri::State<'_, SharedState>) -> StatusSnapshot {
@@ -243,7 +245,15 @@ fn handle_dictation_hotkey(app: &AppHandle, state: &SharedState, key_state: Shor
 fn handle_command_hotkey(app: &AppHandle, state: &SharedState, key_state: ShortcutState) {
     let result = match key_state {
         ShortcutState::Pressed => start_command(app, state),
-        ShortcutState::Released => stop_session(app, state),
+        ShortcutState::Released => {
+            if state.should_ignore_command_release() {
+                // Synthetic Cmd/Ctrl+C during selection capture often looks like
+                // a release of the command chord — ignore those.
+                Ok(())
+            } else {
+                stop_session(app, state)
+            }
+        }
     };
     if let Err(e) = result {
         state.push_log(format!("Command hotkey error: {e}"));
@@ -282,7 +292,7 @@ pub fn run() {
             let dictation_shortcut =
                 Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
             let command_shortcut =
-                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyC);
+                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyX);
 
             {
                 let handle = handle.clone();

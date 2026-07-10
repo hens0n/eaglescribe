@@ -8,7 +8,9 @@ use crate::snippets::{self, Snippet, SnippetBook};
 use crate::stt::WhisperEngine;
 use parking_lot::Mutex;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Runtime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -28,6 +30,9 @@ enum SessionKind {
 
 pub struct AppState {
     inner: Mutex<InnerState>,
+    /// While true, Command Mode hotkey Released events are ignored.
+    /// Prevents synthetic Cmd/Ctrl+C (selection capture) from ending the session.
+    suppress_command_release: AtomicBool,
 }
 
 struct InnerState {
@@ -35,6 +40,8 @@ struct InnerState {
     session_kind: SessionKind,
     /// Selected text captured at the start of Command Mode (may be empty).
     command_selection: Option<String>,
+    /// Ignore command-hotkey releases until this time (debounce after arming).
+    command_ignore_release_until: Option<Instant>,
     model_path: PathBuf,
     settings_path: PathBuf,
     settings: AppSettings,
@@ -67,10 +74,12 @@ impl AppState {
         let hotkey_mode = settings.hotkey_mode;
 
         Self {
+            suppress_command_release: AtomicBool::new(false),
             inner: Mutex::new(InnerState {
                 status: DictationStatus::Idle,
                 session_kind: SessionKind::Dictation,
                 command_selection: None,
+                command_ignore_release_until: None,
                 model_path,
                 settings_path: settings_path.clone(),
                 settings,
@@ -102,12 +111,23 @@ impl AppState {
                         snippet_count
                     ));
                     log.push(
-                        "Command Mode: Ctrl+Shift+C (select text, hold, speak instruction)".into(),
+                        "Command Mode: Ctrl+Shift+X (select text, hold, speak instruction)".into(),
                     );
                     log
                 },
             }),
         }
+    }
+
+    /// True when a Command Mode Released event should be ignored (arming / debounce).
+    pub fn should_ignore_command_release(&self) -> bool {
+        if self.suppress_command_release.load(Ordering::SeqCst) {
+            return true;
+        }
+        let g = self.inner.lock();
+        g.command_ignore_release_until
+            .map(|t| Instant::now() < t)
+            .unwrap_or(false)
     }
 
     pub fn snapshot(&self) -> StatusSnapshot {
@@ -281,6 +301,10 @@ impl AppState {
     }
 
     /// Command Mode: capture selection, then record a spoken instruction.
+    ///
+    /// Selection capture synthesizes Cmd/Ctrl+C. That can spuriously fire
+    /// Released on hotkeys that include the C key, so we suppress command
+    /// releases while arming and for a short debounce window afterward.
     pub fn start_command_recording<R: Runtime>(&self, app: &AppHandle<R>) -> AppResult<()> {
         {
             let g = self.inner.lock();
@@ -292,28 +316,38 @@ impl AppState {
             }
         }
 
-        self.push_log("Command Mode: capturing selection (Cmd/Ctrl+C)…");
-        let selection = crate::inject::capture_selection(app).unwrap_or_default();
-        if selection.trim().is_empty() {
-            self.push_log("Command Mode: no selection — will generate at cursor.");
-        } else {
-            self.push_log(format!(
-                "Command Mode: {} chars selected",
-                selection.chars().count()
-            ));
-        }
+        self.suppress_command_release.store(true, Ordering::SeqCst);
 
-        let session = RecordingSession::start()?;
-        let mut g = self.inner.lock();
-        g.session = Some(session);
-        g.session_kind = SessionKind::Command;
-        g.command_selection = Some(selection);
-        g.status = DictationStatus::Recording;
-        g.last_error = None;
-        g.log.push(
-            "Command Mode recording… speak your instruction (e.g. make this more concise)".into(),
-        );
-        Ok(())
+        let selection = (|| {
+            self.push_log("Command Mode: capturing selection (Cmd/Ctrl+C)…");
+            let selection = crate::inject::capture_selection(app).unwrap_or_default();
+            if selection.trim().is_empty() {
+                self.push_log("Command Mode: no selection — will generate at cursor.");
+            } else {
+                self.push_log(format!(
+                    "Command Mode: {} chars selected",
+                    selection.chars().count()
+                ));
+            }
+
+            let session = RecordingSession::start()?;
+            let mut g = self.inner.lock();
+            g.session = Some(session);
+            g.session_kind = SessionKind::Command;
+            g.command_selection = Some(selection);
+            // Ignore hotkey releases for a bit after arming (synthetic key noise).
+            g.command_ignore_release_until = Some(Instant::now() + Duration::from_millis(400));
+            g.status = DictationStatus::Recording;
+            g.last_error = None;
+            g.log.push(
+                "Command Mode recording… speak your instruction (e.g. make this more concise)"
+                    .into(),
+            );
+            Ok(())
+        })();
+
+        self.suppress_command_release.store(false, Ordering::SeqCst);
+        selection
     }
 
     /// Stop mic, transcribe, polish, dictionary, snippets, inject.
@@ -521,6 +555,7 @@ impl AppState {
         }
         let _ = g.session.take();
         g.command_selection = None;
+        g.command_ignore_release_until = None;
         g.session_kind = SessionKind::Dictation;
         g.status = DictationStatus::Idle;
         g.log.push("Recording cancelled.".into());
