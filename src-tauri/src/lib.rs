@@ -1,6 +1,7 @@
 mod audio;
 mod dictionary;
 mod error;
+mod history;
 mod hotkey;
 mod inject;
 mod llm;
@@ -113,6 +114,21 @@ fn set_llm_settings(
     state
         .inner()
         .set_llm_settings(&base_url, &model, &api_key)?;
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
+fn set_history_enabled(
+    enabled: bool,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    state.inner().set_history_enabled(enabled)?;
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
+fn clear_history(state: tauri::State<'_, SharedState>) -> AppResult<StatusSnapshot> {
+    state.inner().clear_history()?;
     Ok(state.inner().snapshot())
 }
 
@@ -452,6 +468,8 @@ pub fn run() {
             set_hotkeys,
             reset_hotkeys,
             set_llm_settings,
+            set_history_enabled,
+            clear_history,
             dictionary_add,
             dictionary_remove,
             snippet_add,

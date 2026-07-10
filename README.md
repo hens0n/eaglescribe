@@ -103,7 +103,7 @@ Map a short **cue** to a longer **expansion** (signatures, links, templates). If
 
 ## What’s next
 
-See [research/STATUS.md](./research/STATUS.md) for the full status and gap list.
+See [research/STATUS.md](./research/STATUS.md) for the full status, backlog, and suggested session slices.
 
 - [x] Deterministic polish (fillers, punctuation, backtrack, lists)
 - [x] Personal dictionary
@@ -111,7 +111,13 @@ See [research/STATUS.md](./research/STATUS.md) for the full status and gap list.
 - [x] Push-to-talk hold (UI button still toggles)
 - [x] Command Mode via local OpenAI-compatible LLM (Ollama / llama-server)
 - [x] System tray / hide window (close hides to tray; Quit from tray menu)
+- [x] Rebindable hotkeys
+- [x] Dense tabbed UI + waiting-LLM status
+- [x] Transcript history (last N, local; History tab)
+- [ ] Global Escape cancel while recording
+- [ ] Mic device picker
 - [ ] Linux Wayland hotkey/paste hardening
+- [ ] Packaging (dmg / AppImage)
 
 ## Command Mode
 

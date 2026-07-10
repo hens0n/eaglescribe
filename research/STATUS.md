@@ -2,8 +2,8 @@
 
 **Last updated:** 2026-07-10  
 **Branch:** `main`  
-**Latest focus:** Rebindable hotkeys (**implemented**, uncommitted until you commit)  
-**Previous commit (as of handoff):** `99fd3d1` — list formatting in smart polish  
+**Latest focus:** Transcript history (**implemented**, uncommitted until you commit)  
+**Latest ship on origin:** `7cebf0a` — dense UI, waiting-LLM, STT deadlock fix  
 
 Use this document to resume work in a **new session**. For product research and full requirements, see:
 
@@ -24,7 +24,7 @@ Use this document to resume work in a **new session**. For product research and 
 - **Command Mode**: select text → speak an instruction → rewrite via a **localhost** OpenAI-compatible LLM (Ollama / llama-server)  
 - **No cloud required** for dictation STT/polish; no account  
 
-Primary platforms: **macOS** (validated), **Linux** (intended; less hardened).
+Primary platforms: **macOS** (validated / daily-driver), **Linux** (intended; less hardened).
 
 ---
 
@@ -34,12 +34,13 @@ Primary platforms: **macOS** (validated), **Linux** (intended; less hardened).
 | --- | --- |
 | App shell | **Tauri 2** + Vite/TS UI (`src/`, `src-tauri/`) |
 | Language | **Rust** |
-| STT | **whisper.cpp** via `whisper-rs` |
+| STT | **whisper.cpp** via `whisper-rs` (`Arc` engine; STT does **not** hold app state mutex) |
 | Audio | `cpal` (dedicated thread; stream not held in shared state) |
 | Inject | Clipboard + simulated paste/copy on **main thread** (`enigo`, physical keycodes on macOS) |
 | Polish | Rule-based in `polish.rs` (no LLM) |
 | Command LLM | HTTP to **localhost** only (`ureq` → `/v1/chat/completions`) |
 | Persistence | JSON under OS app data dir (`…/eaglescribe/`) |
+| Tray | Tauri `tray-icon`; hide-on-close; menu Show / Hide / Quit |
 
 **Not used in-process:** llama.cpp linked into the binary (Command Mode uses local HTTP instead, to avoid heavy dual C++ link cost).
 
@@ -63,26 +64,30 @@ Default builds are CPU whisper unless `--features metal` (etc.) is passed.
 ```
 Hotkey / UI button
   → mic capture (cpal)
-  → Whisper STT (ggml model on disk)
+  → status: recording
+  → Whisper STT (ggml model on disk)  → status: transcribing
   → smart polish OR verbatim
   → personal dictionary
   → snippets
   → inject (clipboard + Cmd/Ctrl+V on main thread)
+  → status: idle
 ```
 
 ### Command Mode
 
 ```
 Select text in any app
-  → hold Ctrl+Shift+X (or UI Command Mode button)
+  → hold command hotkey (default Ctrl+Shift+X) or UI button
   → capture selection (synthesized Cmd/Ctrl+C on main thread)
-  → record spoken instruction
-  → Whisper STT + light polish on instruction
-  → local LLM rewrite (localhost)
-  → inject result
+  → record spoken instruction  → status: recording
+  → Whisper STT + light polish  → status: transcribing
+  → local LLM rewrite (localhost)  → status: waiting_llm
+  → inject result  → status: idle
 ```
 
-**Hotkey note:** Command Mode is **Ctrl+Shift+X**, not `C`. Selection capture synthesizes copy (`C`); using `C` as the hotkey caused immediate session end (spurious Released). Releases are also suppressed during capture + ~400 ms debounce.
+**Hotkey note:** Command Mode default is **Ctrl+Shift+X**, not `C`. Selection capture synthesizes copy (`C`); using `C` as the main key ends the session immediately. Rebinds reject `C` for Command Mode. Releases are suppressed during capture + ~400 ms debounce.
+
+**Status badge values:** `idle` · `recording` · `transcribing` · `waiting_llm` · `error` (UI labels; snake_case over the wire).
 
 ---
 
@@ -90,10 +95,10 @@ Select text in any app
 
 | Feature | Notes / keys |
 | --- | --- |
-| Global dictation hotkey | `Ctrl+Shift+Space` |
+| Global dictation hotkey | Default `Ctrl+Shift+Space` (rebindable) |
 | Hold vs toggle (user choice) | Saved in `settings.json` |
 | UI always-toggle button | Independent of hotkey mode |
-| Cancel recording | UI Cancel |
+| Cancel recording | UI Cancel (global Escape still open) |
 | Local Whisper model path | UI + `EAGLESCRIBE_WHISPER_MODEL` + `models/ggml-base.en.bin` |
 | Smart polish | Fillers, spoken punct, backtrack, **lists**, cap + period |
 | Verbatim mode | Raw-ish STT (whitespace only) |
@@ -102,47 +107,56 @@ Select text in any app
 | Snippets | `snippets.json`; whole-utterance or in-place |
 | Command Mode + LLM settings | `settings.json` (`llm_base_url`, `llm_model`) |
 | List formatting | Cardinal / ordinal / digit / bullet markers (need ≥2 items) |
-| System tray | Icon + menu: Show / Hide / Quit; left-click toggles window |
+| System tray | Menu bar **ES** + icon; Show / Hide / Quit |
 | Hide on close | Window close hides to tray; hotkeys stay active until Quit |
-| Rebindable hotkeys | Dictation + Command Mode chords in settings; capture UI; conflict + KeyC checks |
+| Rebindable hotkeys | Dictation + Command chords; capture UI; conflict + KeyC checks |
+| Dense tabbed UI | Always-on status/actions/transcript; tabs: **Settings · Library · History · Log** |
+| Waiting-LLM status | Distinct badge while Command Mode awaits localhost LLM |
+| STT / paste deadlock fix | No state-mutex hold during Whisper; busy claim before worker |
+| Transcript history | Last N (default 50) in `history.json`; History tab; clear; toggle off |
 
 ### Local data files (macOS example)
 
 Under `~/Library/Application Support/eaglescribe/` (via `dirs::data_local_dir`):
 
-- `settings.json` — hotkey mode, LLM URL/model  
+- `settings.json` — hotkey mode, bindings, LLM, `history_enabled` / `history_max`  
 - `dictionary.json`  
 - `snippets.json`  
+- `history.json` — transcript history (newest capped by `history_max`)  
 
 Whisper weights: repo `models/*.bin` (gitignored) or user path.
+
+**Note:** Pre-rename data lived under `…/talontype/` — not auto-migrated.
 
 ---
 
 ## 5. Gaps & recommended next work
 
-### Explicitly open (README)
+### Open backlog (priority order)
 
-| Priority | Gap | Why |
+| Priority | Gap | Why / acceptance sketch |
 | --- | --- | --- |
-| **High (Linux)** | Wayland global hotkeys + paste reliability | X11-oriented crates; needs explicit Wayland path |
-| Medium (tray polish) | Dedicated monochrome tray glyph; optional dock-hide (LS accessory) | Default app icon + template; dock still shows |
-| Medium | Escape cancel (global) | Cancel exists in UI only |
-| Medium | Mic device picker | Uses default input only |
-| Medium | Optional transcript history | Not stored beyond “last” in UI |
-| Medium | VAD / silence trim | Full hold duration always transcribed |
-| Medium | Metal/CUDA default packaging | Features exist; not first-class UX |
-| Medium | Clipboard restore after paste | Optional polish |
-| Low | In-process llama.cpp | Command Mode is HTTP-local today |
-| Low | Signed dmg / AppImage, launch at login | Packaging / distribution |
+| **High (Linux)** | Wayland global hotkeys + paste reliability | X11-oriented crates; document distro deps; test X11 vs Wayland; fallbacks (clipboard-only if paste fails) |
+| **Medium** | **Escape cancel** (global) | While `recording`, Escape cancels (same as UI Cancel); must not fire when typing in focused fields if window focused — define scope (global always vs window-focused) |
+| **Medium** | Mic **device picker** | List inputs via `cpal`; persist choice in settings; default device fallback |
+| **Medium** | **VAD / silence trim** | Drop leading/trailing silence before STT; optional min-speech gate |
+| **Medium** | **Tray polish** | Dedicated monochrome template glyph; optional dock-hide (`ActivationPolicy::Accessory`) |
+| **Medium** | **Clipboard restore** after paste | Save prior clipboard; restore after successful inject (with short delay) |
+| **Medium** | Metal/CUDA **packaging UX** | First-class “build with Metal” docs/scripts; surface acceleration status in UI |
+| **Medium** | **Packaging / distribution** | `tauri build` notes; unsigned dmg/AppImage first; later signed + launch at login |
+| Low | In-process llama.cpp | Optional; Command Mode stays HTTP-local by default |
+| Low | Onboarding / permissions copy | Mic + Accessibility/Input Monitoring checklist on first run |
 | Out of scope (v1) | Cloud sync, accounts, team features, full voice OS (Talon-class) | By design |
 
 ### Known footguns
 
 1. **Stale Rust linker errors** (`ld: symbol(s) not found for architecture arm64` with `_anon.*`) after many Tauri rebuilds → `cd src-tauri && cargo clean && cargo build`.  
-2. **Command Mode needs a running local LLM** (e.g. Ollama). Clear error if unreachable.  
+2. **Command Mode needs a running local LLM** (e.g. Ollama). Clear error if unreachable; badge → `error`.  
 3. **Spoken “question mark”** only becomes `?` if Whisper emits those words; check **Raw** panel.  
 4. **Accessibility / Input Monitoring** may be required for reliable paste/copy simulation on macOS.  
-5. **List formatting** needs ≥2 markers; single “one” stays prose; backtrack runs before lists so “two actually three” does not listify.
+5. **List formatting** needs ≥2 markers; single “one” stays prose; backtrack runs before lists so “two actually three” does not listify.  
+6. **Back-to-back dictation** used to deadlock (state mutex held during Whisper + main-thread paste). Fixed in `7cebf0a` — if UI freezes on `transcribing` again, treat as regression.  
+7. **Tray Show menu** on macOS may be flaky; left-click + Dock reopen are primary restore paths.
 
 ---
 
@@ -150,8 +164,8 @@ Whisper weights: repo `models/*.bin` (gitignored) or user path.
 
 ```
 src-tauri/src/
-  lib.rs          # Tauri commands, hotkeys, app setup
-  state.rs        # Session state, dictation + command pipelines
+  lib.rs          # Tauri commands, hotkey register/rebind, tray, app setup
+  state.rs        # Session state, dictation + command pipelines, status emit
   audio.rs        # Mic capture on dedicated thread
   stt.rs          # whisper-rs wrapper
   polish.rs       # Offline cleanup + lists
@@ -161,11 +175,12 @@ src-tauri/src/
   llm.rs          # Local OpenAI-compatible HTTP client
   settings.rs     # Hotkey mode + bindings + LLM prefs
   hotkey.rs       # Parse/validate rebindable global shortcuts
+  history.rs      # Local transcript history (history.json)
   error.rs
 
 src/
-  main.ts         # UI wiring
-  styles.css
+  main.ts         # UI wiring, tabs, hotkey capture, history list
+  styles.css      # Dense shell + tab panels
 index.html
 
 scripts/download-whisper-model.sh
@@ -194,7 +209,7 @@ Command Mode:
 
 ```bash
 ollama pull llama3.2
-# In app: URL http://127.0.0.1:11434/v1 , model llama3.2 → Save LLM
+# In app Settings: URL http://127.0.0.1:11434/v1 , model llama3.2 → Save LLM
 ```
 
 Tests:
@@ -205,17 +220,24 @@ cd src-tauri && cargo test
 
 ---
 
-## 8. Suggested next session goals
+## 8. Suggested next session goals (slices)
 
-Pick one vertical slice:
+Pick **one vertical slice** per session. Each should ship usable end-to-end.
 
-1. **Linux pass**: document distro deps; test hotkey + paste on X11 vs Wayland; fallbacks.  
-2. **History** of last N transcripts (local, optional, clearable).  
-3. **Packaging**: `tauri build`, dmg/appimage notes.  
-4. **Tray polish**: custom template icon; optional “run as menu-bar only” (no dock).  
-5. **Escape cancel** (global) while recording.
+| # | Slice | Deliverable | Effort (rough) |
+| --- | --- | --- | --- |
+| **1** | **Escape cancel** | Global Escape cancels active recording; document interaction with capture UI | S |
+| **2** | **Mic device picker** | Enumerate devices; save id; use on next recording | M |
+| **3** | **VAD / silence trim** | Trim audio before Whisper; log trimmed duration | M |
+| **4** | **Tray polish** | Template menu-bar icon; optional “menu bar only” (no dock) | S–M |
+| **5** | **Clipboard restore** | Restore previous clipboard after inject (configurable) | S |
+| **6** | **Linux pass** | Distro deps doc; X11/Wayland hotkey + paste matrix; fallbacks | M–L |
+| **7** | **Packaging** | `tauri build` + dmg/AppImage notes; optional Metal release script | M |
+| **8** | **Accel packaging UX** | Surface Metal/CUDA in UI; first-class build docs | S–M |
 
-Default recommendation: **(2) history** for Mac dogfooding, or **(1) Linux pass** if shipping multi-platform soon.
+**Default recommendation (Mac dogfooding):** **(1) Escape cancel** — small, high-friction fix while recording.  
+
+**If multi-platform soon:** **(6) Linux pass**.
 
 ---
 
@@ -230,9 +252,9 @@ Default recommendation: **(2) history** for Mac dogfooding, or **(1) Linux pass*
 | `0052a79` / `1d65f9d` | Hold-to-talk + GUI hold/toggle |
 | `cbf0849` / `dc33936` | Command Mode + hotkey fix |
 | `99fd3d1` | List formatting |
-| *(session)* | System tray + hide-on-close |
-| *(session)* | Rename → EagleScribe |
-| *(session)* | Rebindable hotkeys |
+| `dd610d3` | Project STATUS handoff doc |
+| `37b7b86` | System tray, rebindable hotkeys, rename → EagleScribe |
+| `7cebf0a` | Dense tabbed UI, `waiting_llm` status, STT deadlock fix |
 
 ---
 
@@ -246,4 +268,4 @@ Do not add cloud STT or training uploads without an explicit, opt-in product dec
 
 ---
 
-*When updating this file after a session: bump “Last updated”, latest commit, and the Done / Gaps tables.*
+*When updating this file after a session: bump “Last updated”, latest commit, Done table, Gaps table, and Suggested slices.*

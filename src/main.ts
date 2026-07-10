@@ -28,6 +28,14 @@ interface Snippet {
   expansion: string;
 }
 
+interface HistoryEntry {
+  id: string;
+  at_ms: number;
+  kind: string;
+  text: string;
+  raw?: string | null;
+}
+
 interface StatusSnapshot {
   status: DictationStatus;
   model_path: string;
@@ -42,6 +50,10 @@ interface StatusSnapshot {
   dictionary: DictEntry[];
   snippets_path: string;
   snippets: Snippet[];
+  history_path: string;
+  history_enabled: boolean;
+  history_max: number;
+  history: HistoryEntry[];
   last_transcript: string | null;
   last_raw_transcript: string | null;
   last_error: string | null;
@@ -112,6 +124,14 @@ const els = {
   snipList: () => document.querySelector("#snip-list") as HTMLUListElement,
   snipPath: () => document.querySelector("#snip-path") as HTMLElement,
   btnSnipAdd: () => document.querySelector("#btn-snip-add") as HTMLButtonElement,
+  historyList: () => document.querySelector("#history-list") as HTMLUListElement,
+  historyPath: () => document.querySelector("#history-path") as HTMLElement,
+  historyEnabled: () =>
+    document.querySelector("#history-enabled") as HTMLInputElement,
+  historyMaxLabel: () =>
+    document.querySelector("#history-max-label") as HTMLElement,
+  btnClearHistory: () =>
+    document.querySelector("#btn-clear-history") as HTMLButtonElement,
 };
 
 /** Map a KeyboardEvent to a global-hotkey string (modifiers + e.code). */
@@ -279,6 +299,82 @@ function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+function formatHistoryTime(atMs: number): string {
+  if (!atMs) return "—";
+  try {
+    return new Date(atMs).toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return "—";
+  }
+}
+
+function renderHistory(
+  entries: HistoryEntry[],
+  path: string,
+  enabled: boolean,
+  max: number,
+) {
+  els.historyPath().textContent = path || "—";
+  els.historyMaxLabel().textContent = String(max || 50);
+  const checkbox = els.historyEnabled();
+  if (document.activeElement !== checkbox) {
+    checkbox.checked = enabled;
+  }
+  els.btnClearHistory().disabled = !entries.length;
+
+  const list = els.historyList();
+  list.innerHTML = "";
+  if (!enabled && !entries.length) {
+    const li = document.createElement("li");
+    li.className = "dict-empty";
+    li.textContent = "History is off. Enable Save to retain transcripts.";
+    list.appendChild(li);
+    return;
+  }
+  if (!entries.length) {
+    const li = document.createElement("li");
+    li.className = "dict-empty";
+    li.textContent = "No history yet. Dictate or run Command Mode.";
+    list.appendChild(li);
+    return;
+  }
+  for (const entry of entries) {
+    const li = document.createElement("li");
+    li.className = "history-item";
+
+    const meta = document.createElement("div");
+    meta.className = "history-meta";
+    const kind = document.createElement("span");
+    kind.className = `history-kind ${entry.kind === "command" ? "command" : ""}`;
+    kind.textContent = entry.kind || "dictation";
+    const when = document.createElement("span");
+    when.textContent = formatHistoryTime(entry.at_ms);
+    meta.appendChild(kind);
+    meta.appendChild(when);
+
+    const text = document.createElement("p");
+    text.className = "history-text";
+    text.textContent = entry.text;
+
+    li.appendChild(meta);
+    li.appendChild(text);
+
+    if (entry.raw && entry.raw !== entry.text) {
+      const raw = document.createElement("p");
+      raw.className = "history-raw";
+      raw.textContent = entry.raw;
+      li.appendChild(raw);
+    }
+
+    list.appendChild(li);
+  }
+}
+
 function applyStatus(s: StatusSnapshot) {
   const badge = els.badge();
   const status = (s.status ?? "idle") as DictationStatus;
@@ -306,6 +402,12 @@ function applyStatus(s: StatusSnapshot) {
   els.log().textContent = s.log.join("\n");
   renderDictionary(s.dictionary ?? [], s.dictionary_path ?? "");
   renderSnippets(s.snippets ?? [], s.snippets_path ?? "");
+  renderHistory(
+    s.history ?? [],
+    s.history_path ?? "",
+    s.history_enabled ?? true,
+    s.history_max ?? 50,
+  );
 
   if (s.polish_mode === "verbatim") {
     els.polishVerbatim().checked = true;
@@ -356,6 +458,7 @@ function setupTabs() {
   const panels = {
     settings: document.querySelector("#panel-settings") as HTMLElement,
     library: document.querySelector("#panel-library") as HTMLElement,
+    history: document.querySelector("#panel-history") as HTMLElement,
     log: document.querySelector("#panel-log") as HTMLElement,
   };
 
@@ -382,6 +485,29 @@ function setupTabs() {
 
 window.addEventListener("DOMContentLoaded", async () => {
   setupTabs();
+
+  els.historyEnabled().addEventListener("change", async () => {
+    try {
+      const s = await invoke<StatusSnapshot>("set_history_enabled", {
+        enabled: els.historyEnabled().checked,
+      });
+      applyStatus(s);
+    } catch (e) {
+      alert(String(e));
+      await refresh();
+    }
+  });
+
+  els.btnClearHistory().addEventListener("click", async () => {
+    if (!confirm("Clear all transcript history?")) return;
+    try {
+      const s = await invoke<StatusSnapshot>("clear_history");
+      applyStatus(s);
+    } catch (e) {
+      alert(String(e));
+      await refresh();
+    }
+  });
 
   els.btnToggle().addEventListener("click", async () => {
     try {

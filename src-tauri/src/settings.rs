@@ -60,6 +60,20 @@ pub struct AppSettings {
     pub llm_model: String,
     #[serde(default)]
     pub llm_api_key: String,
+    /// When true, successful injects are appended to `history.json`.
+    #[serde(default = "default_true")]
+    pub history_enabled: bool,
+    /// Max retained history entries (newest kept).
+    #[serde(default = "default_history_max")]
+    pub history_max: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_history_max() -> usize {
+    crate::history::DEFAULT_HISTORY_MAX
 }
 
 fn default_dictation_hotkey() -> String {
@@ -87,6 +101,8 @@ impl Default for AppSettings {
             llm_base_url: default_llm_base_url(),
             llm_model: default_llm_model(),
             llm_api_key: String::new(),
+            history_enabled: true,
+            history_max: default_history_max(),
         }
     }
 }

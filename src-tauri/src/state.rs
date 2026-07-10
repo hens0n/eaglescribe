@@ -1,9 +1,10 @@
 use crate::audio::RecordingSession;
 use crate::dictionary::{self, DictEntry, Dictionary};
 use crate::error::{AppError, AppResult};
+use crate::history::{self, HistoryBook, HistoryEntry};
+use crate::hotkey;
 use crate::llm;
 use crate::polish::{self, PolishMode};
-use crate::hotkey;
 use crate::settings::{self, AppSettings, HotkeyMode};
 use crate::snippets::{self, Snippet, SnippetBook};
 use crate::stt::WhisperEngine;
@@ -59,6 +60,8 @@ struct InnerState {
     dictionary: Dictionary,
     snippets_path: PathBuf,
     snippets: SnippetBook,
+    history_path: PathBuf,
+    history: HistoryBook,
     /// Shared so STT can run without holding the state mutex (avoids main-thread deadlock).
     engine: Option<Arc<WhisperEngine>>,
     session: Option<RecordingSession>,
@@ -82,6 +85,11 @@ impl AppState {
         let snippets = SnippetBook::load_or_default(&snippets_path);
         let snippet_count = snippets.snippets.len();
 
+        let history_path = history::default_history_path();
+        let history = HistoryBook::load_or_default(&history_path);
+        let history_count = history.entries.len();
+        let history_enabled = settings.history_enabled;
+
         let hotkey_mode = settings.hotkey_mode;
         let command_hotkey = settings.command_hotkey.clone();
         let dictation_hotkey = settings.dictation_hotkey.clone();
@@ -100,6 +108,8 @@ impl AppState {
                 dictionary,
                 snippets_path: snippets_path.clone(),
                 snippets,
+                history_path: history_path.clone(),
+                history,
                 engine: None,
                 session: None,
                 polish_mode: PolishMode::Smart,
@@ -126,6 +136,12 @@ impl AppState {
                         "Snippets: {} ({} cues)",
                         snippets_path.display(),
                         snippet_count
+                    ));
+                    log.push(format!(
+                        "History: {} ({} entries, {})",
+                        history_path.display(),
+                        history_count,
+                        if history_enabled { "on" } else { "off" }
                     ));
                     log
                 },
@@ -160,6 +176,10 @@ impl AppState {
             dictionary: g.dictionary.list(),
             snippets_path: g.snippets_path.display().to_string(),
             snippets: g.snippets.list(),
+            history_path: g.history_path.display().to_string(),
+            history_enabled: g.settings.history_enabled,
+            history_max: g.settings.history_max,
+            history: g.history.list_newest_first(),
             last_transcript: g.last_transcript.clone(),
             last_raw_transcript: g.last_raw_transcript.clone(),
             last_error: g.last_error.clone(),
@@ -229,6 +249,25 @@ impl AppState {
         g.settings.save(&g.settings_path)?;
         g.log
             .push(format!("Dictation hotkey: {dictation} · Command: {command}"));
+        Ok(())
+    }
+
+    pub fn set_history_enabled(&self, enabled: bool) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        g.settings.history_enabled = enabled;
+        g.settings.save(&g.settings_path)?;
+        g.log.push(format!(
+            "Transcript history: {}",
+            if enabled { "on" } else { "off" }
+        ));
+        Ok(())
+    }
+
+    pub fn clear_history(&self) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        g.history.clear();
+        g.history.save(&g.history_path)?;
+        g.log.push("Transcript history cleared.".into());
         Ok(())
     }
 
@@ -556,7 +595,7 @@ impl AppState {
             return Err(AppError::from("Transcript empty after polish"));
         }
 
-        self.finish_inject(app, &polished.raw, &text)
+        self.finish_inject(app, &polished.raw, &text, SessionKind::Dictation)
     }
 
     fn finish_command_mode<R: Runtime>(
@@ -600,7 +639,7 @@ impl AppState {
         };
 
         self.push_log(format!("Command result: {}", truncate(&rewritten, 80)));
-        self.finish_inject(app, instruction_raw, &rewritten)
+        self.finish_inject(app, instruction_raw, &rewritten, SessionKind::Command)
     }
 
     fn finish_inject<R: Runtime>(
@@ -608,6 +647,7 @@ impl AppState {
         app: &AppHandle<R>,
         raw: &str,
         text: &str,
+        kind: SessionKind,
     ) -> AppResult<String> {
         // Paste runs on the main thread; never hold `inner` across this call.
         match crate::inject::inject_text(app, text) {
@@ -627,6 +667,12 @@ impl AppState {
                             truncate(&result.text, 80)
                         ));
                     }
+                    Self::maybe_record_history(
+                        &mut g,
+                        kind,
+                        &result.text,
+                        Some(raw),
+                    );
                 }
                 let _ = app.emit("dictation-status", self.snapshot());
                 Ok(result.text)
@@ -641,10 +687,33 @@ impl AppState {
                     g.last_error = Some(e.to_string());
                     g.log
                         .push(format!("Transcript on clipboard; inject failed: {e}"));
+                    // Still record — user got the text on the clipboard.
+                    Self::maybe_record_history(&mut g, kind, text, Some(raw));
                 }
                 let _ = app.emit("dictation-status", self.snapshot());
                 Ok(text.to_string())
             }
+        }
+    }
+
+    fn maybe_record_history(
+        g: &mut InnerState,
+        kind: SessionKind,
+        text: &str,
+        raw: Option<&str>,
+    ) {
+        if !g.settings.history_enabled {
+            return;
+        }
+        let max = g.settings.history_max.max(1);
+        let kind_str = match kind {
+            SessionKind::Dictation => "dictation",
+            SessionKind::Command => "command",
+        };
+        g.history.push(kind_str, text, raw, max);
+        if let Err(e) = g.history.save(&g.history_path) {
+            g.log
+                .push(format!("History save failed (in-memory only): {e}"));
         }
     }
 
@@ -678,6 +747,10 @@ pub struct StatusSnapshot {
     pub dictionary: Vec<DictEntry>,
     pub snippets_path: String,
     pub snippets: Vec<Snippet>,
+    pub history_path: String,
+    pub history_enabled: bool,
+    pub history_max: usize,
+    pub history: Vec<HistoryEntry>,
     pub last_transcript: Option<String>,
     pub last_raw_transcript: Option<String>,
     pub last_error: Option<String>,

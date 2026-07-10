@@ -81,6 +81,16 @@
           class="tab"
           role="tab"
           aria-selected="false"
+          data-tab="history"
+          id="tab-history"
+        >
+          History
+        </button>
+        <button
+          type="button"
+          class="tab"
+          role="tab"
+          aria-selected="false"
           data-tab="log"
           id="tab-log"
         >
@@ -286,6 +296,38 @@
             <ul id="snip-list" class="dict-list"></ul>
             <p class="hint tight path-line">
               <code id="snip-path">—</code>
+            </p>
+          </div>
+        </section>
+
+        <!-- History -->
+        <section
+          id="panel-history"
+          class="tab-panel"
+          role="tabpanel"
+          aria-labelledby="tab-history"
+          hidden
+        >
+          <div class="panel-section history-section">
+            <div class="history-toolbar">
+              <div class="section-title">Transcript history</div>
+              <div class="row gap-sm">
+                <label class="check-inline">
+                  <input id="history-enabled" type="checkbox" checked />
+                  Save
+                </label>
+                <button id="btn-clear-history" type="button" class="secondary btn-sm">
+                  Clear all
+                </button>
+              </div>
+            </div>
+            <p class="hint tight">
+              Last <span id="history-max-label">50</span> successful dictations /
+              command results · local only
+            </p>
+            <ul id="history-list" class="history-list"></ul>
+            <p class="hint tight path-line">
+              <code id="history-path">—</code>
             </p>
           </div>
         </section>
