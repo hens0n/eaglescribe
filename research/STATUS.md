@@ -1,9 +1,9 @@
 # EagleScribe — project status & session handoff
 
 **Last updated:** 2026-07-10  
-**Branch:** `main`  
-**Latest focus:** Transcript history (**implemented**, uncommitted until you commit)  
-**Latest ship on origin:** `7cebf0a` — dense UI, waiting-LLM, STT deadlock fix  
+**Branch:** `main` (synced with `origin/main`)  
+**Latest commit:** `48ccad9` — local transcript history + History tab  
+**Previous ship:** `7cebf0a` — dense UI, waiting-LLM, STT deadlock fix  
 
 Use this document to resume work in a **new session**. For product research and full requirements, see:
 
@@ -255,6 +255,7 @@ Pick **one vertical slice** per session. Each should ship usable end-to-end.
 | `dd610d3` | Project STATUS handoff doc |
 | `37b7b86` | System tray, rebindable hotkeys, rename → EagleScribe |
 | `7cebf0a` | Dense tabbed UI, `waiting_llm` status, STT deadlock fix |
+| `48ccad9` | Local transcript history + History tab |
 
 ---
 
