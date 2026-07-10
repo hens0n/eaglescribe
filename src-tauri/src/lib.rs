@@ -1,4 +1,5 @@
 mod audio;
+mod dictionary;
 mod error;
 mod inject;
 mod polish;
@@ -45,6 +46,25 @@ fn set_polish_mode(
         }
     };
     state.inner().set_polish_mode(mode);
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
+fn dictionary_add(
+    from: String,
+    to: String,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    state.inner().dictionary_add(&from, &to)?;
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
+fn dictionary_remove(
+    from: String,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    state.inner().dictionary_remove(&from)?;
     Ok(state.inner().snapshot())
 }
 
@@ -109,6 +129,8 @@ pub fn run() {
             get_status,
             set_model_path,
             set_polish_mode,
+            dictionary_add,
+            dictionary_remove,
             load_model,
             toggle_dictation,
             cancel_dictation,

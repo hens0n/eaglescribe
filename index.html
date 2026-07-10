@@ -69,6 +69,33 @@
         </div>
       </section>
 
+      <section class="card">
+        <span class="label">Dictionary</span>
+        <p class="hint">
+          Force spellings for names and jargon. Match is case-insensitive;
+          longer phrases win. Stored locally only.
+        </p>
+        <div class="row">
+          <input
+            id="dict-from"
+            type="text"
+            spellcheck="false"
+            placeholder="what you say (e.g. talon type)"
+          />
+          <input
+            id="dict-to"
+            type="text"
+            spellcheck="false"
+            placeholder="write as (e.g. TalonType)"
+          />
+          <button id="btn-dict-add" type="button">Add</button>
+        </div>
+        <ul id="dict-list" class="dict-list"></ul>
+        <p class="hint">
+          File: <code id="dict-path">—</code>
+        </p>
+      </section>
+
       <section class="card actions">
         <button id="btn-toggle" type="button" class="primary">
           Start / stop dictation

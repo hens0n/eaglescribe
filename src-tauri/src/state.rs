@@ -1,4 +1,5 @@
 use crate::audio::RecordingSession;
+use crate::dictionary::{self, DictEntry, Dictionary};
 use crate::error::{AppError, AppResult};
 use crate::polish::{self, PolishMode};
 use crate::stt::WhisperEngine;
@@ -23,6 +24,8 @@ pub struct AppState {
 struct InnerState {
     status: DictationStatus,
     model_path: PathBuf,
+    dictionary_path: PathBuf,
+    dictionary: Dictionary,
     engine: Option<WhisperEngine>,
     session: Option<RecordingSession>,
     polish_mode: PolishMode,
@@ -34,17 +37,31 @@ struct InnerState {
 
 impl AppState {
     pub fn new(model_path: PathBuf) -> Self {
+        let dictionary_path = dictionary::default_dictionary_path();
+        let dictionary = Dictionary::load_or_default(&dictionary_path);
+        let entry_count = dictionary.entries.len();
+
         Self {
             inner: Mutex::new(InnerState {
                 status: DictationStatus::Idle,
                 model_path,
+                dictionary_path: dictionary_path.clone(),
+                dictionary,
                 engine: None,
                 session: None,
                 polish_mode: PolishMode::Smart,
                 last_transcript: None,
                 last_raw_transcript: None,
                 last_error: None,
-                log: vec!["TalonType ready.".into()],
+                log: {
+                    let mut log = vec!["TalonType ready.".into()];
+                    log.push(format!(
+                        "Dictionary: {} ({} entries)",
+                        dictionary_path.display(),
+                        entry_count
+                    ));
+                    log
+                },
             }),
         }
     }
@@ -56,6 +73,8 @@ impl AppState {
             model_path: g.model_path.display().to_string(),
             model_loaded: g.engine.is_some(),
             polish_mode: g.polish_mode,
+            dictionary_path: g.dictionary_path.display().to_string(),
+            dictionary: g.dictionary.list(),
             last_transcript: g.last_transcript.clone(),
             last_raw_transcript: g.last_raw_transcript.clone(),
             last_error: g.last_error.clone(),
@@ -86,6 +105,32 @@ impl AppState {
         let mut g = self.inner.lock();
         g.polish_mode = mode;
         g.log.push(format!("Polish mode: {mode:?}"));
+    }
+
+    pub fn dictionary_add(&self, from: &str, to: &str) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        g.dictionary.upsert(from, to)?;
+        g.dictionary.save(&g.dictionary_path)?;
+        g.log.push(format!(
+            "Dictionary: {:?} → {:?}",
+            from.trim(),
+            to.trim()
+        ));
+        Ok(())
+    }
+
+    pub fn dictionary_remove(&self, from: &str) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        if !g.dictionary.remove(from) {
+            return Err(AppError::from(format!(
+                "No dictionary entry for {:?}",
+                from.trim()
+            )));
+        }
+        g.dictionary.save(&g.dictionary_path)?;
+        g.log
+            .push(format!("Dictionary removed: {:?}", from.trim()));
+        Ok(())
     }
 
     pub fn ensure_engine(&self) -> AppResult<()> {
@@ -124,7 +169,7 @@ impl AppState {
         Ok(())
     }
 
-    /// Stop mic, transcribe, polish, inject. Returns polished (or raw) text.
+    /// Stop mic, transcribe, polish, dictionary, inject.
     pub fn stop_and_transcribe<R: Runtime>(&self, app: &AppHandle<R>) -> AppResult<String> {
         let session = {
             let mut g = self.inner.lock();
@@ -193,7 +238,11 @@ impl AppState {
             return Err(AppError::from("Empty transcript"));
         }
 
-        let mode = self.inner.lock().polish_mode;
+        let (mode, dictionary) = {
+            let g = self.inner.lock();
+            (g.polish_mode, g.dictionary.clone())
+        };
+
         let polished = polish::polish(&raw, mode);
         if polished.changed {
             self.push_log(format!(
@@ -205,7 +254,16 @@ impl AppState {
             self.push_log("Polish: no changes (or verbatim mode)");
         }
 
-        let text = polished.polished.clone();
+        let after_dict = dictionary.apply(&polished.polished);
+        if after_dict != polished.polished {
+            self.push_log(format!(
+                "Dictionary: {} → {}",
+                truncate(&polished.polished, 40),
+                truncate(&after_dict, 40)
+            ));
+        }
+
+        let text = after_dict;
         if text.is_empty() {
             let mut g = self.inner.lock();
             g.status = DictationStatus::Idle;
@@ -263,6 +321,8 @@ pub struct StatusSnapshot {
     pub model_path: String,
     pub model_loaded: bool,
     pub polish_mode: PolishMode,
+    pub dictionary_path: String,
+    pub dictionary: Vec<DictEntry>,
     pub last_transcript: Option<String>,
     pub last_raw_transcript: Option<String>,
     pub last_error: Option<String>,

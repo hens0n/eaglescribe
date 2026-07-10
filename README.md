@@ -81,13 +81,18 @@ After STT, **smart** mode (default) runs offline rules:
 
 Switch to **verbatim** in the UI for raw Whisper output. Raw + polished text both appear in the window after each dictation.
 
+## Dictionary
+
+Add preferred spellings (names, product terms) in the UI. Matching is case-insensitive with word boundaries; longer phrases win. Applied after polish. Stored only on disk under the OS app data dir (`…/talontype/dictionary.json`).
+
 ## What’s next
 
 - [x] Deterministic polish (fillers, punctuation, backtrack)
+- [x] Personal dictionary
 - [ ] llama.cpp Command Mode / optional rewrite
 - [ ] Push-to-talk hold (not only toggle)
 - [ ] Linux Wayland hotkey/paste hardening
-- [ ] Dictionary + snippets
+- [ ] Snippets
 - [ ] System tray / hide window
 
 ## License
