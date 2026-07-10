@@ -9,237 +9,301 @@
   </head>
 
   <body>
-    <main class="container">
-      <header class="header">
-        <h1>EagleScribe</h1>
-        <p class="tagline">Local voice dictation · offline by default</p>
-        <p class="hint tray-hint">
-          Lives in the menu bar as <strong>ES</strong>. Close this window to hide —
-          hotkeys keep working. <strong>Left-click</strong> ES to show again;
-          <strong>right-click</strong> for Show / Hide / Quit. Dock icon also restores.
-        </p>
-      </header>
-
-      <section class="card status-card">
-        <div class="status-row">
-          <span class="label">Status</span>
+    <main class="app">
+      <!-- Always-visible shell -->
+      <header class="topbar">
+        <div class="topbar-brand">
+          <h1>EagleScribe</h1>
           <span id="status-badge" class="badge idle">idle</span>
         </div>
-        <div class="status-row">
-          <span class="label">Dictation</span>
-          <kbd id="status-dictation-hotkey">Ctrl+Shift+Space</kbd>
-          <span id="hotkey-hint" class="hint">hold to talk · release to paste</span>
+        <div class="topbar-meta">
+          <span class="chip"
+            ><kbd id="status-dictation-hotkey">Ctrl+Shift+Space</kbd>
+            <span id="hotkey-hint" class="chip-hint">hold</span></span
+          >
+          <span class="chip muted-chip"
+            >cmd <kbd id="status-command-hotkey">Ctrl+Shift+X</kbd></span
+          >
+          <span id="model-loaded" class="chip muted-chip">not loaded</span>
+          <span class="chip muted-chip"
+            >polish <span id="polish-mode">smart</span></span
+          >
+          <span class="chip muted-chip"
+            >mode <span id="hotkey-mode">hold</span></span
+          >
         </div>
-        <div class="status-row">
-          <span class="label">Command</span>
-          <kbd id="status-command-hotkey">Ctrl+Shift+X</kbd>
-          <span class="hint">hold · rewrite selection</span>
-        </div>
-        <div class="status-row">
-          <span class="label">Model</span>
-          <span id="model-loaded" class="muted">not loaded</span>
-        </div>
-        <div class="status-row">
-          <span class="label">Polish</span>
-          <span id="polish-mode" class="muted">smart</span>
-        </div>
-        <div class="status-row">
-          <span class="label">Mode</span>
-          <span id="hotkey-mode" class="muted">hold</span>
-        </div>
-      </section>
+      </header>
 
-      <section class="card">
-        <span class="label">Hotkeys</span>
-        <p class="hint">
-          Click <strong>Change</strong>, then press a chord (needs at least one
-          modifier). Esc cancels. Saved locally. Command Mode cannot use the
-          <kbd>C</kbd> key.
-        </p>
-        <div class="hotkey-bind-row">
-          <span class="hotkey-bind-label">Dictation</span>
-          <kbd id="dictation-hotkey-display" class="hotkey-display">Ctrl+Shift+Space</kbd>
-          <button id="btn-change-dictation" type="button" class="secondary">
-            Change
-          </button>
-        </div>
-        <div class="hotkey-bind-row">
-          <span class="hotkey-bind-label">Command Mode</span>
-          <kbd id="command-hotkey-display" class="hotkey-display">Ctrl+Shift+X</kbd>
-          <button id="btn-change-command" type="button" class="secondary">
-            Change
-          </button>
-        </div>
-        <div class="row">
-          <button id="btn-reset-hotkeys" type="button" class="secondary">
-            Reset defaults
-          </button>
-        </div>
-        <p id="hotkey-capture-status" class="hint capture-status" hidden></p>
-        <span class="label">Dictation mode</span>
-        <div class="row polish-row">
-          <label class="check-label">
-            <input id="hotkey-hold" type="radio" name="hotkey" value="hold" checked />
-            Hold to talk
-            <span class="hint-inline">press &amp; hold · release to paste</span>
-          </label>
-          <label class="check-label">
-            <input id="hotkey-toggle" type="radio" name="hotkey" value="toggle" />
-            Toggle
-            <span class="hint-inline">press to start · press again to paste</span>
-          </label>
-        </div>
-      </section>
-
-      <section class="card">
-        <label class="label" for="model-path">Whisper model path (ggml)</label>
-        <div class="row">
-          <input
-            id="model-path"
-            type="text"
-            spellcheck="false"
-            placeholder="/path/to/ggml-base.en.bin"
-          />
-          <button id="btn-save-path" type="button">Save</button>
-          <button id="btn-load" type="button" class="secondary">Load</button>
-        </div>
-        <p class="hint">
-          Or set <code>EAGLESCRIBE_WHISPER_MODEL</code>. Default:
-          <code>models/ggml-base.en.bin</code>
-        </p>
-      </section>
-
-      <section class="card">
-        <span class="label">Cleanup</span>
-        <div class="row polish-row">
-          <label class="check-label">
-            <input id="polish-smart" type="radio" name="polish" value="smart" checked />
-            Smart
-            <span class="hint-inline">fillers · punctuation · backtrack</span>
-          </label>
-          <label class="check-label">
-            <input id="polish-verbatim" type="radio" name="polish" value="verbatim" />
-            Verbatim
-            <span class="hint-inline">raw STT only</span>
-          </label>
-        </div>
-      </section>
-
-      <section class="card">
-        <span class="label">Dictionary</span>
-        <p class="hint">
-          Force spellings for names and jargon. Match is case-insensitive;
-          longer phrases win. Stored locally only.
-        </p>
-        <div class="row">
-          <input
-            id="dict-from"
-            type="text"
-            spellcheck="false"
-            placeholder="what you say (e.g. eagle scribe)"
-          />
-          <input
-            id="dict-to"
-            type="text"
-            spellcheck="false"
-            placeholder="write as (e.g. EagleScribe)"
-          />
-          <button id="btn-dict-add" type="button">Add</button>
-        </div>
-        <ul id="dict-list" class="dict-list"></ul>
-        <p class="hint">
-          File: <code id="dict-path">—</code>
-        </p>
-      </section>
-
-      <section class="card">
-        <span class="label">Snippets</span>
-        <p class="hint">
-          Speak a short cue to insert a longer block of text. Whole-utterance
-          cues expand fully; cues inside a sentence expand in place.
-        </p>
-        <div class="row">
-          <input
-            id="snip-cue"
-            type="text"
-            spellcheck="false"
-            placeholder="cue (e.g. calendar link)"
-          />
-        </div>
-        <div class="row">
-          <textarea
-            id="snip-expansion"
-            rows="3"
-            spellcheck="false"
-            placeholder="Full text to insert…"
-          ></textarea>
-        </div>
-        <div class="row">
-          <button id="btn-snip-add" type="button">Add snippet</button>
-        </div>
-        <ul id="snip-list" class="dict-list"></ul>
-        <p class="hint">
-          File: <code id="snip-path">—</code>
-        </p>
-      </section>
-
-      <section class="card">
-        <span class="label">Command Mode (local LLM)</span>
-        <p class="hint">
-          Select text → hold <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> →
-          speak an instruction (e.g. “make this more concise”). Uses a
-          local OpenAI-compatible server (Ollama / llama-server). Nothing
-          is sent to the cloud.
-        </p>
-        <div class="row">
-          <input
-            id="llm-url"
-            type="text"
-            spellcheck="false"
-            placeholder="http://127.0.0.1:11434/v1"
-          />
-        </div>
-        <div class="row">
-          <input
-            id="llm-model"
-            type="text"
-            spellcheck="false"
-            placeholder="model name (e.g. llama3.2)"
-          />
-          <button id="btn-llm-save" type="button">Save LLM</button>
-        </div>
-        <p class="hint">
-          Example: install <a href="https://ollama.com" target="_blank" rel="noreferrer">Ollama</a>,
-          run <code>ollama pull llama3.2</code>, keep Ollama running.
-        </p>
-      </section>
-
-      <section class="card actions">
+      <section class="actions card-tight">
         <button id="btn-toggle" type="button" class="primary">
-          Start / stop dictation
+          Start dictation
         </button>
         <button id="btn-command" type="button" class="secondary">
           Command Mode
         </button>
         <button id="btn-cancel" type="button" class="secondary">Cancel</button>
-        <p class="hint">
-          Dictation button always <strong>toggles</strong>. Command Mode button
-          toggles instruction capture (hotkey is hold).
-        </p>
       </section>
 
-      <section class="card">
-        <span class="label">Last transcript</span>
+      <section class="card-tight transcript-card">
+        <div class="transcript-head">
+          <span class="label">Last transcript</span>
+          <span class="label raw-label-inline">Raw</span>
+        </div>
         <p id="transcript" class="transcript">—</p>
-        <span class="label raw-label">Raw (before polish)</span>
         <p id="transcript-raw" class="transcript raw">—</p>
-      </section>
-
-      <section class="card">
-        <span class="label">Log</span>
-        <pre id="log" class="log"></pre>
         <p id="error" class="error" hidden></p>
       </section>
+
+      <!-- Tabs -->
+      <nav class="tabs" role="tablist" aria-label="Settings panels">
+        <button
+          type="button"
+          class="tab active"
+          role="tab"
+          aria-selected="true"
+          data-tab="settings"
+          id="tab-settings"
+        >
+          Settings
+        </button>
+        <button
+          type="button"
+          class="tab"
+          role="tab"
+          aria-selected="false"
+          data-tab="library"
+          id="tab-library"
+        >
+          Library
+        </button>
+        <button
+          type="button"
+          class="tab"
+          role="tab"
+          aria-selected="false"
+          data-tab="log"
+          id="tab-log"
+        >
+          Log
+        </button>
+      </nav>
+
+      <div class="tab-panels">
+        <!-- Settings: hotkeys, polish, model, LLM -->
+        <section
+          id="panel-settings"
+          class="tab-panel active"
+          role="tabpanel"
+          aria-labelledby="tab-settings"
+        >
+          <div class="panel-section">
+            <div class="section-title">Hotkeys</div>
+            <p class="hint tight">
+              Change → press chord (needs a modifier). Esc cancels. Command Mode
+              cannot use <kbd>C</kbd>.
+            </p>
+            <div class="hotkey-bind-row">
+              <span class="hotkey-bind-label">Dictation</span>
+              <kbd id="dictation-hotkey-display" class="hotkey-display"
+                >Ctrl+Shift+Space</kbd
+              >
+              <button id="btn-change-dictation" type="button" class="secondary btn-sm">
+                Change
+              </button>
+            </div>
+            <div class="hotkey-bind-row">
+              <span class="hotkey-bind-label">Command</span>
+              <kbd id="command-hotkey-display" class="hotkey-display"
+                >Ctrl+Shift+X</kbd
+              >
+              <button id="btn-change-command" type="button" class="secondary btn-sm">
+                Change
+              </button>
+            </div>
+            <div class="row gap-sm">
+              <button id="btn-reset-hotkeys" type="button" class="secondary btn-sm">
+                Reset defaults
+              </button>
+              <p id="hotkey-capture-status" class="hint capture-status" hidden></p>
+            </div>
+            <div class="seg-row">
+              <span class="seg-label">Dictation mode</span>
+              <div class="seg">
+                <label class="seg-opt">
+                  <input
+                    id="hotkey-hold"
+                    type="radio"
+                    name="hotkey"
+                    value="hold"
+                    checked
+                  />
+                  Hold
+                </label>
+                <label class="seg-opt">
+                  <input
+                    id="hotkey-toggle"
+                    type="radio"
+                    name="hotkey"
+                    value="toggle"
+                  />
+                  Toggle
+                </label>
+              </div>
+            </div>
+            <div class="seg-row">
+              <span class="seg-label">Cleanup</span>
+              <div class="seg">
+                <label class="seg-opt">
+                  <input
+                    id="polish-smart"
+                    type="radio"
+                    name="polish"
+                    value="smart"
+                    checked
+                  />
+                  Smart
+                </label>
+                <label class="seg-opt">
+                  <input
+                    id="polish-verbatim"
+                    type="radio"
+                    name="polish"
+                    value="verbatim"
+                  />
+                  Verbatim
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel-section">
+            <div class="section-title">Whisper model</div>
+            <div class="row">
+              <input
+                id="model-path"
+                type="text"
+                spellcheck="false"
+                placeholder="/path/to/ggml-base.en.bin"
+              />
+              <button id="btn-save-path" type="button" class="btn-sm">Save</button>
+              <button id="btn-load" type="button" class="secondary btn-sm">Load</button>
+            </div>
+            <p class="hint tight">
+              Or <code>EAGLESCRIBE_WHISPER_MODEL</code> · default
+              <code>models/ggml-base.en.bin</code>
+            </p>
+          </div>
+
+          <div class="panel-section">
+            <div class="section-title">Command Mode LLM</div>
+            <p class="hint tight">
+              Select text → hold command hotkey → speak instruction. Localhost
+              only (Ollama / llama-server).
+            </p>
+            <div class="row">
+              <input
+                id="llm-url"
+                type="text"
+                spellcheck="false"
+                placeholder="http://127.0.0.1:11434/v1"
+              />
+            </div>
+            <div class="row">
+              <input
+                id="llm-model"
+                type="text"
+                spellcheck="false"
+                placeholder="model (e.g. llama3.2)"
+              />
+              <button id="btn-llm-save" type="button" class="btn-sm">Save LLM</button>
+            </div>
+          </div>
+
+          <p class="hint tight tray-footer">
+            Menu bar <strong>ES</strong>: close window to hide · left-click to
+            show · Quit from tray menu.
+          </p>
+        </section>
+
+        <!-- Library: dictionary + snippets -->
+        <section
+          id="panel-library"
+          class="tab-panel"
+          role="tabpanel"
+          aria-labelledby="tab-library"
+          hidden
+        >
+          <div class="panel-section">
+            <div class="section-title">Dictionary</div>
+            <p class="hint tight">
+              Preferred spellings · case-insensitive · longer phrases win.
+            </p>
+            <div class="row">
+              <input
+                id="dict-from"
+                type="text"
+                spellcheck="false"
+                placeholder="what you say"
+              />
+              <input
+                id="dict-to"
+                type="text"
+                spellcheck="false"
+                placeholder="write as"
+              />
+              <button id="btn-dict-add" type="button" class="btn-sm">Add</button>
+            </div>
+            <ul id="dict-list" class="dict-list"></ul>
+            <p class="hint tight path-line">
+              <code id="dict-path">—</code>
+            </p>
+          </div>
+
+          <div class="panel-section">
+            <div class="section-title">Snippets</div>
+            <p class="hint tight">
+              Cue → expansion (whole utterance or in-place).
+            </p>
+            <div class="row">
+              <input
+                id="snip-cue"
+                type="text"
+                spellcheck="false"
+                placeholder="cue"
+              />
+            </div>
+            <div class="row">
+              <textarea
+                id="snip-expansion"
+                rows="2"
+                spellcheck="false"
+                placeholder="Expansion text…"
+              ></textarea>
+            </div>
+            <div class="row">
+              <button id="btn-snip-add" type="button" class="btn-sm">Add snippet</button>
+            </div>
+            <ul id="snip-list" class="dict-list"></ul>
+            <p class="hint tight path-line">
+              <code id="snip-path">—</code>
+            </p>
+          </div>
+        </section>
+
+        <!-- Log -->
+        <section
+          id="panel-log"
+          class="tab-panel"
+          role="tabpanel"
+          aria-labelledby="tab-log"
+          hidden
+        >
+          <div class="panel-section log-section">
+            <div class="section-title">Activity log</div>
+            <pre id="log" class="log"></pre>
+          </div>
+        </section>
+      </div>
     </main>
   </body>
 </html>

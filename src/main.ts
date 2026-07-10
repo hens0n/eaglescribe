@@ -1,7 +1,20 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-type DictationStatus = "idle" | "recording" | "transcribing" | "error";
+type DictationStatus =
+  | "idle"
+  | "recording"
+  | "transcribing"
+  | "waiting_llm"
+  | "error";
+
+const STATUS_LABELS: Record<DictationStatus, string> = {
+  idle: "idle",
+  recording: "recording",
+  transcribing: "transcribing",
+  waiting_llm: "waiting llm",
+  error: "error",
+};
 type PolishMode = "smart" | "verbatim";
 type HotkeyMode = "hold" | "toggle";
 
@@ -37,8 +50,8 @@ interface StatusSnapshot {
 }
 
 const HOTKEY_HINTS: Record<HotkeyMode, string> = {
-  hold: "hold to talk · release to paste",
-  toggle: "press to start · press again to paste",
+  hold: "hold",
+  toggle: "toggle",
 };
 
 type CaptureTarget = "dictation" | "command" | null;
@@ -268,8 +281,9 @@ function escapeHtml(s: string): string {
 
 function applyStatus(s: StatusSnapshot) {
   const badge = els.badge();
-  badge.textContent = s.status;
-  badge.className = `badge ${s.status}`;
+  const status = (s.status ?? "idle") as DictationStatus;
+  badge.textContent = STATUS_LABELS[status] ?? status;
+  badge.className = `badge ${status}`;
 
   els.modelLoaded().textContent = s.model_loaded ? "loaded" : "not loaded";
   els.polishMode().textContent = s.polish_mode;
@@ -314,8 +328,8 @@ function applyStatus(s: StatusSnapshot) {
     err.textContent = "";
   }
 
-  const busy = s.status === "transcribing";
-  const recording = s.status === "recording";
+  const busy = status === "transcribing" || status === "waiting_llm";
+  const recording = status === "recording";
   const isCommand = s.session_kind === "command";
   els.btnToggle().disabled = busy || (recording && isCommand);
   els.btnCommand().disabled = busy || (recording && !isCommand);
@@ -327,7 +341,9 @@ function applyStatus(s: StatusSnapshot) {
   els.btnCommand().textContent =
     recording && isCommand
       ? "Stop command (run LLM)"
-      : "Command Mode";
+      : status === "waiting_llm"
+        ? "Waiting on LLM…"
+        : "Command Mode";
 }
 
 async function refresh() {
@@ -335,7 +351,38 @@ async function refresh() {
   applyStatus(s);
 }
 
+function setupTabs() {
+  const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>(".tab"));
+  const panels = {
+    settings: document.querySelector("#panel-settings") as HTMLElement,
+    library: document.querySelector("#panel-library") as HTMLElement,
+    log: document.querySelector("#panel-log") as HTMLElement,
+  };
+
+  const activate = (name: keyof typeof panels) => {
+    for (const tab of tabs) {
+      const on = tab.dataset.tab === name;
+      tab.classList.toggle("active", on);
+      tab.setAttribute("aria-selected", on ? "true" : "false");
+    }
+    for (const [key, panel] of Object.entries(panels)) {
+      const on = key === name;
+      panel.classList.toggle("active", on);
+      panel.hidden = !on;
+    }
+  };
+
+  for (const tab of tabs) {
+    tab.addEventListener("click", () => {
+      const name = tab.dataset.tab as keyof typeof panels;
+      if (name && panels[name]) activate(name);
+    });
+  }
+}
+
 window.addEventListener("DOMContentLoaded", async () => {
+  setupTabs();
+
   els.btnToggle().addEventListener("click", async () => {
     try {
       const s = await invoke<StatusSnapshot>("toggle_dictation");

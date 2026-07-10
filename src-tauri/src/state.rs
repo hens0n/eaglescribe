@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,7 +20,16 @@ pub enum DictationStatus {
     Idle,
     Recording,
     Transcribing,
+    /// Command Mode: waiting on local LLM rewrite (after STT).
+    WaitingLlm,
     Error,
+}
+
+impl DictationStatus {
+    /// True while a background STT/LLM job should block new sessions.
+    pub fn is_busy(self) -> bool {
+        matches!(self, Self::Transcribing | Self::WaitingLlm)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +59,8 @@ struct InnerState {
     dictionary: Dictionary,
     snippets_path: PathBuf,
     snippets: SnippetBook,
-    engine: Option<WhisperEngine>,
+    /// Shared so STT can run without holding the state mutex (avoids main-thread deadlock).
+    engine: Option<Arc<WhisperEngine>>,
     session: Option<RecordingSession>,
     polish_mode: PolishMode,
     last_transcript: Option<String>,
@@ -187,7 +197,7 @@ impl AppState {
     pub fn set_model_path(&self, path: PathBuf) {
         let mut g = self.inner.lock();
         g.model_path = path;
-        g.engine = None;
+        g.engine = None; // drop Arc; reload on next ensure_engine
         g.log
             .push("Model path updated; will reload on next dictation.".into());
     }
@@ -301,19 +311,27 @@ impl AppState {
         let engine = WhisperEngine::load(&path)?;
 
         let mut g = self.inner.lock();
-        g.engine = Some(engine);
+        g.engine = Some(Arc::new(engine));
         g.log.push("Whisper model loaded.".into());
+        Ok(())
+    }
+
+    fn reject_if_unavailable(status: DictationStatus) -> AppResult<()> {
+        if status == DictationStatus::Recording {
+            return Err(AppError::from("Already recording"));
+        }
+        if status.is_busy() {
+            return Err(AppError::from(match status {
+                DictationStatus::WaitingLlm => "Waiting on local LLM — please wait",
+                _ => "Busy transcribing — please wait",
+            }));
+        }
         Ok(())
     }
 
     pub fn start_recording(&self) -> AppResult<()> {
         let mut g = self.inner.lock();
-        if g.status == DictationStatus::Recording {
-            return Err(AppError::from("Already recording"));
-        }
-        if g.status == DictationStatus::Transcribing {
-            return Err(AppError::from("Busy transcribing"));
-        }
+        Self::reject_if_unavailable(g.status)?;
 
         let session = RecordingSession::start()?;
         g.session = Some(session);
@@ -334,12 +352,7 @@ impl AppState {
     pub fn start_command_recording<R: Runtime>(&self, app: &AppHandle<R>) -> AppResult<()> {
         {
             let g = self.inner.lock();
-            if g.status == DictationStatus::Recording {
-                return Err(AppError::from("Already recording"));
-            }
-            if g.status == DictationStatus::Transcribing {
-                return Err(AppError::from("Busy transcribing"));
-            }
+            Self::reject_if_unavailable(g.status)?;
         }
 
         self.suppress_command_release.store(true, Ordering::SeqCst);
@@ -358,6 +371,10 @@ impl AppState {
 
             let session = RecordingSession::start()?;
             let mut g = self.inner.lock();
+            // Another session may have started while we captured selection.
+            if g.status == DictationStatus::Recording || g.status.is_busy() {
+                return Err(AppError::from("Busy — cannot start Command Mode"));
+            }
             g.session = Some(session);
             g.session_kind = SessionKind::Command;
             g.command_selection = Some(selection);
@@ -377,42 +394,79 @@ impl AppState {
     }
 
     /// Stop mic, transcribe, polish, dictionary, snippets, inject.
+    fn set_status_emit<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        status: DictationStatus,
+        log: Option<String>,
+    ) {
+        {
+            let mut g = self.inner.lock();
+            g.status = status;
+            if let Some(msg) = log {
+                g.log.push(msg);
+                if g.log.len() > 100 {
+                    let drain = g.log.len() - 100;
+                    g.log.drain(0..drain);
+                }
+            }
+        }
+        // Never hold the state lock across emit (UI / main-thread handlers may re-enter).
+        let _ = app.emit("dictation-status", self.snapshot());
+    }
+
+    fn fail_status<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        status: DictationStatus,
+        err: impl Into<String>,
+    ) {
+        let err = err.into();
+        {
+            let mut g = self.inner.lock();
+            g.status = status;
+            g.last_error = Some(err);
+        }
+        let _ = app.emit("dictation-status", self.snapshot());
+    }
+
     /// For Command Mode, runs local LLM rewrite instead of normal paste pipeline.
     pub fn stop_and_transcribe<R: Runtime>(&self, app: &AppHandle<R>) -> AppResult<String> {
+        // Claim the session and mark busy under one lock so back-to-back
+        // hotkeys cannot start a second worker while STT is still running.
         let (session, kind, command_selection) = {
             let mut g = self.inner.lock();
             if g.status != DictationStatus::Recording {
                 return Err(AppError::from("Not recording"));
             }
-            let session = g
-                .session
-                .take()
-                .ok_or_else(|| AppError::from("Missing recording session"))?;
+            let session = match g.session.take() {
+                Some(s) => s,
+                None => {
+                    g.status = DictationStatus::Error;
+                    g.last_error = Some("Missing recording session".into());
+                    drop(g);
+                    let _ = app.emit("dictation-status", self.snapshot());
+                    return Err(AppError::from("Missing recording session"));
+                }
+            };
             let kind = g.session_kind;
             let sel = g.command_selection.take();
             g.session_kind = SessionKind::Dictation;
-            (session, kind, sel)
-        };
-
-        if let Err(e) = self.ensure_engine() {
-            let mut g = self.inner.lock();
-            g.status = DictationStatus::Error;
-            g.last_error = Some(e.to_string());
-            return Err(e);
-        }
-
-        {
-            let mut g = self.inner.lock();
             g.status = DictationStatus::Transcribing;
             g.log.push("Transcribing on-device…".into());
+            (session, kind, sel)
+        };
+        let _ = app.emit("dictation-status", self.snapshot());
+
+        if let Err(e) = self.ensure_engine() {
+            self.fail_status(app, DictationStatus::Error, e.to_string());
+            return Err(e);
         }
 
         let (samples, rate) = match session.stop() {
             Ok(v) => v,
             Err(e) => {
-                let mut g = self.inner.lock();
-                g.status = DictationStatus::Error;
-                g.last_error = Some(e.to_string());
+                self.fail_status(app, DictationStatus::Error, e.to_string());
                 return Err(e);
             }
         };
@@ -424,30 +478,31 @@ impl AppState {
             audio.len()
         ));
 
-        let raw = {
+        // Clone Arc so Whisper runs without holding the state mutex.
+        // Holding the mutex during STT deadlocks with main-thread paste/hotkeys.
+        let engine = {
             let g = self.inner.lock();
-            let engine = g
-                .engine
-                .as_ref()
-                .ok_or_else(|| AppError::from("Engine not loaded"))?;
-            engine.transcribe_16k_mono(&audio)
+            g.engine
+                .clone()
+                .ok_or_else(|| AppError::from("Engine not loaded"))?
         };
 
-        let raw = match raw {
+        let raw = match engine.transcribe_16k_mono(&audio) {
             Ok(t) => t,
             Err(e) => {
-                let mut g = self.inner.lock();
-                g.status = DictationStatus::Error;
-                g.last_error = Some(e.to_string());
+                self.fail_status(app, DictationStatus::Error, e.to_string());
                 return Err(e);
             }
         };
 
         if raw.trim().is_empty() {
-            let mut g = self.inner.lock();
-            g.status = DictationStatus::Idle;
-            g.last_error = Some("Empty transcript (try speaking longer)".into());
-            g.log.push("Empty transcript.".into());
+            {
+                let mut g = self.inner.lock();
+                g.status = DictationStatus::Idle;
+                g.last_error = Some("Empty transcript (try speaking longer)".into());
+                g.log.push("Empty transcript.".into());
+            }
+            let _ = app.emit("dictation-status", self.snapshot());
             return Err(AppError::from("Empty transcript"));
         }
 
@@ -491,10 +546,13 @@ impl AppState {
 
         let text = after_snip;
         if text.is_empty() {
-            let mut g = self.inner.lock();
-            g.status = DictationStatus::Idle;
-            g.last_raw_transcript = Some(polished.raw);
-            g.last_error = Some("Transcript empty after polish".into());
+            {
+                let mut g = self.inner.lock();
+                g.status = DictationStatus::Idle;
+                g.last_raw_transcript = Some(polished.raw);
+                g.last_error = Some("Transcript empty after polish".into());
+            }
+            let _ = app.emit("dictation-status", self.snapshot());
             return Err(AppError::from("Transcript empty after polish"));
         }
 
@@ -517,18 +575,26 @@ impl AppState {
         let llm = self.inner.lock().settings.llm_config();
         let (system, user) = llm::build_rewrite_prompt(&instruction, &selection);
 
-        self.push_log(format!(
-            "Command Mode: calling local LLM {} …",
-            llm.model
-        ));
+        self.set_status_emit(
+            app,
+            DictationStatus::WaitingLlm,
+            Some(format!(
+                "Command Mode: waiting on local LLM {} …",
+                llm.model
+            )),
+        );
 
+        // HTTP call — must not hold state lock (and must not block main thread).
         let rewritten = match llm::complete(&llm, &system, &user) {
             Ok(t) => t,
             Err(e) => {
-                let mut g = self.inner.lock();
-                g.status = DictationStatus::Error;
-                g.last_error = Some(e.to_string());
-                g.last_raw_transcript = Some(instruction_raw.to_string());
+                {
+                    let mut g = self.inner.lock();
+                    g.status = DictationStatus::Error;
+                    g.last_error = Some(e.to_string());
+                    g.last_raw_transcript = Some(instruction_raw.to_string());
+                }
+                let _ = app.emit("dictation-status", self.snapshot());
                 return Err(e);
             }
         };
@@ -543,32 +609,40 @@ impl AppState {
         raw: &str,
         text: &str,
     ) -> AppResult<String> {
+        // Paste runs on the main thread; never hold `inner` across this call.
         match crate::inject::inject_text(app, text) {
             Ok(result) => {
-                let mut g = self.inner.lock();
-                g.last_raw_transcript = Some(raw.to_string());
-                g.last_transcript = Some(result.text.clone());
-                g.status = DictationStatus::Idle;
-                if result.pasted {
-                    g.log
-                        .push(format!("Injected: {}", truncate(&result.text, 80)));
-                } else {
-                    g.log.push(format!(
-                        "Copied (paste manually with Cmd/Ctrl+V): {}",
-                        truncate(&result.text, 80)
-                    ));
+                {
+                    let mut g = self.inner.lock();
+                    g.last_raw_transcript = Some(raw.to_string());
+                    g.last_transcript = Some(result.text.clone());
+                    g.status = DictationStatus::Idle;
+                    g.last_error = None;
+                    if result.pasted {
+                        g.log
+                            .push(format!("Injected: {}", truncate(&result.text, 80)));
+                    } else {
+                        g.log.push(format!(
+                            "Copied (paste manually with Cmd/Ctrl+V): {}",
+                            truncate(&result.text, 80)
+                        ));
+                    }
                 }
+                let _ = app.emit("dictation-status", self.snapshot());
                 Ok(result.text)
             }
             Err(e) => {
                 let _ = crate::inject::copy_to_clipboard(text);
-                let mut g = self.inner.lock();
-                g.last_raw_transcript = Some(raw.to_string());
-                g.last_transcript = Some(text.to_string());
-                g.status = DictationStatus::Idle;
-                g.last_error = Some(e.to_string());
-                g.log
-                    .push(format!("Transcript on clipboard; inject failed: {e}"));
+                {
+                    let mut g = self.inner.lock();
+                    g.last_raw_transcript = Some(raw.to_string());
+                    g.last_transcript = Some(text.to_string());
+                    g.status = DictationStatus::Idle;
+                    g.last_error = Some(e.to_string());
+                    g.log
+                        .push(format!("Transcript on clipboard; inject failed: {e}"));
+                }
+                let _ = app.emit("dictation-status", self.snapshot());
                 Ok(text.to_string())
             }
         }

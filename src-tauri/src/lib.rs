@@ -186,8 +186,20 @@ fn cancel_dictation(state: tauri::State<'_, SharedState>) -> AppResult<StatusSna
     Ok(state.inner().snapshot())
 }
 
+fn busy_message(status: state::DictationStatus) -> AppError {
+    match status {
+        state::DictationStatus::WaitingLlm => {
+            AppError::from("Waiting on local LLM — please wait")
+        }
+        _ => AppError::from("Already busy — please wait"),
+    }
+}
+
 fn start_dictation(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     let status = state.snapshot().status;
+    if status.is_busy() {
+        return Err(busy_message(status));
+    }
     match status {
         state::DictationStatus::Idle | state::DictationStatus::Error => {
             state.start_recording()?;
@@ -195,14 +207,15 @@ fn start_dictation(app: &AppHandle, state: &SharedState) -> AppResult<()> {
             Ok(())
         }
         state::DictationStatus::Recording => Ok(()),
-        state::DictationStatus::Transcribing => {
-            Err(AppError::from("Already transcribing — please wait"))
-        }
+        _ => Err(busy_message(status)),
     }
 }
 
 fn start_command(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     let status = state.snapshot().status;
+    if status.is_busy() {
+        return Err(busy_message(status));
+    }
     match status {
         state::DictationStatus::Idle | state::DictationStatus::Error => {
             state.start_command_recording(app)?;
@@ -210,14 +223,15 @@ fn start_command(app: &AppHandle, state: &SharedState) -> AppResult<()> {
             Ok(())
         }
         state::DictationStatus::Recording => Ok(()),
-        state::DictationStatus::Transcribing => {
-            Err(AppError::from("Already transcribing — please wait"))
-        }
+        _ => Err(busy_message(status)),
     }
 }
 
 fn stop_session(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     let status = state.snapshot().status;
+    if status.is_busy() {
+        return Err(busy_message(status));
+    }
     match status {
         state::DictationStatus::Recording => {
             let app_bg = app.clone();
@@ -227,37 +241,38 @@ fn stop_session(app: &AppHandle, state: &SharedState) -> AppResult<()> {
                 if let Err(e) = &result {
                     state_bg.push_log(format!("Error: {e}"));
                 }
+                // Final status already emitted on success/error paths inside;
+                // emit once more so UI always settles (e.g. after polish dictation).
                 let _ = app_bg.emit("dictation-status", state_bg.snapshot());
             });
-            let _ = app.emit("dictation-status", state.snapshot());
             Ok(())
         }
         state::DictationStatus::Idle | state::DictationStatus::Error => Ok(()),
-        state::DictationStatus::Transcribing => {
-            Err(AppError::from("Already transcribing — please wait"))
-        }
+        _ => Err(busy_message(status)),
     }
 }
 
 fn toggle_dictation_inner(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     let status = state.snapshot().status;
+    if status.is_busy() {
+        return Err(busy_message(status));
+    }
     match status {
         state::DictationStatus::Idle | state::DictationStatus::Error => start_dictation(app, state),
         state::DictationStatus::Recording => stop_session(app, state),
-        state::DictationStatus::Transcribing => {
-            Err(AppError::from("Already transcribing — please wait"))
-        }
+        _ => Err(busy_message(status)),
     }
 }
 
 fn toggle_command_inner(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     let status = state.snapshot().status;
+    if status.is_busy() {
+        return Err(busy_message(status));
+    }
     match status {
         state::DictationStatus::Idle | state::DictationStatus::Error => start_command(app, state),
         state::DictationStatus::Recording => stop_session(app, state),
-        state::DictationStatus::Transcribing => {
-            Err(AppError::from("Already transcribing — please wait"))
-        }
+        _ => Err(busy_message(status)),
     }
 }
 

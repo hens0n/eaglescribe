@@ -14,8 +14,10 @@
     "windows": [
       {
         "title": "EagleScribe",
-        "width": 720,
-        "height": 640,
+        "width": 520,
+        "height": 620,
+        "minWidth": 420,
+        "minHeight": 520,
         "resizable": true
       }
     ],
