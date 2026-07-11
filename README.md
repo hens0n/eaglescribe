@@ -2,6 +2,10 @@
 
 Local-first voice dictation for **macOS** and **Linux**. Speak → on-device Whisper transcription → paste into the focused app. No cloud required.
 
+<p align="center">
+  <img src="docs/images/gui-main.png" alt="EagleScribe main window — idle dictation UI with Settings, hotkeys, and last transcript" width="420" />
+</p>
+
 **Backlog & orientation:** [GitHub issues](https://github.com/hens0n/eaglescribe/issues) · behavior specs and ADRs under [`research/`](./research/) · requirements: [`research/requirements-local-app.md`](./research/requirements-local-app.md) · stack: [`research/stack-decision.md`](./research/stack-decision.md).
 
 ## Stack
