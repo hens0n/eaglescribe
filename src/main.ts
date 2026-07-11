@@ -83,6 +83,10 @@ interface StatusSnapshot {
   show_metal_rebuild_hint: boolean;
   /** True only when both OS global shortcuts registered successfully. */
   global_hotkeys_ok: boolean;
+  /** Dictation OS shortcut registered (independent of command). */
+  dictation_hotkey_ok?: boolean;
+  /** Command Mode OS shortcut registered (independent of dictation). */
+  command_hotkey_ok?: boolean;
   /** Linux session probe: x11 | wayland | other | unknown. */
   linux_session: string;
   /** When true, first-run setup checklist should not auto-show. */
@@ -787,9 +791,32 @@ function applyStatus(s: StatusSnapshot) {
   els.polishMode().textContent = s.polish_mode;
   const hotkeyMode = s.hotkey_mode ?? "hold";
   els.hotkeyMode().textContent = hotkeyMode;
-  // Do not claim global shortcuts are live when OS registration failed.
-  const hotkeysOk = s.global_hotkeys_ok === true;
-  els.hotkeyHint().textContent = hotkeysOk
+  // Hotkey availability — prefer explicit flags, fall back to log lines, and
+  // accept camelCase keys if the IPC layer ever renames fields.
+  const rec = s as StatusSnapshot & Record<string, unknown>;
+  const flag = (snake: string, camel: string): boolean | undefined => {
+    const v = rec[snake] ?? rec[camel];
+    if (v === true || v === false) return v;
+    return undefined;
+  };
+  const bothFlag = flag("global_hotkeys_ok", "globalHotkeysOk");
+  const dictFlag = flag("dictation_hotkey_ok", "dictationHotkeyOk");
+  const cmdFlag = flag("command_hotkey_ok", "commandHotkeyOk");
+  const logText = (s.log ?? []).join("\n");
+  // Backend always logs this on successful grab — use as a hard source of truth
+  // so a stale/missing flag cannot keep the scary banner up while Ctrl+Shift works.
+  const dictFromLog =
+    /Hotkey registration: dictation=ok/.test(logText) ||
+    /Global hotkeys active:/.test(logText) ||
+    /Global dictation hotkey observed live/.test(logText);
+  const cmdFromLog =
+    /Hotkey registration: command=ok/.test(logText) ||
+    /Hotkey registration: dictation=ok.*command=ok/.test(logText) ||
+    /Global hotkeys active:/.test(logText) ||
+    /Global command hotkey observed live/.test(logText);
+  const dictOk = dictFlag === true || bothFlag === true || dictFromLog;
+  const cmdOk = cmdFlag === true || bothFlag === true || cmdFromLog;
+  els.hotkeyHint().textContent = dictOk
     ? (HOTKEY_HINTS[hotkeyMode] ?? HOTKEY_HINTS.hold)
     : "ui only";
   updateHotkeyDisplays(
@@ -798,8 +825,36 @@ function applyStatus(s: StatusSnapshot) {
   );
   const unavailChip = els.hotkeysUnavailableChip();
   const unavailBanner = els.hotkeysUnavailableBanner();
-  if (unavailChip) unavailChip.hidden = hotkeysOk;
-  if (unavailBanner) unavailBanner.hidden = hotkeysOk;
+  // Top-bar chip: only when dictation itself is unavailable (primary path).
+  // Note: `.chip { display: inline-flex }` would ignore the HTML `hidden`
+  // attribute without the `[hidden] { display: none !important }` rule in CSS.
+  if (unavailChip) {
+    if (dictOk) {
+      unavailChip.hidden = true;
+    } else {
+      unavailChip.hidden = false;
+      unavailChip.textContent = "hotkeys unavailable — use window controls";
+      unavailChip.title =
+        "Dictation global hotkey could not be registered. Use Start/Stop in this window.";
+    }
+  }
+  if (unavailBanner) {
+    if (dictOk && cmdOk) {
+      unavailBanner.hidden = true;
+    } else if (dictOk && !cmdOk) {
+      unavailBanner.hidden = false;
+      unavailBanner.textContent =
+        "Dictation hotkey is active. Command Mode global shortcut failed (maybe in use by another app) — use the Command Mode button in this window.";
+    } else if (!dictOk && cmdOk) {
+      unavailBanner.hidden = false;
+      unavailBanner.textContent =
+        "Command Mode hotkey is active, but the dictation global shortcut failed. Use Start dictation in this window.";
+    } else {
+      unavailBanner.hidden = false;
+      unavailBanner.textContent =
+        "Global hotkeys unavailable — use window controls. On Linux the current stack needs X11 for global shortcuts; pure Wayland often cannot register. In-window Start / Stop / Cancel still work.";
+    }
+  }
   els.modelPath().value = s.model_path;
   // Read-only compile-time STT acceleration (no runtime switch).
   els.sttAccelLabel().textContent = formatSttAccel(s.stt_accel);

@@ -114,15 +114,9 @@ fn set_hotkeys(
     // Platform cannot register (or both old and new fail). Keep the *new*
     // validated bindings so a later X11 session / restart can use them; never crash.
     let _ = state.inner().set_hotkey_bindings(&dictation, &command);
-    state.inner().set_global_hotkeys_ok(false);
-    // Prefer the new-chord failure detail for the log line.
-    state.inner().push_log(hotkey_registration_failure_log(
-        &report.summary(),
-        detect_linux_session(),
-    ));
-    state
-        .inner()
-        .push_log(HOTKEYS_UNAVAILABLE_USER_MSG.to_string());
+    // Persist the *last attempt* outcome (may be partial — UI must not claim full unavailable
+    // when only one chord failed). Prefer new-chord report over empty rollback.
+    apply_hotkey_register_report(state.inner(), &report);
     // Soft success: rebind persisted, UI path remains; honesty via snapshot flag + log.
     Ok(state.inner().snapshot())
 }
@@ -361,7 +355,8 @@ fn cancel_dictation(
     state: tauri::State<'_, SharedState>,
 ) -> AppResult<StatusSnapshot> {
     state.inner().cancel_recording()?;
-    disarm_escape_cancel(&app);
+    // Defer: safe if this command is ever reached from a nested hotkey path.
+    schedule_disarm_escape_cancel(&app);
     let snap = state.inner().snapshot();
     let _ = app.emit("dictation-status", &snap);
     Ok(snap)
@@ -382,7 +377,10 @@ fn start_dictation(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     match status {
         state::DictationStatus::Idle | state::DictationStatus::Error => {
             state.start_recording()?;
-            arm_escape_cancel(app, state);
+            // Must not register/unregister shortcuts inside a global-hotkey
+            // callback — the plugin holds its mutex for the duration of the
+            // handler (deadlocks on macOS). Queue for the next event-loop tick.
+            schedule_arm_escape_cancel(app, state);
             let _ = app.emit("dictation-status", state.snapshot());
             Ok(())
         }
@@ -399,7 +397,7 @@ fn start_command(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     match status {
         state::DictationStatus::Idle | state::DictationStatus::Error => {
             state.start_command_recording(app)?;
-            arm_escape_cancel(app, state);
+            schedule_arm_escape_cancel(app, state);
             let _ = app.emit("dictation-status", state.snapshot());
             Ok(())
         }
@@ -416,7 +414,8 @@ fn stop_session(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     match status {
         state::DictationStatus::Recording => {
             // Leave recording → disarm Escape before STT/LLM (spec: armed only while recording).
-            disarm_escape_cancel(app);
+            // Deferred: stop is often invoked from the dictation/command hotkey release handler.
+            schedule_disarm_escape_cancel(app);
             let app_bg = app.clone();
             let state_bg = Arc::clone(state);
             std::thread::spawn(move || {
@@ -460,6 +459,9 @@ fn toggle_command_inner(app: &AppHandle, state: &SharedState) -> AppResult<()> {
 }
 
 fn handle_dictation_hotkey(app: &AppHandle, state: &SharedState, key_state: ShortcutState) {
+    // Self-heal: if the OS delivered this chord, the banner must not claim "unavailable".
+    note_hotkey_observed(app, state, HotkeyRole::Dictation);
+
     let result = match state.hotkey_mode() {
         HotkeyMode::Hold => match key_state {
             ShortcutState::Pressed => start_dictation(app, state),
@@ -490,6 +492,8 @@ fn handle_dictation_hotkey(app: &AppHandle, state: &SharedState, key_state: Shor
 
 /// Command Mode always uses hold semantics on its own hotkey for predictability.
 fn handle_command_hotkey(app: &AppHandle, state: &SharedState, key_state: ShortcutState) {
+    note_hotkey_observed(app, state, HotkeyRole::Command);
+
     let result = match key_state {
         ShortcutState::Pressed => start_command(app, state),
         ShortcutState::Released => {
@@ -508,11 +512,89 @@ fn handle_command_hotkey(app: &AppHandle, state: &SharedState, key_state: Shortc
     }
 }
 
+/// Which global chord was observed (for registration self-heal).
+enum HotkeyRole {
+    Dictation,
+    Command,
+}
+
+/// If the OS fired a global shortcut, mark that role as registered and refresh the UI.
+///
+/// Fixes a false "hotkeys unavailable" banner when registration bookkeeping is
+/// wrong/stale but the chord still works (the user-visible truth).
+fn note_hotkey_observed(app: &AppHandle, state: &SharedState, role: HotkeyRole) {
+    let snap = state.snapshot();
+    let (need_dict, need_cmd) = match role {
+        HotkeyRole::Dictation => (!snap.dictation_hotkey_ok, false),
+        HotkeyRole::Command => (false, !snap.command_hotkey_ok),
+    };
+    if !need_dict && !need_cmd {
+        return;
+    }
+    let dict_ok = snap.dictation_hotkey_ok || need_dict;
+    let cmd_ok = snap.command_hotkey_ok || need_cmd;
+    state.set_hotkey_registration(dict_ok, cmd_ok);
+    let label = match role {
+        HotkeyRole::Dictation => "dictation",
+        HotkeyRole::Command => "command",
+    };
+    state.push_log(format!(
+        "Global {label} hotkey observed live — cleared stale unavailable state \
+         (dictation_ok={dict_ok}, command_ok={cmd_ok})"
+    ));
+    let _ = app.emit("dictation-status", state.snapshot());
+}
+
 fn escape_shortcut() -> AppResult<Shortcut> {
     parse_shortcut(ESCAPE_CANCEL_HOTKEY)
 }
 
+/// Queue Escape arm after the current global-hotkey callback returns.
+///
+/// **Must** be used from global-shortcut handlers. Calling
+/// [`arm_escape_cancel`] synchronously inside a hotkey callback deadlocks:
+/// `tauri-plugin-global-shortcut` holds its internal mutex for the whole
+/// handler, and register/unregister tries to take that same mutex.
+///
+/// Important: Tauri's `run_on_main_thread` runs the closure **inline** when
+/// already on the main thread (hotkey handlers are). So we hop to a worker
+/// thread first, then post back — that path uses the event-loop proxy and
+/// runs only after the handler has released the plugin mutex.
+///
+/// Only arms if still `recording` when the deferred work runs (quick
+/// press/release must not leave Escape grabbed after stop).
+fn schedule_arm_escape_cancel(app: &AppHandle, state: &SharedState) {
+    let app_c = app.clone();
+    let state_c = Arc::clone(state);
+    std::thread::spawn(move || {
+        let app_m = app_c.clone();
+        let _ = app_c.run_on_main_thread(move || {
+            if state_c.is_recording() {
+                arm_escape_cancel(&app_m, &state_c);
+            }
+        });
+    });
+}
+
+/// Queue Escape disarm after the current global-hotkey callback returns.
+///
+/// Same re-entrancy rule as [`schedule_arm_escape_cancel`]: never call
+/// plugin unregister from inside a hotkey (or Escape) callback. Worker hop
+/// required because hotkey handlers already run on the main thread.
+fn schedule_disarm_escape_cancel(app: &AppHandle) {
+    let app_c = app.clone();
+    std::thread::spawn(move || {
+        let app_m = app_c.clone();
+        let _ = app_c.run_on_main_thread(move || {
+            disarm_escape_cancel(&app_m);
+        });
+    });
+}
+
 /// Register global Escape only while `recording`. Failures are logged, not fatal.
+///
+/// Call only when **not** already inside a global-shortcut handler (startup /
+/// rebind / deferred schedule). From hotkey paths use [`schedule_arm_escape_cancel`].
 fn arm_escape_cancel(app: &AppHandle, state: &SharedState) {
     let sc = match escape_shortcut() {
         Ok(s) => s,
@@ -535,12 +617,13 @@ fn arm_escape_cancel(app: &AppHandle, state: &SharedState) {
             }
             match state_h.cancel_recording() {
                 Ok(()) => {
-                    disarm_escape_cancel(&handle);
+                    // Defer unregister — we are inside the Escape hotkey callback.
+                    schedule_disarm_escape_cancel(&handle);
                     let _ = handle.emit("dictation-status", state_h.snapshot());
                 }
                 Err(_) => {
                     // Race: left recording between arm and key; ensure disarmed.
-                    disarm_escape_cancel(&handle);
+                    schedule_disarm_escape_cancel(&handle);
                 }
             }
         })
@@ -552,6 +635,9 @@ fn arm_escape_cancel(app: &AppHandle, state: &SharedState) {
 }
 
 /// Unregister global Escape (idempotent). Must run on every exit from `recording`.
+///
+/// Call only when **not** already inside a global-shortcut handler. From hotkey
+/// paths use [`schedule_disarm_escape_cancel`].
 fn disarm_escape_cancel(app: &AppHandle) {
     if let Ok(sc) = escape_shortcut() {
         let _ = app.global_shortcut().unregister(sc);
@@ -756,6 +842,9 @@ fn try_register_dictation_hotkey(
         .on_shortcut(dictation, move |_app, _sc, event| {
             handle_dictation_hotkey(&handle, &state_h, event.state);
         }) {
+        // Trust Ok from the plugin. Do not second-guess with is_registered —
+        // a false negative there left the UI saying "unavailable" while the
+        // chord still fired.
         Ok(()) => report.dictation_ok = true,
         Err(e) => {
             report.dictation_ok = false;
@@ -808,10 +897,20 @@ fn try_register_command_hotkey_sc(
     }
 }
 
-/// Apply registration outcome to state: flag + logs. Never claims active when failed.
+/// Apply registration outcome to state: flag + logs. Never claims full active when partial.
 fn apply_hotkey_register_report(state: &SharedState, report: &HotkeyRegisterReport) {
-    // "Active" only when both chords registered — partial must not look fully active.
-    state.set_global_hotkeys_ok(report.all_ok());
+    // Per-role flags so the UI can hide the "all unavailable" chip when dictation
+    // works even if Command Mode failed (and vice versa).
+    state.set_hotkey_registration(report.dictation_ok, report.command_ok);
+
+    // Always log explicit per-role outcome (drives debugging when UI disagrees).
+    state.push_log(format!(
+        "Hotkey registration: dictation={} ({}) · command={} ({})",
+        if report.dictation_ok { "ok" } else { "FAIL" },
+        state.dictation_hotkey(),
+        if report.command_ok { "ok" } else { "FAIL" },
+        state.command_hotkey(),
+    ));
 
     if report.all_ok() {
         state.push_log(format!(
@@ -825,14 +924,23 @@ fn apply_hotkey_register_report(state: &SharedState, report: &HotkeyRegisterRepo
     let session = detect_linux_session();
     let detail = report.summary();
     state.push_log(hotkey_registration_failure_log(&detail, session));
-    state.push_log(HOTKEYS_UNAVAILABLE_USER_MSG.to_string());
 
     if report.any_ok() {
-        state.push_log(format!(
-            "Partial global hotkey registration (dictation_ok={}, command_ok={}) — \
-             prefer window controls for the missing role.",
-            report.dictation_ok, report.command_ok
-        ));
+        // Partial success — do not claim everything is unavailable.
+        let which = match (report.dictation_ok, report.command_ok) {
+            (true, false) => format!(
+                "Dictation hotkey active ({}); Command Mode hotkey failed — use the window Command button.",
+                state.dictation_hotkey()
+            ),
+            (false, true) => format!(
+                "Command Mode hotkey active ({}); dictation hotkey failed — use Start dictation in the window.",
+                state.command_hotkey()
+            ),
+            _ => "Partial global hotkey registration.".into(),
+        };
+        state.push_log(which);
+    } else {
+        state.push_log(HOTKEYS_UNAVAILABLE_USER_MSG.to_string());
     }
 }
 
@@ -958,6 +1066,9 @@ pub fn run() {
             // Global hotkey registration must never abort startup (Linux Wayland / no X11).
             let hotkey_report = register_app_hotkeys(app.handle(), &state);
             apply_hotkey_register_report(&state, &hotkey_report);
+            // Push status so the webview never sticks on the pre-registration default
+            // (global_hotkeys_ok=false) if it loaded a snapshot early.
+            let _ = app.emit("dictation-status", state.snapshot());
 
             let mode = state.hotkey_mode();
             // Always log configured bindings; "active" is only claimed via apply_hotkey_register_report.
@@ -1348,6 +1459,87 @@ mod tray_restore_tests {
             menu_item_labels.len(),
             3,
             "tray menu must have exactly Show, Hide, Quit items"
+        );
+    }
+
+    /// Regression: dictation hotkey → arm Escape must not call plugin
+    /// register/unregister synchronously. That deadlocks macOS because the
+    /// global-shortcut handler holds the plugin mutex for the whole callback
+    /// (sample: arm_escape_cancel → GlobalShortcut::unregister → mutex wait).
+    #[test]
+    fn escape_arm_disarm_deferred_from_hotkey_paths() {
+        let lib = lib_src();
+
+        assert!(
+            lib.contains("fn schedule_arm_escape_cancel")
+                && lib.contains("fn schedule_disarm_escape_cancel"),
+            "deferred Escape arm/disarm helpers must exist"
+        );
+
+        let start_d = fn_body(&lib, "start_dictation");
+        assert!(
+            start_d.contains("schedule_arm_escape_cancel"),
+            "start_dictation must defer Escape arm (hotkey Pressed path)"
+        );
+        // Reject bare `arm_escape_cancel(` but allow `schedule_arm_escape_cancel(`.
+        assert!(
+            !start_d
+                .replace("schedule_arm_escape_cancel", "SCHEDULED")
+                .contains("arm_escape_cancel"),
+            "start_dictation must not call arm_escape_cancel synchronously"
+        );
+
+        let start_c = fn_body(&lib, "start_command");
+        assert!(
+            start_c.contains("schedule_arm_escape_cancel"),
+            "start_command must defer Escape arm"
+        );
+        assert!(
+            !start_c
+                .replace("schedule_arm_escape_cancel", "SCHEDULED")
+                .contains("arm_escape_cancel"),
+            "start_command must not call arm_escape_cancel synchronously"
+        );
+
+        let stop = fn_body(&lib, "stop_session");
+        assert!(
+            stop.contains("schedule_disarm_escape_cancel"),
+            "stop_session must defer Escape disarm (hotkey Released path)"
+        );
+        assert!(
+            !stop
+                .replace("schedule_disarm_escape_cancel", "SCHEDULED")
+                .contains("disarm_escape_cancel"),
+            "stop_session must not call disarm_escape_cancel synchronously"
+        );
+
+        // Escape handler itself must defer disarm (re-entrancy on same plugin).
+        let arm = fn_body(&lib, "arm_escape_cancel");
+        assert!(
+            arm.contains("schedule_disarm_escape_cancel"),
+            "Escape callback must schedule_disarm, not sync unregister"
+        );
+        assert!(
+            !arm
+                .replace("schedule_disarm_escape_cancel", "SCHEDULED")
+                .contains("disarm_escape_cancel"),
+            "Escape callback must not call disarm_escape_cancel synchronously"
+        );
+
+        // Deferred arm: hop off main thread (run_on_main_thread is inline when
+        // already on main), then post back; re-check recording so quick release
+        // does not leave Escape grabbed.
+        let sched_arm = fn_body(&lib, "schedule_arm_escape_cancel");
+        assert!(
+            sched_arm.contains("thread::spawn")
+                && sched_arm.contains("run_on_main_thread")
+                && sched_arm.contains("is_recording"),
+            "schedule_arm must worker-hop, then main-thread arm only while still recording"
+        );
+        let sched_disarm = fn_body(&lib, "schedule_disarm_escape_cancel");
+        assert!(
+            sched_disarm.contains("thread::spawn") && sched_disarm.contains("run_on_main_thread"),
+            "schedule_disarm must worker-hop then main-thread unregister"
         );
     }
 }

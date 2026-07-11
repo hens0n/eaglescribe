@@ -463,7 +463,22 @@ const TRIM_PAD_MS: u32 = 100;
 /// Minimum remaining audio after trim (~150 ms). Below this → fail path.
 const TRIM_MIN_REMAINING_MS: u32 = 150;
 /// RMS energy threshold (f32 PCM in [-1, 1]). Frames at/above count as speech.
-const TRIM_RMS_THRESHOLD: f32 = 0.015;
+///
+/// Kept low enough for quiet laptop mics / soft speech. Near-silent TCC-denied
+/// streams (peak ~0) still fail via the near-zero peak check in the pipeline.
+const TRIM_RMS_THRESHOLD: f32 = 0.005;
+/// Peak below this after capture is treated as a silent stream (often denied mic).
+pub const SILENT_CAPTURE_PEAK: f32 = 0.001;
+
+/// Peak absolute sample in a mono buffer (for diagnostics / silent-stream detect).
+pub fn peak_abs(samples: &[f32]) -> f32 {
+    samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max)
+}
+
+/// Frame-RMS speech threshold used by silence trim (tests / diagnostics).
+pub fn trim_rms_threshold() -> f32 {
+    TRIM_RMS_THRESHOLD
+}
 
 /// Successful leading/trailing silence trim of 16 kHz mono PCM.
 #[derive(Debug, Clone, PartialEq)]
@@ -796,12 +811,30 @@ mod tests {
 
     #[test]
     fn trim_near_silent_noise_is_below_floor() {
-        // Below RMS threshold — still treated as silence.
-        let s: Vec<f32> = (0..ms_to_samples(500)).map(|_| 0.001).collect();
+        // Below RMS threshold — still treated as silence by the trimmer itself.
+        // (Pipeline may still soft-recover non-zero peak into Whisper.)
+        let s: Vec<f32> = (0..ms_to_samples(500)).map(|_| 0.0005).collect();
         assert!(matches!(
             trim_silence_16k(&s),
             TrimOutcome::BelowFloor { .. }
         ));
+        assert!(peak_abs(&s) < TRIM_RMS_THRESHOLD);
+    }
+
+    #[test]
+    fn quiet_speech_above_lowered_threshold_is_kept() {
+        // Soft speech at amplitude 0.02 must survive trim (was failing at 0.015).
+        let mut s = vec![0.0f32; ms_to_samples(300)];
+        let speech = ms_to_samples(400);
+        for i in 0..speech {
+            let t = i as f32 / SAMPLE_RATE_16K as f32;
+            s.push(0.02 * (2.0 * std::f32::consts::PI * 440.0 * t).sin());
+        }
+        s.extend(std::iter::repeat_n(0.0f32, ms_to_samples(200)));
+        assert!(
+            matches!(trim_silence_16k(&s), TrimOutcome::Ok(_)),
+            "0.02 amplitude speech must not be fully trimmed"
+        );
     }
 
     #[test]

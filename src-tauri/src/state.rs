@@ -78,8 +78,12 @@ struct InnerState {
     /// Backend-computed fallback notice when preferred mic was unavailable (UI displays as-is).
     last_mic_fallback_notice: Option<String>,
     /// True only when both dictation + command global shortcuts registered successfully.
-    /// False after registration failure/partial so the UI never claims hotkeys are active.
+    /// Derived from the per-role flags; kept for older UI checks.
     global_hotkeys_ok: bool,
+    /// OS registration for the dictation chord (independent of command).
+    dictation_hotkey_ok: bool,
+    /// OS registration for the Command Mode chord (independent of dictation).
+    command_hotkey_ok: bool,
     log: Vec<String>,
 }
 
@@ -134,6 +138,8 @@ impl AppState {
                 last_mic_fallback_notice: None,
                 // Until setup attempts OS registration, do not claim shortcuts are active.
                 global_hotkeys_ok: false,
+                dictation_hotkey_ok: false,
+                command_hotkey_ok: false,
                 log: {
                     let mut log = vec!["EagleScribe ready.".into()];
                     log.push(format!(
@@ -258,6 +264,8 @@ impl AppState {
             show_metal_rebuild_hint: stt::show_metal_rebuild_hint(),
             // OS global-shortcut registration result (never assume true before setup).
             global_hotkeys_ok: g.global_hotkeys_ok,
+            dictation_hotkey_ok: g.dictation_hotkey_ok,
+            command_hotkey_ok: g.command_hotkey_ok,
             // Linux `$XDG_SESSION_TYPE` probe; null/omitted meaning on non-Linux via "unknown".
             linux_session: hotkey::detect_linux_session().as_str().to_string(),
             onboarding_dismissed: g.settings.onboarding_dismissed,
@@ -283,8 +291,22 @@ impl AppState {
     }
 
     /// Record the outcome of OS global-shortcut registration (startup or rebind).
+    ///
+    /// Prefer [`set_hotkey_registration`] when per-role results are known.
     pub fn set_global_hotkeys_ok(&self, ok: bool) {
-        self.inner.lock().global_hotkeys_ok = ok;
+        let mut g = self.inner.lock();
+        g.global_hotkeys_ok = ok;
+        // Keep per-role flags aligned when only a combined result is available.
+        g.dictation_hotkey_ok = ok;
+        g.command_hotkey_ok = ok;
+    }
+
+    /// Record per-role OS registration results (startup or rebind).
+    pub fn set_hotkey_registration(&self, dictation_ok: bool, command_ok: bool) {
+        let mut g = self.inner.lock();
+        g.dictation_hotkey_ok = dictation_ok;
+        g.command_hotkey_ok = command_ok;
+        g.global_hotkeys_ok = dictation_ok && command_ok;
     }
 
     /// Record open-time mic info; on structured fallback, push a clear log + snapshot notice.
@@ -704,10 +726,22 @@ impl AppState {
 
         let mut audio = crate::audio::resample_to_16k(&samples, rate);
         let duration_s = audio.len() as f32 / 16_000.0;
+        let peak = crate::audio::peak_abs(&audio);
         self.push_log(format!(
-            "Captured {duration_s:.1}s audio ({} samples @ 16 kHz)",
+            "Captured {duration_s:.1}s audio ({} samples @ 16 kHz, peak={peak:.4}, device rate={rate})",
             audio.len()
         ));
+
+        // Near-zero peak almost always means macOS denied the mic (or wrong
+        // device) and still delivered a stream of silence — not "no speech".
+        if peak < crate::audio::SILENT_CAPTURE_PEAK {
+            let err = format!(
+                "No audio captured — check microphone permissions (peak={peak:.4}). System Settings → Privacy & Security → Microphone → enable EagleScribe."
+            );
+            self.push_log(err.clone());
+            self.fail_status(app, DictationStatus::Error, err.clone());
+            return Err(AppError::from(err));
+        }
 
         // Optional leading/trailing silence trim (dictation + Command Mode).
         // Applies current setting at stop time; mid-utterance pauses untouched.
@@ -731,12 +765,13 @@ impl AppState {
                     original_ms,
                     remaining_ms,
                 } => {
-                    let err = format!(
-                        "No speech detected (after silence trim: {original_ms}ms → {remaining_ms}ms)"
-                    );
-                    self.push_log(err.clone());
-                    self.fail_status(app, DictationStatus::Error, err.clone());
-                    return Err(AppError::from(err));
+                    // Quiet but non-silent takes: skip trim and still run Whisper
+                    // so soft speech / quiet mics are not hard-failed at the gate.
+                    // (Spec intent: normal speech must not die in the fail path.)
+                    self.push_log(format!(
+                        "Silence trim found no speech frames ({original_ms}ms → {remaining_ms}ms, peak={peak:.4}, threshold={:.4}) — keeping full buffer for STT",
+                        crate::audio::trim_rms_threshold()
+                    ));
                 }
             }
         }
@@ -1253,9 +1288,18 @@ mod tests {
 
         state.set_global_hotkeys_ok(true);
         assert!(state.snapshot().global_hotkeys_ok);
+        assert!(state.snapshot().dictation_hotkey_ok);
+        assert!(state.snapshot().command_hotkey_ok);
 
         state.set_global_hotkeys_ok(false);
         assert!(!state.snapshot().global_hotkeys_ok);
+
+        // Partial: dictation live, command not — must not claim full ok.
+        state.set_hotkey_registration(true, false);
+        let snap = state.snapshot();
+        assert!(snap.dictation_hotkey_ok);
+        assert!(!snap.command_hotkey_ok);
+        assert!(!snap.global_hotkeys_ok);
     }
 
     #[test]
@@ -1442,8 +1486,12 @@ pub struct StatusSnapshot {
     /// Soft UI hint: Apple Silicon + CPU-only build (rebuild with Metal).
     pub show_metal_rebuild_hint: bool,
     /// True when both dictation and command global hotkeys registered with the OS.
-    /// False when registration failed or was partial — UI must not claim shortcuts are active.
+    /// False when registration failed or was partial — UI must not claim *all* shortcuts are active.
     pub global_hotkeys_ok: bool,
+    /// Dictation global shortcut registered with the OS.
+    pub dictation_hotkey_ok: bool,
+    /// Command Mode global shortcut registered with the OS.
+    pub command_hotkey_ok: bool,
     /// Linux session type probe: `x11` | `wayland` | `other` | `unknown` (always set).
     pub linux_session: String,
     /// When true, first-run setup checklist should not auto-show.

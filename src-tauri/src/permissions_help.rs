@@ -56,12 +56,16 @@ pub fn classify_permissions_help(error: &str) -> Option<PermissionsHelpKind> {
     }
 
     // Empty capture / mic permission style (audio stop + open failures).
+    // Includes near-silent streams that still deliver samples (TCC deny → zeros).
     if e.contains("no audio captured")
         || e.contains("check microphone permissions")
         || e.contains("no default microphone")
         || e.contains("microphone never reported")
         || e.contains("microphone thread panicked")
         || e.contains("failed to enumerate microphones")
+        || (e.contains("peak=")
+            && e.contains("microphone")
+            && (e.contains("permission") || e.contains("privacy")))
         || (e.contains("microphone")
             && (e.contains("permission")
                 || e.contains("denied")
@@ -105,6 +109,12 @@ mod tests {
         );
         assert_eq!(
             classify_permissions_help("No default microphone found"),
+            Some(PermissionsHelpKind::Microphone)
+        );
+        assert_eq!(
+            classify_permissions_help(
+                "No audio captured — check microphone permissions (peak=0.0001). System Settings → Privacy & Security → Microphone → enable EagleScribe."
+            ),
             Some(PermissionsHelpKind::Microphone)
         );
     }

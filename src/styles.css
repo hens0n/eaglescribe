@@ -88,6 +88,13 @@ body {
   color: var(--muted);
 }
 
+/* Author `display` on .chip overrides the UA [hidden] rule — force hide. */
+.chip[hidden],
+.hint[hidden],
+[hidden] {
+  display: none !important;
+}
+
 .muted-chip {
   opacity: 0.95;
 }
