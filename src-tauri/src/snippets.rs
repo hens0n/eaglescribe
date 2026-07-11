@@ -56,11 +56,7 @@ impl SnippetBook {
 
     pub fn list(&self) -> Vec<Snippet> {
         let mut snippets = self.snippets.clone();
-        snippets.sort_by(|a, b| {
-            a.cue
-                .to_ascii_lowercase()
-                .cmp(&b.cue.to_ascii_lowercase())
-        });
+        snippets.sort_by(|a, b| a.cue.to_ascii_lowercase().cmp(&b.cue.to_ascii_lowercase()));
         snippets
     }
 

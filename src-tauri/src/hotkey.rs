@@ -186,6 +186,113 @@ pub fn validate_pair(dictation: &str, command: &str) -> AppResult<(String, Strin
     Ok((dictation, command))
 }
 
+/// Linux display session as reported by `$XDG_SESSION_TYPE` (best-effort).
+///
+/// Used for honest hotkey-failure messaging. Non-Linux builds always report
+/// [`LinuxSession::Unknown`] (session type is not meaningful for this product).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxSession {
+    X11,
+    Wayland,
+    /// Non-empty `$XDG_SESSION_TYPE` that is neither x11 nor wayland.
+    Other,
+    Unknown,
+}
+
+impl LinuxSession {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::X11 => "x11",
+            Self::Wayland => "wayland",
+            Self::Other => "other",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classify a raw `$XDG_SESSION_TYPE` value (testable without touching the environment).
+pub fn classify_linux_session(raw: Option<&str>) -> LinuxSession {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) if s.eq_ignore_ascii_case("x11") => LinuxSession::X11,
+        Some(s) if s.eq_ignore_ascii_case("wayland") => LinuxSession::Wayland,
+        Some(_) => LinuxSession::Other,
+        None => LinuxSession::Unknown,
+    }
+}
+
+/// Probe the running Linux session type from the environment.
+pub fn detect_linux_session() -> LinuxSession {
+    if !cfg!(target_os = "linux") {
+        return LinuxSession::Unknown;
+    }
+    classify_linux_session(std::env::var("XDG_SESSION_TYPE").ok().as_deref())
+}
+
+/// Short user-facing status when global hotkeys could not be registered.
+pub const HOTKEYS_UNAVAILABLE_USER_MSG: &str = "Global hotkeys unavailable — use window controls";
+
+/// Build a clear registration-failure log line (Linux-specific when applicable).
+///
+/// Includes session type on Linux, points at the X11 requirement of the current
+/// stack, and tells the user to use in-window Start/Stop.
+pub fn hotkey_registration_failure_log(err: &str, session: LinuxSession) -> String {
+    let guidance = HOTKEYS_UNAVAILABLE_USER_MSG;
+    if cfg!(target_os = "linux") {
+        let session = session.as_str();
+        format!(
+            "Global hotkey registration failed (session={session}): {err}. \
+             With the current stack, global hotkeys require X11 (see README / \
+             research/linux-hotkey-paste-spec.md). Pure Wayland often cannot register. \
+             {guidance}."
+        )
+    } else {
+        format!("Global hotkey registration failed: {err}. {guidance}.")
+    }
+}
+
+/// Outcome of registering dictation + command global shortcuts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyRegisterReport {
+    pub dictation_ok: bool,
+    pub command_ok: bool,
+    pub errors: Vec<String>,
+}
+
+impl HotkeyRegisterReport {
+    pub fn all_ok(&self) -> bool {
+        self.dictation_ok && self.command_ok && self.errors.is_empty()
+    }
+
+    pub fn any_ok(&self) -> bool {
+        self.dictation_ok || self.command_ok
+    }
+
+    /// Compact summary for logs / errors.
+    pub fn summary(&self) -> String {
+        if self.all_ok() {
+            return "dictation+command registered".into();
+        }
+        let mut parts = Vec::new();
+        if !self.dictation_ok {
+            parts.push("dictation failed");
+        }
+        if !self.command_ok {
+            parts.push("command failed");
+        }
+        if self.dictation_ok && !self.command_ok {
+            parts.push("dictation ok");
+        } else if self.command_ok && !self.dictation_ok {
+            parts.push("command ok");
+        }
+        let detail = if self.errors.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", self.errors.join("; "))
+        };
+        format!("{}{}", parts.join(", "), detail)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,7 +335,10 @@ mod tests {
 
     #[test]
     fn normalize_whitespace() {
-        assert_eq!(normalize_combo(" Ctrl + Shift + Space "), "Ctrl+Shift+Space");
+        assert_eq!(
+            normalize_combo(" Ctrl + Shift + Space "),
+            "Ctrl+Shift+Space"
+        );
     }
 
     #[test]
@@ -263,5 +373,88 @@ mod tests {
     fn escape_cancel_hotkey_parses() {
         let sc = parse_shortcut(ESCAPE_CANCEL_HOTKEY).unwrap();
         assert!(is_escape_alone(&sc));
+    }
+
+    #[test]
+    fn classify_linux_session_values() {
+        assert_eq!(classify_linux_session(None), LinuxSession::Unknown);
+        assert_eq!(classify_linux_session(Some("")), LinuxSession::Unknown);
+        assert_eq!(classify_linux_session(Some("   ")), LinuxSession::Unknown);
+        assert_eq!(classify_linux_session(Some("x11")), LinuxSession::X11);
+        assert_eq!(classify_linux_session(Some("X11")), LinuxSession::X11);
+        assert_eq!(
+            classify_linux_session(Some("wayland")),
+            LinuxSession::Wayland
+        );
+        assert_eq!(
+            classify_linux_session(Some("Wayland")),
+            LinuxSession::Wayland
+        );
+        assert_eq!(classify_linux_session(Some("mir")), LinuxSession::Other);
+        assert_eq!(classify_linux_session(Some("tty")), LinuxSession::Other);
+    }
+
+    #[test]
+    fn hotkey_failure_log_mentions_window_controls_and_x11_on_linux() {
+        let msg = hotkey_registration_failure_log(
+            "other window systems are not supported",
+            LinuxSession::Wayland,
+        );
+        assert!(
+            msg.contains("use window controls") || msg.contains(HOTKEYS_UNAVAILABLE_USER_MSG),
+            "expected window-controls guidance: {msg}"
+        );
+        if cfg!(target_os = "linux") {
+            assert!(
+                msg.contains("session=wayland"),
+                "Linux log should include session type: {msg}"
+            );
+            assert!(
+                msg.contains("X11"),
+                "Linux log should mention X11 requirement: {msg}"
+            );
+        } else {
+            assert!(
+                msg.contains("Global hotkey registration failed"),
+                "non-Linux path: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn hotkey_register_report_summary() {
+        let ok = HotkeyRegisterReport {
+            dictation_ok: true,
+            command_ok: true,
+            errors: vec![],
+        };
+        assert!(ok.all_ok());
+        assert!(ok.any_ok());
+        assert!(ok.summary().contains("registered"));
+
+        let partial = HotkeyRegisterReport {
+            dictation_ok: true,
+            command_ok: false,
+            errors: vec!["command grab denied".into()],
+        };
+        assert!(!partial.all_ok());
+        assert!(partial.any_ok());
+        let s = partial.summary();
+        assert!(s.contains("command failed"), "{s}");
+        assert!(s.contains("grab denied"), "{s}");
+
+        let none = HotkeyRegisterReport {
+            dictation_ok: false,
+            command_ok: false,
+            errors: vec!["no X11".into()],
+        };
+        assert!(!none.all_ok());
+        assert!(!none.any_ok());
+    }
+
+    #[test]
+    fn user_msg_is_stable() {
+        assert!(HOTKEYS_UNAVAILABLE_USER_MSG.contains("window controls"));
+        assert!(HOTKEYS_UNAVAILABLE_USER_MSG.contains("unavailable"));
     }
 }

@@ -92,8 +92,18 @@ body {
   opacity: 0.95;
 }
 
+.warn-chip {
+  color: var(--recording);
+  font-weight: 600;
+}
+
 .chip-hint {
   color: var(--muted);
+}
+
+.hint.warn-hint {
+  color: var(--recording);
+  margin: 0 0 0.45rem;
 }
 
 /* —— Cards / compact blocks —— */
@@ -400,7 +410,8 @@ kbd {
 }
 
 /* —— Form controls —— */
-input[type="text"] {
+input[type="text"],
+select {
   flex: 1 1 140px;
   min-width: 0;
   background: #0e1016;
@@ -413,7 +424,13 @@ input[type="text"] {
   font-size: 0.8rem;
 }
 
+select {
+  cursor: pointer;
+  appearance: auto;
+}
+
 input:focus,
+select:focus,
 textarea:focus {
   outline: 2px solid var(--accent-dim);
   border-color: var(--accent);
@@ -457,6 +474,89 @@ button.secondary {
 .btn-sm {
   padding: 0.32rem 0.55rem;
   font-size: 0.78rem;
+}
+
+/* —— First-run / Settings setup checklist (non-blocking) —— */
+.setup-checklist {
+  flex-shrink: 0;
+  max-height: 42vh;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  border-color: color-mix(in srgb, var(--accent-dim) 55%, var(--border));
+}
+
+.setup-checklist[hidden] {
+  display: none;
+}
+
+.setup-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+}
+
+.setup-head-text {
+  flex: 1 1 12rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.setup-head-actions {
+  flex-shrink: 0;
+}
+
+.setup-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.setup-body[hidden] {
+  display: none;
+}
+
+.setup-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+  padding: 0.4rem 0.5rem;
+  background: #0e1016;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.setup-row-main {
+  flex: 1 1 12rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.setup-row-main strong {
+  font-size: 0.85rem;
+  font-weight: 650;
+}
+
+.setup-manual-path {
+  opacity: 0.9;
+}
+
+.setup-secondary-note {
+  margin-top: 0.15rem;
+  font-style: italic;
+}
+
+.setup-privacy-note {
+  margin-top: 0.1rem;
 }
 
 textarea {
@@ -668,4 +768,41 @@ textarea {
   margin: 0;
   color: var(--danger);
   font-size: 0.8rem;
+}
+
+/* —— Failure-time permissions help (pairs with last_error) —— */
+.permissions-failure-help {
+  margin-top: 0.4rem;
+  padding: 0.45rem 0.55rem;
+  background: color-mix(in srgb, var(--recording) 12%, #0e1016);
+  border: 1px solid color-mix(in srgb, var(--recording) 40%, var(--border));
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.permissions-failure-help[hidden] {
+  display: none;
+}
+
+.pfh-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.pfh-head-text {
+  flex: 1 1 12rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.pfh-actions {
+  flex-wrap: wrap;
+  gap: 0.35rem;
 }

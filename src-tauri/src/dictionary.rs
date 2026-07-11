@@ -150,7 +150,9 @@ fn replace_phrase(text: &str, from: &str, to: &str) -> String {
 
 /// If the STT match is ALL CAPS or Title Case, nudge the replacement similarly.
 fn adapt_casing(matched: &str, replacement: &str) -> String {
-    if matched.chars().all(|c| !c.is_alphabetic() || c.is_uppercase())
+    if matched
+        .chars()
+        .all(|c| !c.is_alphabetic() || c.is_uppercase())
         && matched.chars().any(|c| c.is_alphabetic())
     {
         return replacement.to_uppercase();

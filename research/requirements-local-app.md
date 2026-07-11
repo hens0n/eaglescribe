@@ -146,7 +146,7 @@ Priority legend:
 | ID | Requirement | Priority |
 | --- | --- | --- |
 | **CMD-01** | Separate hotkey: voice command transforms **selected** text | P2 |
-| **CMD-02** | Commands run via **local LLM** (llama.cpp) when model configured | P2 |
+| **CMD-02** | Commands run via **local LLM** over a configured **localhost** OpenAI-compatible endpoint when set (Ollama / llama-server / etc.; not in-process llama.cpp — see [in-process-llm-stance.md](./in-process-llm-stance.md)) | P2 |
 | **CMD-03** | Without selection, insert model response at cursor / clipboard | P2 |
 | **CMD-04** | Cancel in-flight command | P2 |
 | **CMD-05** | Clear errors if no LLM model loaded | P2 |
@@ -398,7 +398,7 @@ MVP is accepted when **all** of the following pass on a developer Mac (and docum
 | Cloud STT | whisper.cpp on-device | STT-* |
 | AI Auto Edits / Smart Formatting | Rules polish ± LLM | POL-* |
 | Backtrack | Phrase heuristics | POL-05 |
-| Command Mode | Local llama.cpp | CMD-* |
+| Command Mode | Localhost OpenAI-compatible LLM (not in-process) | CMD-* |
 | Personal dictionary | Local store | DICTN-01–02 |
 | Snippets | Local expansions | DICTN-03 |
 | Context Awareness | Local app/text only | CTX-* |

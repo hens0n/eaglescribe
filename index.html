@@ -24,6 +24,13 @@
           <span class="chip muted-chip"
             >cmd <kbd id="status-command-hotkey">Ctrl+Shift+X</kbd></span
           >
+          <span
+            id="hotkeys-unavailable-chip"
+            class="chip warn-chip"
+            hidden
+            title="Global hotkeys could not be registered. Use Start/Stop in this window."
+            >hotkeys unavailable — use window controls</span
+          >
           <span id="model-loaded" class="chip muted-chip">not loaded</span>
           <span class="chip muted-chip"
             >polish <span id="polish-mode">smart</span></span
@@ -52,6 +59,216 @@
         <p id="transcript" class="transcript">—</p>
         <p id="transcript-raw" class="transcript raw">—</p>
         <p id="error" class="error" hidden></p>
+        <!-- Failure-time permissions help (same checklist guidance; ignores dismiss) -->
+        <div
+          id="permissions-failure-help"
+          class="permissions-failure-help"
+          hidden
+          role="region"
+          aria-label="Permissions help"
+        >
+          <div class="pfh-head">
+            <div class="pfh-head-text">
+              <div class="section-title" id="pfh-title">Permissions help</div>
+              <p class="hint tight" id="pfh-body"></p>
+              <p
+                class="hint tight setup-manual-path"
+                id="pfh-path"
+                hidden
+              ></p>
+              <p class="hint tight" id="pfh-clipboard" hidden>
+                Your text is still on the clipboard — paste manually with
+                Cmd/Ctrl+V.
+              </p>
+            </div>
+            <button
+              id="btn-pfh-dismiss"
+              type="button"
+              class="secondary btn-sm"
+            >
+              Dismiss
+            </button>
+          </div>
+          <div class="pfh-actions row">
+            <button
+              id="btn-pfh-open-mic"
+              type="button"
+              class="secondary btn-sm"
+              hidden
+            >
+              Open Microphone settings
+            </button>
+            <button
+              id="btn-pfh-open-ax"
+              type="button"
+              class="secondary btn-sm"
+              hidden
+            >
+              Open Accessibility settings
+            </button>
+            <button
+              id="btn-pfh-focus-model"
+              type="button"
+              class="secondary btn-sm"
+              hidden
+            >
+              Open model settings
+            </button>
+            <button
+              id="btn-pfh-show-checklist"
+              type="button"
+              class="secondary btn-sm"
+            >
+              Full setup checklist
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- First-run / Settings re-open setup checklist (non-blocking) -->
+      <section
+        id="setup-checklist"
+        class="card-tight setup-checklist"
+        hidden
+        aria-label="Setup checklist"
+      >
+        <div class="setup-head">
+          <div class="setup-head-text">
+            <div class="section-title">Setup checklist</div>
+            <p class="hint tight">
+              Short guide so dictation works. Does not block hotkeys or Settings.
+              Audio and transcripts stay on this machine for default dictation.
+            </p>
+          </div>
+          <div class="setup-head-actions">
+            <button
+              id="btn-setup-dismiss"
+              type="button"
+              class="secondary btn-sm"
+            >
+              Got it
+            </button>
+          </div>
+        </div>
+
+        <!-- macOS rows -->
+        <div id="setup-macos" class="setup-body" hidden>
+          <div class="setup-row">
+            <div class="setup-row-main">
+              <strong>Microphone</strong>
+              <p class="hint tight">
+                So we can hear you. Grant mic access for EagleScribe.
+              </p>
+              <p class="hint tight setup-manual-path">
+                System Settings → Privacy &amp; Security → Microphone → enable
+                EagleScribe
+              </p>
+            </div>
+            <button
+              id="btn-open-mic-privacy"
+              type="button"
+              class="secondary btn-sm"
+            >
+              Open Microphone settings
+            </button>
+          </div>
+          <div class="setup-row">
+            <div class="setup-row-main">
+              <strong>Accessibility</strong>
+              <p class="hint tight">
+                So we can paste into other apps (clipboard + simulated paste).
+              </p>
+              <p class="hint tight setup-manual-path">
+                System Settings → Privacy &amp; Security → Accessibility → enable
+                EagleScribe
+              </p>
+              <p class="hint tight setup-secondary-note">
+                On some macOS versions, Input Monitoring may also be needed for
+                reliable global shortcuts — not required to finish setup; use
+                window Start/Stop if hotkeys fail.
+              </p>
+            </div>
+            <button
+              id="btn-open-ax-privacy"
+              type="button"
+              class="secondary btn-sm"
+            >
+              Open Accessibility settings
+            </button>
+          </div>
+          <div class="setup-row">
+            <div class="setup-row-main">
+              <strong>Whisper model</strong>
+              <p class="hint tight">
+                Local speech-to-text needs a ggml model file. Set path under
+                Settings → Whisper model, then Load. Or run
+                <code>npm run model:download</code> (see README).
+              </p>
+            </div>
+            <button
+              id="btn-setup-focus-model"
+              type="button"
+              class="secondary btn-sm"
+            >
+              Open model settings
+            </button>
+          </div>
+          <p class="hint tight setup-privacy-note">
+            We never ask for Screen Recording or Full Disk Access for core
+            dictation.
+          </p>
+        </div>
+
+        <!-- Linux / non-macOS notes -->
+        <div id="setup-linux" class="setup-body" hidden>
+          <div class="setup-row">
+            <div class="setup-row-main">
+              <strong>Microphone</strong>
+              <p class="hint tight">
+                Capture needs mic access (PipeWire / PulseAudio on most
+                desktops). Grant when the OS prompts, or check session audio
+                settings.
+              </p>
+            </div>
+          </div>
+          <div class="setup-row">
+            <div class="setup-row-main">
+              <strong>Hotkeys &amp; paste</strong>
+              <p class="hint tight">
+                Global shortcuts and paste reliability depend on session type
+                (X11 vs Wayland) and packages. Check
+                <code>$XDG_SESSION_TYPE</code>. Pure Wayland may not register
+                global hotkeys — use in-window Start / Stop / Cancel. On paste
+                failure, text stays on the clipboard for manual paste.
+              </p>
+              <p class="hint tight">
+                See README · Linux hotkeys &amp; paste and
+                <code>research/linux-hotkey-paste-spec.md</code>.
+              </p>
+            </div>
+          </div>
+          <div class="setup-row">
+            <div class="setup-row-main">
+              <strong>Whisper model</strong>
+              <p class="hint tight">
+                Set path under Settings → Whisper model, then Load. Or
+                <code>npm run model:download</code> (see README).
+              </p>
+            </div>
+            <button
+              id="btn-setup-focus-model-linux"
+              type="button"
+              class="secondary btn-sm"
+            >
+              Open model settings
+            </button>
+          </div>
+          <p class="hint tight setup-privacy-note">
+            Local-first: audio and transcripts stay on this machine for default
+            dictation. No macOS Accessibility or Screen Recording steps apply
+            here.
+          </p>
+        </div>
       </section>
 
       <!-- Tabs -->
@@ -108,6 +325,11 @@
         >
           <div class="panel-section">
             <div class="section-title">Hotkeys</div>
+            <p id="hotkeys-unavailable-banner" class="hint warn-hint" hidden>
+              Global hotkeys unavailable — use window controls. On Linux the
+              current stack needs X11 for global shortcuts; pure Wayland often
+              cannot register. In-window Start / Stop / Cancel still work.
+            </p>
             <p class="hint tight">
               Change → press chord (needs a modifier). Esc cancels. Command Mode
               cannot use <kbd>C</kbd>.
@@ -187,6 +409,24 @@
           </div>
 
           <div class="panel-section">
+            <div class="section-title">Microphone</div>
+            <p class="hint tight">
+              Used for the next dictation or Command Mode recording. System
+              default matches host default input.
+            </p>
+            <div class="row">
+              <select id="mic-device" aria-label="Microphone device">
+                <option value="">System default</option>
+              </select>
+              <button id="btn-mic-refresh" type="button" class="secondary btn-sm">
+                Refresh
+              </button>
+              <button id="btn-mic-save" type="button" class="btn-sm">Save</button>
+            </div>
+            <p id="mic-status" class="hint tight" hidden></p>
+          </div>
+
+          <div class="panel-section">
             <div class="section-title">Whisper model</div>
             <div class="row">
               <input
@@ -198,6 +438,13 @@
               <button id="btn-save-path" type="button" class="btn-sm">Save</button>
               <button id="btn-load" type="button" class="secondary btn-sm">Load</button>
             </div>
+            <p class="hint tight" id="stt-accel-line">
+              Acceleration: <span id="stt-accel-label">—</span>
+            </p>
+            <p class="hint tight" id="stt-accel-metal-hint" hidden>
+              For faster STT on Apple Silicon, rebuild with Metal — see README
+              (<code>npm run desktop:build:metal</code>).
+            </p>
             <p class="hint tight">
               Or <code>EAGLESCRIBE_WHISPER_MODEL</code> · default
               <code>models/ggml-base.en.bin</code>
@@ -242,9 +489,48 @@
             </p>
           </div>
 
+          <div class="panel-section">
+            <div class="section-title">Speech-to-text</div>
+            <label class="check-inline">
+              <input id="silence-trim" type="checkbox" checked />
+              Trim silence (leading &amp; trailing)
+            </label>
+            <p class="hint tight">
+              After stop, drop quiet padding at the start and end before Whisper
+              (dictation and Command Mode). Mid-utterance pauses are kept. Off =
+              send the full capture buffer. Applies to the next completed take.
+            </p>
+          </div>
+
+          <div class="panel-section" id="menu-bar-only-section" hidden>
+            <div class="section-title">Menu bar</div>
+            <label class="check-inline">
+              <input id="menu-bar-only" type="checkbox" />
+              Menu bar only (hide Dock icon)
+            </label>
+            <p class="hint tight">
+              Takes effect the next time EagleScribe starts. When on: no Dock
+              icon; tray remains; main window still shows on launch. Restore via
+              tray left-click or <strong>Show Window</strong>.
+            </p>
+          </div>
+
+          <div class="panel-section" id="setup-help-section">
+            <div class="section-title">Setup &amp; permissions</div>
+            <p class="hint tight">
+              Re-open the first-run checklist anytime (mic, paste, model). Same
+              content after dismiss.
+            </p>
+            <div class="row">
+              <button id="btn-show-setup" type="button" class="secondary btn-sm">
+                Show setup checklist
+              </button>
+            </div>
+          </div>
+
           <p class="hint tight tray-footer">
-            Menu bar <strong>ES</strong>: close window to hide · left-click to
-            show · Quit from tray menu.
+            Menu bar tray: close window to hide · left-click or Show Window to
+            restore · Quit from tray menu.
           </p>
         </section>
 

@@ -1,4 +1,4 @@
-use crate::audio::RecordingSession;
+use crate::audio::{self, RecordingSession};
 use crate::dictionary::{self, DictEntry, Dictionary};
 use crate::error::{AppError, AppResult};
 use crate::history::{self, HistoryBook, HistoryEntry};
@@ -7,7 +7,7 @@ use crate::llm;
 use crate::polish::{self, PolishMode};
 use crate::settings::{self, AppSettings, HotkeyMode};
 use crate::snippets::{self, Snippet, SnippetBook};
-use crate::stt::WhisperEngine;
+use crate::stt::{self, WhisperEngine};
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,6 +73,13 @@ struct InnerState {
     last_transcript: Option<String>,
     last_raw_transcript: Option<String>,
     last_error: Option<String>,
+    /// Open-time mic label from the most recent recording start.
+    last_input_device_label: Option<String>,
+    /// Backend-computed fallback notice when preferred mic was unavailable (UI displays as-is).
+    last_mic_fallback_notice: Option<String>,
+    /// True only when both dictation + command global shortcuts registered successfully.
+    /// False after registration failure/partial so the UI never claims hotkeys are active.
+    global_hotkeys_ok: bool,
     log: Vec<String>,
 }
 
@@ -94,6 +101,7 @@ impl AppState {
         let history_count = history.entries.len();
         let history_enabled = settings.history_enabled;
         let clipboard_restore = settings.clipboard_restore;
+        let silence_trim = settings.silence_trim;
 
         let hotkey_mode = settings.hotkey_mode;
         let command_hotkey = settings.command_hotkey.clone();
@@ -122,6 +130,10 @@ impl AppState {
                 last_transcript: None,
                 last_raw_transcript: None,
                 last_error: None,
+                last_input_device_label: None,
+                last_mic_fallback_notice: None,
+                // Until setup attempts OS registration, do not claim shortcuts are active.
+                global_hotkeys_ok: false,
                 log: {
                     let mut log = vec!["EagleScribe ready.".into()];
                     log.push(format!(
@@ -129,9 +141,9 @@ impl AppState {
                         hotkey_mode.as_str(),
                         hotkey_mode.label()
                     ));
-                    log.push(format!("Dictation hotkey: {dictation_hotkey}"));
+                    log.push(format!("Dictation hotkey (configured): {dictation_hotkey}"));
                     log.push(format!(
-                        "Command Mode: {command_hotkey} (select text, hold, speak instruction)"
+                        "Command Mode (configured): {command_hotkey} (select text, hold, speak instruction)"
                     ));
                     log.push(format!(
                         "Dictionary: {} ({} entries)",
@@ -152,6 +164,10 @@ impl AppState {
                     log.push(format!(
                         "Clipboard restore after paste: {}",
                         if clipboard_restore { "on" } else { "off" }
+                    ));
+                    log.push(format!(
+                        "Silence trim (leading/trailing): {}",
+                        if silence_trim { "on" } else { "off" }
                     ));
                     log
                 },
@@ -213,14 +229,73 @@ impl AppState {
             history_max: g.settings.history_max,
             history: g.history.list_newest_first(),
             clipboard_restore: g.settings.clipboard_restore,
+            silence_trim: g.settings.silence_trim,
+            menu_bar_only: g.settings.menu_bar_only,
+            // True only on macOS builds — UI hides the control elsewhere.
+            menu_bar_only_available: cfg!(target_os = "macos"),
+            // None / empty = system default (UI shows "System default").
+            input_device_name: audio::normalize_input_device_name(
+                g.settings.input_device_name.as_deref(),
+            ),
+            last_input_device_label: g.last_input_device_label.clone(),
+            last_mic_fallback_notice: g.last_mic_fallback_notice.clone(),
             last_transcript: g.last_transcript.clone(),
             last_raw_transcript: g.last_raw_transcript.clone(),
             last_error: g.last_error.clone(),
+            // Failure-time permissions hint (ignores onboarding_dismissed). UI maps code → copy.
+            permissions_help: crate::permissions_help::permissions_help_for_error(
+                g.last_error.as_deref(),
+            )
+            .map(str::to_string),
             log: g.log.clone(),
             session_kind: match g.session_kind {
                 SessionKind::Dictation => "dictation".into(),
                 SessionKind::Command => "command".into(),
             },
+            // Compile-time Whisper backend (metal/cuda/vulkan/cpu) — read-only UI.
+            stt_accel: stt::stt_acceleration().into(),
+            // Soft Settings hint only; never blocks load/dictation.
+            show_metal_rebuild_hint: stt::show_metal_rebuild_hint(),
+            // OS global-shortcut registration result (never assume true before setup).
+            global_hotkeys_ok: g.global_hotkeys_ok,
+            // Linux `$XDG_SESSION_TYPE` probe; null/omitted meaning on non-Linux via "unknown".
+            linux_session: hotkey::detect_linux_session().as_str().to_string(),
+            onboarding_dismissed: g.settings.onboarding_dismissed,
+            // Compile-time host OS for first-run / permissions copy (macos | linux | other).
+            host_os: host_os_label().into(),
+        }
+    }
+
+    /// Persist first-run checklist dismiss (Settings re-open still works).
+    pub fn set_onboarding_dismissed(&self, dismissed: bool) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        g.settings.onboarding_dismissed = dismissed;
+        g.settings.save(&g.settings_path)?;
+        g.log.push(format!(
+            "Setup checklist: {}",
+            if dismissed {
+                "dismissed (re-open from Settings anytime)"
+            } else {
+                "will show on next launch"
+            }
+        ));
+        Ok(())
+    }
+
+    /// Record the outcome of OS global-shortcut registration (startup or rebind).
+    pub fn set_global_hotkeys_ok(&self, ok: bool) {
+        self.inner.lock().global_hotkeys_ok = ok;
+    }
+
+    /// Record open-time mic info; on structured fallback, push a clear log + snapshot notice.
+    ///
+    /// Uses [`audio::MicOpenInfo`] flags — does not re-parse free-form device labels.
+    fn note_recording_mic(g: &mut InnerState, info: &audio::MicOpenInfo) {
+        g.last_input_device_label = Some(info.device_label.clone());
+        g.last_mic_fallback_notice = info.fallback_notice();
+        if let Some(notice) = &g.last_mic_fallback_notice {
+            eprintln!("[eaglescribe] {notice}");
+            g.log.push(notice.clone());
         }
     }
 
@@ -265,11 +340,8 @@ impl AppState {
         let mut g = self.inner.lock();
         g.settings.hotkey_mode = mode;
         g.settings.save(&g.settings_path)?;
-        g.log.push(format!(
-            "Hotkey mode: {} ({})",
-            mode.as_str(),
-            mode.label()
-        ));
+        g.log
+            .push(format!("Hotkey mode: {} ({})", mode.as_str(), mode.label()));
         Ok(())
     }
 
@@ -280,8 +352,9 @@ impl AppState {
         g.settings.dictation_hotkey = dictation.clone();
         g.settings.command_hotkey = command.clone();
         g.settings.save(&g.settings_path)?;
-        g.log
-            .push(format!("Dictation hotkey: {dictation} · Command: {command}"));
+        g.log.push(format!(
+            "Dictation hotkey: {dictation} · Command: {command}"
+        ));
         Ok(())
     }
 
@@ -305,6 +378,55 @@ impl AppState {
             if enabled { "on" } else { "off" }
         ));
         Ok(())
+    }
+
+    /// Persist leading/trailing silence trim (applies on next completed take).
+    pub fn set_silence_trim(&self, enabled: bool) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        g.settings.silence_trim = enabled;
+        g.settings.save(&g.settings_path)?;
+        g.log.push(format!(
+            "Silence trim (leading/trailing): {}",
+            if enabled { "on" } else { "off" }
+        ));
+        Ok(())
+    }
+
+    /// Persist macOS menu-bar-only (hide Dock). Takes effect on next launch.
+    pub fn set_menu_bar_only(&self, enabled: bool) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        g.settings.menu_bar_only = enabled;
+        g.settings.save(&g.settings_path)?;
+        g.log.push(format!(
+            "Menu bar only (hide Dock): {} — takes effect next launch",
+            if enabled { "on" } else { "off" }
+        ));
+        Ok(())
+    }
+
+    /// Current menu-bar-only preference (for launch-time activation policy).
+    pub fn menu_bar_only(&self) -> bool {
+        self.inner.lock().settings.menu_bar_only
+    }
+
+    /// Persist preferred microphone (`None` / empty = system default).
+    pub fn set_input_device(&self, name: Option<&str>) -> AppResult<()> {
+        let normalized = audio::normalize_input_device_name(name);
+        let mut g = self.inner.lock();
+        g.settings.input_device_name = normalized.clone();
+        g.settings.save(&g.settings_path)?;
+        let msg = match &normalized {
+            Some(n) => format!("Microphone: {n}"),
+            None => "Microphone: system default".into(),
+        };
+        g.log.push(msg);
+        Ok(())
+    }
+
+    /// Preferred mic name for the next recording (`None` = system default).
+    fn preferred_input_device(&self) -> Option<String> {
+        let g = self.inner.lock();
+        audio::normalize_input_device_name(g.settings.input_device_name.as_deref())
     }
 
     pub fn clear_history(&self) -> AppResult<()> {
@@ -333,11 +455,8 @@ impl AppState {
         let mut g = self.inner.lock();
         g.dictionary.upsert(from, to)?;
         g.dictionary.save(&g.dictionary_path)?;
-        g.log.push(format!(
-            "Dictionary: {:?} → {:?}",
-            from.trim(),
-            to.trim()
-        ));
+        g.log
+            .push(format!("Dictionary: {:?} → {:?}", from.trim(), to.trim()));
         Ok(())
     }
 
@@ -350,8 +469,7 @@ impl AppState {
             )));
         }
         g.dictionary.save(&g.dictionary_path)?;
-        g.log
-            .push(format!("Dictionary removed: {:?}", from.trim()));
+        g.log.push(format!("Dictionary removed: {:?}", from.trim()));
         Ok(())
     }
 
@@ -376,8 +494,7 @@ impl AppState {
             )));
         }
         g.snippets.save(&g.snippets_path)?;
-        g.log
-            .push(format!("Snippet removed: {:?}", cue.trim()));
+        g.log.push(format!("Snippet removed: {:?}", cue.trim()));
         Ok(())
     }
 
@@ -413,17 +530,35 @@ impl AppState {
     }
 
     pub fn start_recording(&self) -> AppResult<()> {
-        let mut g = self.inner.lock();
-        Self::reject_if_unavailable(g.status)?;
+        {
+            let g = self.inner.lock();
+            Self::reject_if_unavailable(g.status)?;
+        }
 
-        let session = RecordingSession::start()?;
+        // Open the mic without holding `inner` (enumeration + up to ~500ms sample-rate wait).
+        let preferred = self.preferred_input_device();
+        let session = RecordingSession::start(preferred.as_deref())?;
+        let open_info = audio::MicOpenInfo {
+            device_label: session.device_label.clone(),
+            preferred_unavailable: session.preferred_unavailable.clone(),
+        };
+
+        let mut g = self.inner.lock();
+        // Another session may have started while we opened the mic.
+        if g.status == DictationStatus::Recording || g.status.is_busy() {
+            drop(session);
+            return Err(AppError::from("Busy — cannot start recording"));
+        }
         g.session = Some(session);
         g.session_kind = SessionKind::Dictation;
         g.command_selection = None;
         g.status = DictationStatus::Recording;
         g.last_error = None;
-        g.log
-            .push("Recording… (release hotkey or use Stop to finish)".into());
+        Self::note_recording_mic(&mut g, &open_info);
+        g.log.push(format!(
+            "Recording… mic={} (release hotkey or use Stop to finish)",
+            open_info.device_label
+        ));
         // New intentional session: do not inherit a post-cancel release suppress
         // from a prior cancel that happened without a held chord.
         self.suppress_hotkey_release_after_cancel
@@ -444,6 +579,7 @@ impl AppState {
 
         self.suppress_command_release.store(true, Ordering::SeqCst);
 
+        let preferred = self.preferred_input_device();
         let selection = (|| {
             self.push_log("Command Mode: capturing selection (Cmd/Ctrl+C)…");
             let selection = crate::inject::capture_selection(app).unwrap_or_default();
@@ -456,7 +592,11 @@ impl AppState {
                 ));
             }
 
-            let session = RecordingSession::start()?;
+            let session = RecordingSession::start(preferred.as_deref())?;
+            let open_info = audio::MicOpenInfo {
+                device_label: session.device_label.clone(),
+                preferred_unavailable: session.preferred_unavailable.clone(),
+            };
             let mut g = self.inner.lock();
             // Another session may have started while we captured selection.
             if g.status == DictationStatus::Recording || g.status.is_busy() {
@@ -469,10 +609,11 @@ impl AppState {
             g.command_ignore_release_until = Some(Instant::now() + Duration::from_millis(400));
             g.status = DictationStatus::Recording;
             g.last_error = None;
-            g.log.push(
-                "Command Mode recording… speak your instruction (e.g. make this more concise)"
-                    .into(),
-            );
+            Self::note_recording_mic(&mut g, &open_info);
+            g.log.push(format!(
+                "Command Mode recording… mic={} · speak your instruction",
+                open_info.device_label
+            ));
             // Fresh session — drop any leftover post-cancel release suppress.
             self.suppress_hotkey_release_after_cancel
                 .store(false, Ordering::SeqCst);
@@ -561,12 +702,44 @@ impl AppState {
             }
         };
 
-        let audio = crate::audio::resample_to_16k(&samples, rate);
+        let mut audio = crate::audio::resample_to_16k(&samples, rate);
         let duration_s = audio.len() as f32 / 16_000.0;
         self.push_log(format!(
             "Captured {duration_s:.1}s audio ({} samples @ 16 kHz)",
             audio.len()
         ));
+
+        // Optional leading/trailing silence trim (dictation + Command Mode).
+        // Applies current setting at stop time; mid-utterance pauses untouched.
+        let silence_trim = {
+            let g = self.inner.lock();
+            g.settings.silence_trim
+        };
+        if silence_trim {
+            match crate::audio::trim_silence_16k(&audio) {
+                crate::audio::TrimOutcome::Ok(trimmed) => {
+                    self.push_log(format!(
+                        "Silence trim: {:.1}s → {:.1}s (removed head {}ms, tail {}ms)",
+                        trimmed.original_ms as f32 / 1000.0,
+                        trimmed.trimmed_ms as f32 / 1000.0,
+                        trimmed.head_ms,
+                        trimmed.tail_ms
+                    ));
+                    audio = trimmed.samples;
+                }
+                crate::audio::TrimOutcome::BelowFloor {
+                    original_ms,
+                    remaining_ms,
+                } => {
+                    let err = format!(
+                        "No speech detected (after silence trim: {original_ms}ms → {remaining_ms}ms)"
+                    );
+                    self.push_log(err.clone());
+                    self.fail_status(app, DictationStatus::Error, err.clone());
+                    return Err(AppError::from(err));
+                }
+            }
+        }
 
         // Clone Arc so Whisper runs without holding the state mutex.
         // Holding the mutex during STT deadlocks with main-thread paste/hotkeys.
@@ -713,8 +886,8 @@ impl AppState {
                     g.last_raw_transcript = Some(raw.to_string());
                     g.last_transcript = Some(result.text.clone());
                     g.status = DictationStatus::Idle;
-                    g.last_error = None;
                     if result.pasted {
+                        g.last_error = None;
                         g.log
                             .push(format!("Injected: {}", truncate(&result.text, 80)));
                         if result.restored {
@@ -722,22 +895,22 @@ impl AppState {
                                 .push("Restored previous clipboard after paste.".into());
                         } else if result.restore_failed {
                             g.log.push(
-                                "Clipboard restore failed; transcript left on clipboard."
-                                    .into(),
+                                "Clipboard restore failed; transcript left on clipboard.".into(),
                             );
                         }
                     } else {
+                        // INJ-03: paste failed — transcript stays on clipboard; surface in UI
+                        // (error banner), not log-only / eprintln-only.
+                        g.last_error = Some(
+                            "Paste failed — transcript left on clipboard. Paste manually with Cmd/Ctrl+V."
+                                .into(),
+                        );
                         g.log.push(format!(
                             "Copied (paste manually with Cmd/Ctrl+V): {}",
                             truncate(&result.text, 80)
                         ));
                     }
-                    Self::maybe_record_history(
-                        &mut g,
-                        kind,
-                        &result.text,
-                        Some(raw),
-                    );
+                    Self::maybe_record_history(&mut g, kind, &result.text, Some(raw));
                 }
                 let _ = app.emit("dictation-status", self.snapshot());
                 Ok(result.text)
@@ -749,7 +922,10 @@ impl AppState {
                     g.last_raw_transcript = Some(raw.to_string());
                     g.last_transcript = Some(text.to_string());
                     g.status = DictationStatus::Idle;
-                    g.last_error = Some(e.to_string());
+                    // Keep paste/clipboard wording so failure-time help classifies as Accessibility.
+                    g.last_error = Some(format!(
+                        "Inject failed — transcript left on clipboard. Paste manually with Cmd/Ctrl+V. ({e})"
+                    ));
                     g.log
                         .push(format!("Transcript on clipboard; inject failed: {e}"));
                     // Still record — user got the text on the clipboard.
@@ -761,12 +937,7 @@ impl AppState {
         }
     }
 
-    fn maybe_record_history(
-        g: &mut InnerState,
-        kind: SessionKind,
-        text: &str,
-        raw: Option<&str>,
-    ) {
+    fn maybe_record_history(g: &mut InnerState, kind: SessionKind, text: &str, raw: Option<&str>) {
         if !g.settings.history_enabled {
             return;
         }
@@ -900,6 +1071,329 @@ mod tests {
             "starting a new session should clear post-cancel release suppress"
         );
     }
+
+    #[test]
+    fn note_recording_mic_sets_label_and_fallback_log() {
+        let state = test_state();
+        let info = audio::MicOpenInfo::from_resolved(&audio::ResolvedInput::FallbackDefault {
+            preferred: "Gone Mic".into(),
+        });
+        {
+            let mut g = state.inner.lock();
+            AppState::note_recording_mic(&mut g, &info);
+        }
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.last_input_device_label.as_deref(),
+            Some(info.device_label.as_str())
+        );
+        assert_eq!(
+            snap.last_mic_fallback_notice.as_deref(),
+            Some("Preferred mic \"Gone Mic\" unavailable — using system default")
+        );
+        assert!(
+            snap.log
+                .iter()
+                .any(|l| l.contains("Preferred mic") && l.contains("unavailable")),
+            "expected fallback log line, got {:?}",
+            snap.log
+        );
+    }
+
+    #[test]
+    fn note_recording_mic_system_default_no_fallback_notice() {
+        let state = test_state();
+        {
+            let mut g = state.inner.lock();
+            AppState::note_recording_mic(&mut g, &audio::MicOpenInfo::system_default());
+        }
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.last_input_device_label.as_deref(),
+            Some("system default")
+        );
+        assert!(snap.last_mic_fallback_notice.is_none());
+        assert!(
+            !snap
+                .log
+                .iter()
+                .any(|l| l.contains("Preferred mic") && l.contains("unavailable")),
+            "system default must not emit fallback notice: {:?}",
+            snap.log
+        );
+    }
+
+    #[test]
+    fn note_recording_mic_named_with_unavailable_in_name_is_not_fallback() {
+        // Device name substring must not trigger fallback (structured flag only).
+        let state = test_state();
+        let info = audio::MicOpenInfo::from_resolved(&audio::ResolvedInput::Named(
+            "Mic unavailable for studio".into(),
+        ));
+        {
+            let mut g = state.inner.lock();
+            AppState::note_recording_mic(&mut g, &info);
+        }
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.last_input_device_label.as_deref(),
+            Some("Mic unavailable for studio")
+        );
+        assert!(snap.last_mic_fallback_notice.is_none());
+    }
+
+    #[test]
+    fn snapshot_input_device_defaults() {
+        let state = test_state();
+        let snap = state.snapshot();
+        assert!(snap.input_device_name.is_none());
+        assert!(snap.last_input_device_label.is_none());
+        assert!(snap.last_mic_fallback_notice.is_none());
+    }
+
+    #[test]
+    fn snapshot_silence_trim_defaults_on() {
+        let state = test_state();
+        // Isolate from whatever is on disk under the real settings path.
+        {
+            let mut g = state.inner.lock();
+            g.settings.silence_trim = true;
+        }
+        let snap = state.snapshot();
+        assert!(snap.silence_trim);
+    }
+
+    #[test]
+    fn set_silence_trim_updates_snapshot_and_log() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("eaglescribe-trim-test-{nanos}.json"));
+
+        let state = test_state();
+        {
+            let mut g = state.inner.lock();
+            g.settings_path = path.clone();
+            g.settings = AppSettings::default();
+        }
+
+        state.set_silence_trim(false).expect("disable");
+        assert!(!state.snapshot().silence_trim);
+        let snap = state.snapshot();
+        assert!(
+            snap.log
+                .iter()
+                .any(|l| l.contains("Silence trim") && l.contains("off")),
+            "expected silence trim off log, got {:?}",
+            snap.log
+        );
+
+        let loaded = AppSettings::load(&path).expect("load saved settings");
+        assert!(!loaded.silence_trim);
+
+        state.set_silence_trim(true).expect("enable");
+        assert!(state.snapshot().silence_trim);
+        let loaded_on = AppSettings::load(&path).expect("load after on");
+        assert!(loaded_on.silence_trim);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn snapshot_menu_bar_only_defaults_off() {
+        let state = test_state();
+        // Isolate from whatever is on disk under the real settings path.
+        {
+            let mut g = state.inner.lock();
+            g.settings.menu_bar_only = false;
+        }
+        let snap = state.snapshot();
+        assert!(!snap.menu_bar_only);
+        assert_eq!(snap.menu_bar_only_available, cfg!(target_os = "macos"));
+        assert!(!state.menu_bar_only());
+    }
+
+    #[test]
+    fn snapshot_reports_compile_time_stt_accel() {
+        let snap = test_state().snapshot();
+        assert!(
+            matches!(snap.stt_accel.as_str(), "metal" | "cuda" | "vulkan" | "cpu"),
+            "unexpected stt_accel {:?}",
+            snap.stt_accel
+        );
+        assert_eq!(snap.stt_accel, stt::stt_acceleration());
+        assert_eq!(snap.show_metal_rebuild_hint, stt::show_metal_rebuild_hint());
+        // No runtime probe — CPU default builds always report "cpu".
+        if !cfg!(any(feature = "metal", feature = "cuda", feature = "vulkan")) {
+            assert_eq!(snap.stt_accel, "cpu");
+        }
+    }
+
+    #[test]
+    fn snapshot_global_hotkeys_ok_defaults_false_until_registration() {
+        let state = test_state();
+        let snap = state.snapshot();
+        assert!(
+            !snap.global_hotkeys_ok,
+            "must not claim hotkeys active before OS registration"
+        );
+        assert!(
+            matches!(
+                snap.linux_session.as_str(),
+                "x11" | "wayland" | "other" | "unknown"
+            ),
+            "unexpected linux_session {:?}",
+            snap.linux_session
+        );
+        if !cfg!(target_os = "linux") {
+            assert_eq!(snap.linux_session, "unknown");
+        }
+
+        state.set_global_hotkeys_ok(true);
+        assert!(state.snapshot().global_hotkeys_ok);
+
+        state.set_global_hotkeys_ok(false);
+        assert!(!state.snapshot().global_hotkeys_ok);
+    }
+
+    #[test]
+    fn set_menu_bar_only_updates_snapshot_and_log() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("eaglescribe-mbo-test-{nanos}.json"));
+
+        let state = test_state();
+        // Point saves at a temp file so we do not touch the user's settings.json.
+        {
+            let mut g = state.inner.lock();
+            g.settings_path = path.clone();
+            g.settings = AppSettings::default();
+        }
+
+        state.set_menu_bar_only(true).expect("enable");
+        assert!(state.menu_bar_only());
+        let snap = state.snapshot();
+        assert!(snap.menu_bar_only);
+        assert!(
+            snap.log.iter().any(|l| l.contains("Menu bar only")
+                && l.contains("on")
+                && l.contains("next launch")),
+            "expected restart-required log, got {:?}",
+            snap.log
+        );
+
+        // Round-trip through the same path the setter just wrote.
+        let loaded = AppSettings::load(&path).expect("load saved settings");
+        assert!(loaded.menu_bar_only);
+
+        state.set_menu_bar_only(false).expect("disable");
+        assert!(!state.menu_bar_only());
+        assert!(!state.snapshot().menu_bar_only);
+        let loaded_off = AppSettings::load(&path).expect("load after off");
+        assert!(!loaded_off.menu_bar_only);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn snapshot_onboarding_dismissed_defaults_false() {
+        let state = test_state();
+        {
+            let mut g = state.inner.lock();
+            g.settings.onboarding_dismissed = false;
+        }
+        let snap = state.snapshot();
+        assert!(!snap.onboarding_dismissed);
+        assert_eq!(snap.host_os, host_os_label());
+        assert!(
+            matches!(snap.host_os.as_str(), "macos" | "linux" | "other"),
+            "unexpected host_os {:?}",
+            snap.host_os
+        );
+    }
+
+    #[test]
+    fn set_onboarding_dismissed_updates_snapshot_and_log() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("eaglescribe-onboard-test-{nanos}.json"));
+
+        let state = test_state();
+        {
+            let mut g = state.inner.lock();
+            g.settings_path = path.clone();
+            g.settings = AppSettings::default();
+        }
+
+        state.set_onboarding_dismissed(true).expect("dismiss");
+        assert!(state.snapshot().onboarding_dismissed);
+        let snap = state.snapshot();
+        assert!(
+            snap.log
+                .iter()
+                .any(|l| l.contains("Setup checklist") && l.contains("dismissed")),
+            "expected dismiss log, got {:?}",
+            snap.log
+        );
+
+        let loaded = AppSettings::load(&path).expect("load saved settings");
+        assert!(loaded.onboarding_dismissed);
+
+        state.set_onboarding_dismissed(false).expect("reset");
+        assert!(!state.snapshot().onboarding_dismissed);
+        let loaded_off = AppSettings::load(&path).expect("load after reset");
+        assert!(!loaded_off.onboarding_dismissed);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Failure-time help must still classify when onboarding was dismissed (AC 8–9).
+    #[test]
+    fn snapshot_permissions_help_from_last_error_ignores_dismiss() {
+        let state = test_state();
+        {
+            let mut g = state.inner.lock();
+            g.settings.onboarding_dismissed = true;
+            g.last_error = None;
+        }
+        assert!(state.snapshot().permissions_help.is_none());
+
+        {
+            let mut g = state.inner.lock();
+            g.last_error = Some(
+                "No audio captured — check microphone permissions".into(),
+            );
+        }
+        let snap = state.snapshot();
+        assert!(snap.onboarding_dismissed);
+        assert_eq!(snap.permissions_help.as_deref(), Some("microphone"));
+
+        {
+            let mut g = state.inner.lock();
+            g.last_error = Some(
+                "Paste failed — transcript left on clipboard. Paste manually with Cmd/Ctrl+V."
+                    .into(),
+            );
+        }
+        assert_eq!(
+            state.snapshot().permissions_help.as_deref(),
+            Some("accessibility")
+        );
+
+        {
+            let mut g = state.inner.lock();
+            g.last_error = Some("Empty transcript (try speaking longer)".into());
+        }
+        assert!(state.snapshot().permissions_help.is_none());
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -923,11 +1417,50 @@ pub struct StatusSnapshot {
     pub history: Vec<HistoryEntry>,
     /// When true, previous clipboard text is restored after a successful paste.
     pub clipboard_restore: bool,
+    /// When true, leading/trailing silence is trimmed before Whisper.
+    pub silence_trim: bool,
+    /// Persist preference: hide Dock icon (macOS Accessory) on next launch.
+    pub menu_bar_only: bool,
+    /// True when this build can apply menu-bar-only (macOS only).
+    pub menu_bar_only_available: bool,
+    /// Preferred microphone name; `None` means system default.
+    pub input_device_name: Option<String>,
+    /// Open-time mic label from the last recording start.
+    pub last_input_device_label: Option<String>,
+    /// Backend-computed notice when preferred mic fell back (UI displays; do not re-parse labels).
+    pub last_mic_fallback_notice: Option<String>,
     pub last_transcript: Option<String>,
     pub last_raw_transcript: Option<String>,
     pub last_error: Option<String>,
+    /// Failure-time permissions help code: `microphone` | `accessibility` | `model`.
+    /// Derived from `last_error`; independent of `onboarding_dismissed`.
+    pub permissions_help: Option<String>,
     pub log: Vec<String>,
     pub session_kind: String,
+    /// Compile-time STT acceleration: `metal` | `cuda` | `vulkan` | `cpu`.
+    pub stt_accel: String,
+    /// Soft UI hint: Apple Silicon + CPU-only build (rebuild with Metal).
+    pub show_metal_rebuild_hint: bool,
+    /// True when both dictation and command global hotkeys registered with the OS.
+    /// False when registration failed or was partial — UI must not claim shortcuts are active.
+    pub global_hotkeys_ok: bool,
+    /// Linux session type probe: `x11` | `wayland` | `other` | `unknown` (always set).
+    pub linux_session: String,
+    /// When true, first-run setup checklist should not auto-show.
+    pub onboarding_dismissed: bool,
+    /// Compile-time host: `macos` | `linux` | `other` (permissions copy branches).
+    pub host_os: String,
+}
+
+/// Host OS token for UI onboarding / permissions copy.
+fn host_os_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "other"
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

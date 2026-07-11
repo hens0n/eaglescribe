@@ -70,6 +70,23 @@ pub struct AppSettings {
     /// (INJ-04). When false, the injected transcript remains on the clipboard.
     #[serde(default = "default_true")]
     pub clipboard_restore: bool,
+    /// When true, trim leading/trailing silence after stop before Whisper
+    /// (STT-05). Default on; applies to dictation and Command Mode.
+    #[serde(default = "default_true")]
+    pub silence_trim: bool,
+    /// macOS: when true, next launch uses Accessory activation policy (no Dock
+    /// icon; menu-bar tray remains). Default off; applied only at process start.
+    /// No-op on non-macOS builds (field still persists for cross-platform settings).
+    #[serde(default)]
+    pub menu_bar_only: bool,
+    /// Preferred microphone device name from cpal enumeration.
+    /// `None` or empty string = system default input (pre-feature behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_device_name: Option<String>,
+    /// When true, the first-run setup checklist does not auto-show on launch.
+    /// Missing / corrupt → false (show checklist). Re-open from Settings still works.
+    #[serde(default)]
+    pub onboarding_dismissed: bool,
 }
 
 fn default_true() -> bool {
@@ -108,6 +125,10 @@ impl Default for AppSettings {
             history_enabled: true,
             history_max: default_history_max(),
             clipboard_restore: true,
+            silence_trim: true,
+            menu_bar_only: false,
+            input_device_name: None,
+            onboarding_dismissed: false,
         }
     }
 }
@@ -155,6 +176,177 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert!(!loaded.clipboard_restore);
     }
+
+    #[test]
+    fn default_enables_silence_trim() {
+        let s = AppSettings::default();
+        assert!(s.silence_trim);
+    }
+
+    #[test]
+    fn missing_silence_trim_field_defaults_true() {
+        // Older settings.json without the field must keep trim on.
+        let path = unique_settings_path("legacy-trim");
+        fs::write(
+            &path,
+            r#"{"hotkey_mode":"hold","history_enabled":true,"history_max":50}"#,
+        )
+        .expect("write");
+        let s = AppSettings::load(&path).expect("load");
+        let _ = fs::remove_file(&path);
+        assert!(s.silence_trim);
+    }
+
+    #[test]
+    fn silence_trim_false_roundtrips() {
+        let path = unique_settings_path("trim-off");
+        let s = AppSettings {
+            silence_trim: false,
+            ..Default::default()
+        };
+        s.save(&path).expect("save");
+        let loaded = AppSettings::load(&path).expect("load");
+        let _ = fs::remove_file(&path);
+        assert!(!loaded.silence_trim);
+    }
+
+    #[test]
+    fn corrupt_silence_trim_load_or_default_is_on() {
+        // Unknown / non-bool value fails parse → load_or_default → on.
+        let path = unique_settings_path("trim-corrupt");
+        fs::write(&path, r#"{"silence_trim":"yes"}"#).expect("write");
+        let s = AppSettings::load_or_default(&path);
+        let _ = fs::remove_file(&path);
+        assert!(s.silence_trim);
+    }
+
+    #[test]
+    fn default_disables_menu_bar_only() {
+        let s = AppSettings::default();
+        assert!(!s.menu_bar_only);
+    }
+
+    #[test]
+    fn missing_menu_bar_only_field_defaults_false() {
+        // Older settings.json without the field must keep Dock present.
+        let path = unique_settings_path("legacy-mbo");
+        fs::write(
+            &path,
+            r#"{"hotkey_mode":"hold","history_enabled":true,"history_max":50}"#,
+        )
+        .expect("write");
+        let s = AppSettings::load(&path).expect("load");
+        let _ = fs::remove_file(&path);
+        assert!(!s.menu_bar_only);
+    }
+
+    #[test]
+    fn menu_bar_only_true_roundtrips() {
+        let path = unique_settings_path("mbo-on");
+        let s = AppSettings {
+            menu_bar_only: true,
+            ..Default::default()
+        };
+        s.save(&path).expect("save");
+        let loaded = AppSettings::load(&path).expect("load");
+        let _ = fs::remove_file(&path);
+        assert!(loaded.menu_bar_only);
+    }
+
+    #[test]
+    fn corrupt_menu_bar_only_load_or_default_is_off() {
+        // Unknown / non-bool value fails parse → load_or_default → off.
+        let path = unique_settings_path("mbo-corrupt");
+        fs::write(&path, r#"{"menu_bar_only":"yes"}"#).expect("write");
+        let s = AppSettings::load_or_default(&path);
+        let _ = fs::remove_file(&path);
+        assert!(!s.menu_bar_only);
+    }
+
+    #[test]
+    fn default_input_device_is_none() {
+        let s = AppSettings::default();
+        assert!(s.input_device_name.is_none());
+    }
+
+    #[test]
+    fn missing_input_device_field_defaults_none() {
+        let path = unique_settings_path("legacy-mic");
+        fs::write(
+            &path,
+            r#"{"hotkey_mode":"hold","history_enabled":true,"history_max":50}"#,
+        )
+        .expect("write");
+        let s = AppSettings::load(&path).expect("load");
+        let _ = fs::remove_file(&path);
+        assert!(s.input_device_name.is_none());
+    }
+
+    #[test]
+    fn input_device_name_roundtrips() {
+        let path = unique_settings_path("mic");
+        let s = AppSettings {
+            input_device_name: Some("USB Headset".into()),
+            ..Default::default()
+        };
+        s.save(&path).expect("save");
+        let loaded = AppSettings::load(&path).expect("load");
+        let _ = fs::remove_file(&path);
+        assert_eq!(loaded.input_device_name.as_deref(), Some("USB Headset"));
+    }
+
+    #[test]
+    fn empty_input_device_string_loads() {
+        // Corrupt/empty preference should load without hard fail; callers treat as default.
+        let path = unique_settings_path("mic-empty");
+        fs::write(&path, r#"{"hotkey_mode":"hold","input_device_name":""}"#).expect("write");
+        let s = AppSettings::load(&path).expect("load");
+        let _ = fs::remove_file(&path);
+        assert_eq!(s.input_device_name.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn default_onboarding_not_dismissed() {
+        let s = AppSettings::default();
+        assert!(!s.onboarding_dismissed);
+    }
+
+    #[test]
+    fn missing_onboarding_dismissed_field_defaults_false() {
+        // Older settings.json without the field must show the first-run checklist.
+        let path = unique_settings_path("legacy-onboarding");
+        fs::write(
+            &path,
+            r#"{"hotkey_mode":"hold","history_enabled":true,"history_max":50}"#,
+        )
+        .expect("write");
+        let s = AppSettings::load(&path).expect("load");
+        let _ = fs::remove_file(&path);
+        assert!(!s.onboarding_dismissed);
+    }
+
+    #[test]
+    fn onboarding_dismissed_true_roundtrips() {
+        let path = unique_settings_path("onboarding-on");
+        let s = AppSettings {
+            onboarding_dismissed: true,
+            ..Default::default()
+        };
+        s.save(&path).expect("save");
+        let loaded = AppSettings::load(&path).expect("load");
+        let _ = fs::remove_file(&path);
+        assert!(loaded.onboarding_dismissed);
+    }
+
+    #[test]
+    fn corrupt_onboarding_dismissed_load_or_default_is_false() {
+        // Unknown / non-bool value fails parse → load_or_default → not dismissed (show).
+        let path = unique_settings_path("onboarding-corrupt");
+        fs::write(&path, r#"{"onboarding_dismissed":"yes"}"#).expect("write");
+        let s = AppSettings::load_or_default(&path);
+        let _ = fs::remove_file(&path);
+        assert!(!s.onboarding_dismissed);
+    }
 }
 
 impl AppSettings {
@@ -193,8 +385,7 @@ impl AppSettings {
         }
         let data = serde_json::to_string_pretty(self)
             .map_err(|e| AppError::from(format!("Serialize settings failed: {e}")))?;
-        fs::write(path, data)
-            .map_err(|e| AppError::from(format!("Write settings failed: {e}")))?;
+        fs::write(path, data).map_err(|e| AppError::from(format!("Write settings failed: {e}")))?;
         Ok(())
     }
 }

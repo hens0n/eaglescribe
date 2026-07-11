@@ -84,6 +84,29 @@ fn num_threads() -> std::ffi::c_int {
         .clamp(1, 8)
 }
 
+/// Compile-time STT acceleration backend for the running binary.
+///
+/// Driven only by Cargo features (`metal` / `cuda` / `vulkan`); never runtime GPU probes.
+/// Priority if multiple features were enabled: metal → cuda → vulkan → cpu.
+pub fn stt_acceleration() -> &'static str {
+    if cfg!(feature = "metal") {
+        "metal"
+    } else if cfg!(feature = "cuda") {
+        "cuda"
+    } else if cfg!(feature = "vulkan") {
+        "vulkan"
+    } else {
+        "cpu"
+    }
+}
+
+/// True on Apple Silicon builds that did not compile Metal into Whisper.
+///
+/// Used for a soft Settings hint only — never blocks dictation or model load.
+pub fn show_metal_rebuild_hint() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64")) && stt_acceleration() == "cpu"
+}
+
 /// Resolve model path: explicit override → env → default under repo models / app data.
 pub fn resolve_model_path(override_path: Option<&str>) -> PathBuf {
     if let Some(p) = override_path {
@@ -100,14 +123,54 @@ pub fn resolve_model_path(override_path: Option<&str>) -> PathBuf {
 
     let repo_models = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models/ggml-base.en.bin");
     if repo_models.is_file() {
-        return repo_models
-            .canonicalize()
-            .unwrap_or(repo_models);
+        return repo_models.canonicalize().unwrap_or(repo_models);
     }
 
     if let Some(data) = dirs::data_local_dir() {
-        return data.join("eaglescribe").join("models").join("ggml-base.en.bin");
+        return data
+            .join("eaglescribe")
+            .join("models")
+            .join("ggml-base.en.bin");
     }
 
     PathBuf::from("models/ggml-base.en.bin")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stt_acceleration_is_known_label() {
+        let a = stt_acceleration();
+        assert!(
+            matches!(a, "metal" | "cuda" | "vulkan" | "cpu"),
+            "unexpected stt_accel {a:?}"
+        );
+    }
+
+    #[test]
+    fn stt_acceleration_matches_compile_features() {
+        // Default CI/dev builds are CPU; feature builds report their backend.
+        if cfg!(feature = "metal") {
+            assert_eq!(stt_acceleration(), "metal");
+        } else if cfg!(feature = "cuda") {
+            assert_eq!(stt_acceleration(), "cuda");
+        } else if cfg!(feature = "vulkan") {
+            assert_eq!(stt_acceleration(), "vulkan");
+        } else {
+            assert_eq!(stt_acceleration(), "cpu");
+        }
+    }
+
+    #[test]
+    fn metal_rebuild_hint_only_on_as_cpu() {
+        let expect =
+            cfg!(all(target_os = "macos", target_arch = "aarch64")) && stt_acceleration() == "cpu";
+        assert_eq!(show_metal_rebuild_hint(), expect);
+        // Metal build must never show the "rebuild with Metal" soft hint.
+        if cfg!(feature = "metal") {
+            assert!(!show_metal_rebuild_hint());
+        }
+    }
 }

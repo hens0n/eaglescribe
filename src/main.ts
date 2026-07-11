@@ -36,6 +36,11 @@ interface HistoryEntry {
   raw?: string | null;
 }
 
+interface MicDeviceInfo {
+  name: string;
+  is_default: boolean;
+}
+
 interface StatusSnapshot {
   status: DictationStatus;
   model_path: string;
@@ -55,11 +60,40 @@ interface StatusSnapshot {
   history_max: number;
   history: HistoryEntry[];
   clipboard_restore: boolean;
+  /** Leading/trailing silence trim before Whisper. Default on. */
+  silence_trim: boolean;
+  /** macOS: hide Dock on next launch (Accessory). Default off. */
+  menu_bar_only: boolean;
+  /** True only on macOS builds — hide the Settings control elsewhere. */
+  menu_bar_only_available: boolean;
+  /** Preferred mic name; null = system default. */
+  input_device_name: string | null;
+  /** Open-time mic label from last recording start. */
+  last_input_device_label: string | null;
+  /** Backend-computed fallback notice (display only; do not re-parse labels). */
+  last_mic_fallback_notice: string | null;
   last_transcript: string | null;
   last_raw_transcript: string | null;
   last_error: string | null;
   log: string[];
   session_kind: string;
+  /** Compile-time STT backend: metal | cuda | vulkan | cpu. */
+  stt_accel: string;
+  /** Soft hint: Apple Silicon + CPU-only (rebuild with Metal). */
+  show_metal_rebuild_hint: boolean;
+  /** True only when both OS global shortcuts registered successfully. */
+  global_hotkeys_ok: boolean;
+  /** Linux session probe: x11 | wayland | other | unknown. */
+  linux_session: string;
+  /** When true, first-run setup checklist should not auto-show. */
+  onboarding_dismissed: boolean;
+  /** Compile-time host: macos | linux | other. */
+  host_os: string;
+  /**
+   * Failure-time permissions help code from last_error:
+   * microphone | accessibility | model (independent of onboarding_dismissed).
+   */
+  permissions_help: string | null;
 }
 
 const HOTKEY_HINTS: Record<HotkeyMode, string> = {
@@ -98,7 +132,15 @@ const els = {
     document.querySelector("#btn-reset-hotkeys") as HTMLButtonElement,
   hotkeyCaptureStatus: () =>
     document.querySelector("#hotkey-capture-status") as HTMLElement,
+  hotkeysUnavailableChip: () =>
+    document.querySelector("#hotkeys-unavailable-chip") as HTMLElement,
+  hotkeysUnavailableBanner: () =>
+    document.querySelector("#hotkeys-unavailable-banner") as HTMLElement,
   modelPath: () => document.querySelector("#model-path") as HTMLInputElement,
+  sttAccelLabel: () =>
+    document.querySelector("#stt-accel-label") as HTMLElement,
+  sttAccelMetalHint: () =>
+    document.querySelector("#stt-accel-metal-hint") as HTMLElement,
   transcript: () => document.querySelector("#transcript") as HTMLElement,
   transcriptRaw: () => document.querySelector("#transcript-raw") as HTMLElement,
   log: () => document.querySelector("#log") as HTMLElement,
@@ -135,7 +177,195 @@ const els = {
     document.querySelector("#btn-clear-history") as HTMLButtonElement,
   clipboardRestore: () =>
     document.querySelector("#clipboard-restore") as HTMLInputElement,
+  silenceTrim: () =>
+    document.querySelector("#silence-trim") as HTMLInputElement,
+  menuBarOnlySection: () =>
+    document.querySelector("#menu-bar-only-section") as HTMLElement,
+  menuBarOnly: () =>
+    document.querySelector("#menu-bar-only") as HTMLInputElement,
+  micDevice: () => document.querySelector("#mic-device") as HTMLSelectElement,
+  btnMicRefresh: () =>
+    document.querySelector("#btn-mic-refresh") as HTMLButtonElement,
+  btnMicSave: () => document.querySelector("#btn-mic-save") as HTMLButtonElement,
+  micStatus: () => document.querySelector("#mic-status") as HTMLElement,
+  setupChecklist: () =>
+    document.querySelector("#setup-checklist") as HTMLElement,
+  setupMacos: () => document.querySelector("#setup-macos") as HTMLElement,
+  setupLinux: () => document.querySelector("#setup-linux") as HTMLElement,
+  btnSetupDismiss: () =>
+    document.querySelector("#btn-setup-dismiss") as HTMLButtonElement,
+  btnShowSetup: () =>
+    document.querySelector("#btn-show-setup") as HTMLButtonElement,
+  btnOpenMicPrivacy: () =>
+    document.querySelector("#btn-open-mic-privacy") as HTMLButtonElement,
+  btnOpenAxPrivacy: () =>
+    document.querySelector("#btn-open-ax-privacy") as HTMLButtonElement,
+  btnSetupFocusModel: () =>
+    document.querySelector("#btn-setup-focus-model") as HTMLButtonElement,
+  btnSetupFocusModelLinux: () =>
+    document.querySelector(
+      "#btn-setup-focus-model-linux",
+    ) as HTMLButtonElement,
+  permissionsFailureHelp: () =>
+    document.querySelector("#permissions-failure-help") as HTMLElement,
+  pfhTitle: () => document.querySelector("#pfh-title") as HTMLElement,
+  pfhBody: () => document.querySelector("#pfh-body") as HTMLElement,
+  pfhPath: () => document.querySelector("#pfh-path") as HTMLElement,
+  pfhClipboard: () => document.querySelector("#pfh-clipboard") as HTMLElement,
+  btnPfhDismiss: () =>
+    document.querySelector("#btn-pfh-dismiss") as HTMLButtonElement,
+  btnPfhOpenMic: () =>
+    document.querySelector("#btn-pfh-open-mic") as HTMLButtonElement,
+  btnPfhOpenAx: () =>
+    document.querySelector("#btn-pfh-open-ax") as HTMLButtonElement,
+  btnPfhFocusModel: () =>
+    document.querySelector("#btn-pfh-focus-model") as HTMLButtonElement,
+  btnPfhShowChecklist: () =>
+    document.querySelector("#btn-pfh-show-checklist") as HTMLButtonElement,
 };
+
+/**
+ * When true, checklist was opened from Settings and stays visible until the
+ * user dismisses — even if `onboarding_dismissed` is already true.
+ */
+let setupForcedOpen = false;
+/** Last known dismiss flag from status (for auto-show decisions). */
+let onboardingDismissed = false;
+/** Host OS from status for macOS vs Linux checklist bodies. */
+let hostOs: string = "other";
+/**
+ * When the user dismisses failure-time help, hide until permissions_help changes
+ * (or clears). Does not depend on onboarding_dismissed.
+ */
+let pfhUserDismissedKind: string | null = null;
+/** Last permissions_help code applied from status (for dismiss tracking). */
+let lastPermissionsHelpKind: string | null = null;
+
+/** Same checklist guidance, used for failure-time help (spec §3.3). */
+type PermissionsHelpKind = "microphone" | "accessibility" | "model";
+
+interface PermissionsHelpCopy {
+  title: string;
+  body: string;
+  /** macOS manual path; null when not applicable. */
+  pathMac: string | null;
+  bodyLinux: string;
+  showClipboard: boolean;
+}
+
+const PERMISSIONS_HELP_COPY: Record<PermissionsHelpKind, PermissionsHelpCopy> = {
+  microphone: {
+    title: "Microphone access",
+    body: "So we can hear you. Grant mic access for EagleScribe.",
+    pathMac:
+      "System Settings → Privacy & Security → Microphone → enable EagleScribe",
+    bodyLinux:
+      "Capture needs mic access (PipeWire / PulseAudio on most desktops). Grant when the OS prompts, or check session audio settings.",
+    showClipboard: false,
+  },
+  accessibility: {
+    title: "Paste into other apps",
+    body: "So we can paste into other apps (clipboard + simulated paste). Enable Accessibility for EagleScribe.",
+    pathMac:
+      "System Settings → Privacy & Security → Accessibility → enable EagleScribe",
+    bodyLinux:
+      "Paste reliability depends on session type (X11 vs Wayland) and packages. On failure, text stays on the clipboard for manual paste.",
+    showClipboard: true,
+  },
+  model: {
+    title: "Whisper model",
+    body: "Local speech-to-text needs a ggml model file. Set path under Settings → Whisper model, then Load. Or run npm run model:download (see README).",
+    pathMac: null,
+    bodyLinux:
+      "Local speech-to-text needs a ggml model file. Set path under Settings → Whisper model, then Load. Or run npm run model:download (see README).",
+    showClipboard: false,
+  },
+};
+
+function parsePermissionsHelpKind(
+  raw: string | null | undefined,
+): PermissionsHelpKind | null {
+  switch ((raw ?? "").toLowerCase()) {
+    case "microphone":
+    case "mic":
+      return "microphone";
+    case "accessibility":
+    case "ax":
+    case "paste":
+      return "accessibility";
+    case "model":
+    case "whisper":
+      return "model";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Show failure-time permissions help for the current last_error classification.
+ * Independent of onboarding_dismissed / checklist visibility.
+ */
+function applyPermissionsFailureHelp(s: StatusSnapshot) {
+  const panel = els.permissionsFailureHelp();
+  if (!panel) return;
+
+  const kind = parsePermissionsHelpKind(s.permissions_help);
+  lastPermissionsHelpKind = kind;
+
+  if (!kind) {
+    panel.hidden = true;
+    pfhUserDismissedKind = null;
+    return;
+  }
+
+  // User dismissed this specific failure kind; re-show if kind changes.
+  if (pfhUserDismissedKind === kind) {
+    panel.hidden = true;
+    return;
+  }
+
+  const isMac = hostOs === "macos" || (s.host_os ?? "").toLowerCase() === "macos";
+  const copy = PERMISSIONS_HELP_COPY[kind];
+  els.pfhTitle().textContent = copy.title;
+  els.pfhBody().textContent = isMac ? copy.body : copy.bodyLinux;
+
+  const pathEl = els.pfhPath();
+  if (isMac && copy.pathMac) {
+    pathEl.hidden = false;
+    pathEl.textContent = copy.pathMac;
+  } else {
+    pathEl.hidden = true;
+    pathEl.textContent = "";
+  }
+
+  els.pfhClipboard().hidden = !copy.showClipboard;
+
+  const showMic = kind === "microphone" && isMac;
+  const showAx = kind === "accessibility" && isMac;
+  const showModel = kind === "model";
+  els.btnPfhOpenMic().hidden = !showMic;
+  els.btnPfhOpenAx().hidden = !showAx;
+  els.btnPfhFocusModel().hidden = !showModel;
+
+  panel.hidden = false;
+}
+
+function dismissPermissionsFailureHelp() {
+  pfhUserDismissedKind = lastPermissionsHelpKind;
+  const panel = els.permissionsFailureHelp();
+  if (panel) panel.hidden = true;
+}
+
+/** Preferred mic currently reflected in the select (from status). */
+let currentInputDeviceName: string | null = null;
+/** Device list last loaded from the host (empty until first fetch). */
+let micDevicesLoaded = false;
+/** Names from last successful enumeration (for missing-preferred cue). */
+let lastMicDeviceNames: string[] = [];
+/** Last enumeration error text (if any); Refresh / load clears or updates this. */
+let micListError: string | null = null;
+/** Fallback notice from last recording (from backend snapshot; display only). */
+let micFallbackNotice: string | null = null;
 
 /** Map a KeyboardEvent to a global-hotkey string (modifiers + e.code). */
 function eventToHotkeyString(e: KeyboardEvent): string | null {
@@ -378,6 +608,175 @@ function renderHistory(
   }
 }
 
+/**
+ * Build mic select options: System default + host devices.
+ * `selection` is the value to select after rebuild (may differ from saved preferred
+ * when Refresh preserves an unsaved dirty choice).
+ */
+function populateMicSelect(
+  devices: MicDeviceInfo[],
+  preferred: string | null,
+  selection: string,
+) {
+  const select = els.micDevice();
+  const prevFocus = document.activeElement === select;
+  const names = devices.map((d) => d.name);
+  lastMicDeviceNames = names;
+
+  select.innerHTML = "";
+  const def = document.createElement("option");
+  def.value = "";
+  def.textContent = "System default";
+  select.appendChild(def);
+
+  for (const d of devices) {
+    const opt = document.createElement("option");
+    opt.value = d.name;
+    opt.textContent = d.is_default ? `${d.name} (host default)` : d.name;
+    select.appendChild(opt);
+  }
+
+  // Ensure the intended selection exists (unplugged preferred or dirty choice).
+  const ensureOption = (value: string) => {
+    if (!value || names.includes(value)) return;
+    if (Array.from(select.options).some((o) => o.value === value)) return;
+    const missing = document.createElement("option");
+    missing.value = value;
+    missing.textContent = `${value} (not found)`;
+    select.appendChild(missing);
+  };
+  ensureOption(selection);
+  // Keep saved preferred visible if different from selection and also missing.
+  if (preferred && preferred !== selection) {
+    ensureOption(preferred);
+  }
+
+  select.value = selection;
+  // If value didn't stick (shouldn't happen), force system default.
+  if (select.value !== selection) {
+    select.value = "";
+  }
+  micDevicesLoaded = true;
+  refreshMicStatusHint(preferred);
+  if (prevFocus) select.focus();
+}
+
+/**
+ * Re-enumerate host input devices (Settings Refresh / initial open).
+ * Invokes `list_mic_devices` each time — no device cache on the backend.
+ *
+ * @param preferred saved preference (for missing-device cue)
+ * @param selection value to keep selected after rebuild (defaults to preferred)
+ */
+async function loadMicDevices(
+  preferred: string | null,
+  selection?: string | null,
+) {
+  const statusEl = els.micStatus();
+  const btn = els.btnMicRefresh();
+  const prevDisabled = btn.disabled;
+  const keep = selection !== undefined ? (selection ?? "") : (preferred ?? "");
+  btn.disabled = true;
+  try {
+    // Fresh enumeration every call = refresh path (acceptance: new mics without restart).
+    const devices = await invoke<MicDeviceInfo[]>("list_mic_devices");
+    micListError = null;
+    populateMicSelect(devices ?? [], preferred, keep);
+  } catch (e) {
+    // Keep System default option so Settings stays usable.
+    micListError = `Could not list microphones: ${String(e)}`;
+    populateMicSelect([], preferred, keep);
+    statusEl.hidden = false;
+    statusEl.textContent = micListError;
+  } finally {
+    btn.disabled = prevDisabled;
+  }
+}
+
+/** Refresh #mic-status from list error, last-recording fallback, or missing preferred. */
+function refreshMicStatusHint(preferred: string | null) {
+  const statusEl = els.micStatus();
+  if (micListError) {
+    statusEl.hidden = false;
+    statusEl.textContent = micListError;
+    return;
+  }
+  if (micFallbackNotice) {
+    statusEl.hidden = false;
+    statusEl.textContent = micFallbackNotice;
+    return;
+  }
+  const want = preferred ?? "";
+  if (!want || !micDevicesLoaded) {
+    statusEl.hidden = true;
+    statusEl.textContent = "";
+    return;
+  }
+  if (!lastMicDeviceNames.includes(want)) {
+    statusEl.hidden = false;
+    statusEl.textContent = `Preferred mic “${want}” not found — next recording uses system default.`;
+    return;
+  }
+  statusEl.hidden = true;
+  statusEl.textContent = "";
+}
+
+function applyMicPreference(preferred: string | null) {
+  const select = els.micDevice();
+  // Unsaved choice: select differs from last known saved preference.
+  const dirty =
+    micDevicesLoaded && select.value !== (currentInputDeviceName ?? "");
+  currentInputDeviceName = preferred;
+
+  if (!micDevicesLoaded) {
+    // Options not loaded yet; loadMicDevices will set value.
+    return;
+  }
+  // Don't clobber a focused or dirty select on status push (e.g. recording).
+  if (document.activeElement === select || dirty) {
+    refreshMicStatusHint(preferred);
+    return;
+  }
+
+  const want = preferred ?? "";
+  // Ensure preferred option exists (may have been unplugged).
+  if (want && !Array.from(select.options).some((o) => o.value === want)) {
+    const missing = document.createElement("option");
+    missing.value = want;
+    missing.textContent = `${want} (not found)`;
+    select.appendChild(missing);
+  }
+  select.value = want;
+  if (select.value !== want) select.value = "";
+  refreshMicStatusHint(preferred);
+}
+
+/** Display label for compile-time STT acceleration (Settings read-only line). */
+function formatSttAccel(raw: string | null | undefined): string {
+  switch ((raw ?? "").toLowerCase()) {
+    case "metal":
+      return "Metal";
+    case "cuda":
+      return "CUDA";
+    case "vulkan":
+      return "Vulkan";
+    case "cpu":
+      return "CPU";
+    case "":
+      return "unknown";
+    default:
+      // Truthful fallback if backend sends an unexpected token.
+      return raw as string;
+  }
+}
+
+/** Surface backend-computed fallback notice in Settings mic-status (no label parsing). */
+function applyMicFallbackFromStatus(s: StatusSnapshot) {
+  const notice = s.last_mic_fallback_notice ?? null;
+  micFallbackNotice = notice ? `Last recording: ${notice}` : null;
+  refreshMicStatusHint(s.input_device_name ?? null);
+}
+
 function applyStatus(s: StatusSnapshot) {
   const badge = els.badge();
   const status = (s.status ?? "idle") as DictationStatus;
@@ -388,12 +787,23 @@ function applyStatus(s: StatusSnapshot) {
   els.polishMode().textContent = s.polish_mode;
   const hotkeyMode = s.hotkey_mode ?? "hold";
   els.hotkeyMode().textContent = hotkeyMode;
-  els.hotkeyHint().textContent = HOTKEY_HINTS[hotkeyMode] ?? HOTKEY_HINTS.hold;
+  // Do not claim global shortcuts are live when OS registration failed.
+  const hotkeysOk = s.global_hotkeys_ok === true;
+  els.hotkeyHint().textContent = hotkeysOk
+    ? (HOTKEY_HINTS[hotkeyMode] ?? HOTKEY_HINTS.hold)
+    : "ui only";
   updateHotkeyDisplays(
     s.dictation_hotkey ?? "Ctrl+Shift+Space",
     s.command_hotkey ?? "Ctrl+Shift+X",
   );
+  const unavailChip = els.hotkeysUnavailableChip();
+  const unavailBanner = els.hotkeysUnavailableBanner();
+  if (unavailChip) unavailChip.hidden = hotkeysOk;
+  if (unavailBanner) unavailBanner.hidden = hotkeysOk;
   els.modelPath().value = s.model_path;
+  // Read-only compile-time STT acceleration (no runtime switch).
+  els.sttAccelLabel().textContent = formatSttAccel(s.stt_accel);
+  els.sttAccelMetalHint().hidden = s.show_metal_rebuild_hint !== true;
   if (document.activeElement !== els.llmUrl()) {
     els.llmUrl().value = s.llm_base_url ?? "";
   }
@@ -414,6 +824,18 @@ function applyStatus(s: StatusSnapshot) {
   if (document.activeElement !== els.clipboardRestore()) {
     els.clipboardRestore().checked = s.clipboard_restore ?? true;
   }
+  if (document.activeElement !== els.silenceTrim()) {
+    els.silenceTrim().checked = s.silence_trim ?? true;
+  }
+  // macOS-only control; hidden on Linux/Windows (no dock-hide story).
+  const mboAvailable = s.menu_bar_only_available === true;
+  els.menuBarOnlySection().hidden = !mboAvailable;
+  if (mboAvailable && document.activeElement !== els.menuBarOnly()) {
+    els.menuBarOnly().checked = s.menu_bar_only ?? false;
+  }
+  applyMicPreference(s.input_device_name ?? null);
+  applyMicFallbackFromStatus(s);
+  applySetupChecklistFromStatus(s);
 
   if (s.polish_mode === "verbatim") {
     els.polishVerbatim().checked = true;
@@ -435,6 +857,8 @@ function applyStatus(s: StatusSnapshot) {
     err.hidden = true;
     err.textContent = "";
   }
+  // Contextual mic / Accessibility / model guidance (even if checklist dismissed).
+  applyPermissionsFailureHelp(s);
 
   const busy = status === "transcribing" || status === "waiting_llm";
   const recording = status === "recording";
@@ -459,38 +883,150 @@ async function refresh() {
   applyStatus(s);
 }
 
-function setupTabs() {
+type TabName = "settings" | "library" | "history" | "log";
+
+function activateTab(name: TabName) {
   const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>(".tab"));
-  const panels = {
+  const panels: Record<TabName, HTMLElement> = {
     settings: document.querySelector("#panel-settings") as HTMLElement,
     library: document.querySelector("#panel-library") as HTMLElement,
     history: document.querySelector("#panel-history") as HTMLElement,
     log: document.querySelector("#panel-log") as HTMLElement,
   };
+  for (const tab of tabs) {
+    const on = tab.dataset.tab === name;
+    tab.classList.toggle("active", on);
+    tab.setAttribute("aria-selected", on ? "true" : "false");
+  }
+  for (const [key, panel] of Object.entries(panels) as [TabName, HTMLElement][]) {
+    const on = key === name;
+    panel.classList.toggle("active", on);
+    panel.hidden = !on;
+  }
+}
 
-  const activate = (name: keyof typeof panels) => {
-    for (const tab of tabs) {
-      const on = tab.dataset.tab === name;
-      tab.classList.toggle("active", on);
-      tab.setAttribute("aria-selected", on ? "true" : "false");
-    }
-    for (const [key, panel] of Object.entries(panels)) {
-      const on = key === name;
-      panel.classList.toggle("active", on);
-      panel.hidden = !on;
-    }
-  };
-
+function setupTabs() {
+  const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>(".tab"));
   for (const tab of tabs) {
     tab.addEventListener("click", () => {
-      const name = tab.dataset.tab as keyof typeof panels;
-      if (name && panels[name]) activate(name);
+      const name = tab.dataset.tab as TabName;
+      if (name) activateTab(name);
     });
+  }
+}
+
+/** Show/hide checklist body variants and panel based on dismiss + force flag. */
+function syncSetupChecklistVisibility() {
+  const panel = els.setupChecklist();
+  const mac = els.setupMacos();
+  const linux = els.setupLinux();
+  if (!panel || !mac || !linux) return;
+
+  const isMac = hostOs === "macos";
+  mac.hidden = !isMac;
+  // Linux notes for linux and other non-macOS (Windows out of scope; honest generic).
+  linux.hidden = isMac;
+
+  const shouldShow = setupForcedOpen || !onboardingDismissed;
+  panel.hidden = !shouldShow;
+}
+
+function applySetupChecklistFromStatus(s: StatusSnapshot) {
+  onboardingDismissed = s.onboarding_dismissed === true;
+  hostOs = (s.host_os ?? "other").toLowerCase();
+  // Auto-show when not dismissed; Settings force-open keeps it visible after dismiss.
+  syncSetupChecklistVisibility();
+}
+
+function showSetupChecklist() {
+  setupForcedOpen = true;
+  syncSetupChecklistVisibility();
+  // Scroll checklist into view without blocking the rest of the UI.
+  const panel = els.setupChecklist();
+  if (panel) {
+    panel.hidden = false;
+    panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+}
+
+async function dismissSetupChecklist() {
+  setupForcedOpen = false;
+  try {
+    const s = await invoke<StatusSnapshot>("set_onboarding_dismissed", {
+      dismissed: true,
+    });
+    applyStatus(s);
+  } catch (e) {
+    // Still hide locally so the user is not stuck; next launch may re-show.
+    onboardingDismissed = true;
+    syncSetupChecklistVisibility();
+    console.error(e);
+  }
+}
+
+function focusModelSettings() {
+  activateTab("settings");
+  const input = els.modelPath();
+  if (input) {
+    input.focus();
+    input.select();
+    input.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+}
+
+/**
+ * Open a macOS privacy pane via Rust `open` (validated pane token).
+ * Does not use the JS opener allowlist (which only covers mailto/tel/http(s) by default).
+ * On failure, alert the always-visible manual path — never crash.
+ */
+async function openMacPrivacy(pane: "microphone" | "accessibility", label: string) {
+  try {
+    await invoke("open_macos_privacy_pane", { pane });
+  } catch (e) {
+    console.warn(`open ${label} settings failed`, e);
+    alert(
+      `Could not open System Settings automatically.\n\nUse the manual path under the ${label} row:\nSystem Settings → Privacy & Security → ${label}`,
+    );
   }
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
   setupTabs();
+
+  els.btnSetupDismiss().addEventListener("click", () => {
+    void dismissSetupChecklist();
+  });
+  els.btnShowSetup().addEventListener("click", () => {
+    showSetupChecklist();
+  });
+  els.btnOpenMicPrivacy()?.addEventListener("click", () => {
+    void openMacPrivacy("microphone", "Microphone");
+  });
+  els.btnOpenAxPrivacy()?.addEventListener("click", () => {
+    void openMacPrivacy("accessibility", "Accessibility");
+  });
+  els.btnSetupFocusModel()?.addEventListener("click", () => {
+    focusModelSettings();
+  });
+  els.btnSetupFocusModelLinux()?.addEventListener("click", () => {
+    focusModelSettings();
+  });
+
+  els.btnPfhDismiss()?.addEventListener("click", () => {
+    dismissPermissionsFailureHelp();
+  });
+  els.btnPfhOpenMic()?.addEventListener("click", () => {
+    void openMacPrivacy("microphone", "Microphone");
+  });
+  els.btnPfhOpenAx()?.addEventListener("click", () => {
+    void openMacPrivacy("accessibility", "Accessibility");
+  });
+  els.btnPfhFocusModel()?.addEventListener("click", () => {
+    focusModelSettings();
+  });
+  els.btnPfhShowChecklist()?.addEventListener("click", () => {
+    showSetupChecklist();
+  });
 
   els.historyEnabled().addEventListener("change", async () => {
     try {
@@ -508,6 +1044,30 @@ window.addEventListener("DOMContentLoaded", async () => {
     try {
       const s = await invoke<StatusSnapshot>("set_clipboard_restore", {
         enabled: els.clipboardRestore().checked,
+      });
+      applyStatus(s);
+    } catch (e) {
+      alert(String(e));
+      await refresh();
+    }
+  });
+
+  els.silenceTrim().addEventListener("change", async () => {
+    try {
+      const s = await invoke<StatusSnapshot>("set_silence_trim", {
+        enabled: els.silenceTrim().checked,
+      });
+      applyStatus(s);
+    } catch (e) {
+      alert(String(e));
+      await refresh();
+    }
+  });
+
+  els.menuBarOnly().addEventListener("change", async () => {
+    try {
+      const s = await invoke<StatusSnapshot>("set_menu_bar_only", {
+        enabled: els.menuBarOnly().checked,
       });
       applyStatus(s);
     } catch (e) {
@@ -726,12 +1286,39 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   els.btnSnipAdd().addEventListener("click", () => void addSnip());
 
+  els.btnMicSave().addEventListener("click", async () => {
+    const value = els.micDevice().value;
+    const name = value.trim() === "" ? null : value;
+    try {
+      const s = await invoke<StatusSnapshot>("set_input_device", { name });
+      applyStatus(s);
+    } catch (e) {
+      alert(String(e));
+      await refresh();
+    }
+  });
+
+  // Re-enumerate inputs so newly plugged mics appear without restarting.
+  // Preserve an unsaved (dirty) dropdown choice across refresh.
+  els.btnMicRefresh().addEventListener("click", async () => {
+    try {
+      const select = els.micDevice();
+      const dirty =
+        micDevicesLoaded && select.value !== (currentInputDeviceName ?? "");
+      const selection = dirty ? select.value : (currentInputDeviceName ?? "");
+      await loadMicDevices(currentInputDeviceName, selection);
+    } catch (e) {
+      console.error(e);
+    }
+  });
+
   await listen<StatusSnapshot>("dictation-status", (event) => {
     applyStatus(event.payload);
   });
 
   try {
     await refresh();
+    await loadMicDevices(currentInputDeviceName);
   } catch (e) {
     console.error("Failed to load status", e);
   }

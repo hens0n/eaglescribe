@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
@@ -22,7 +22,8 @@ thiserror = "2"
 parking_lot = "0.12"
 cpal = "0.15"
 hound = "3.5"
-arboard = "3"
+# wayland-data-control: pure Wayland compositors with ext/wlr data-control (falls back to X11).
+arboard = { version = "3", features = ["wayland-data-control"] }
 enigo = "0.3"
 dirs = "6"
 regex = "1"

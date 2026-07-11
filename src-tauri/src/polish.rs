@@ -91,8 +91,14 @@ fn apply_spoken_punctuation(input: &str) -> String {
         (r"(?i)\bcolon\b", ":"),
         (r"(?i)\bsemicolon\b", ";"),
         (r"(?i)\bem\s*dash\b", "—"),
-        (r"(?i)\b(open\s+paren(thesis)?|left\s+paren(thesis)?)\b", "("),
-        (r"(?i)\b(close\s+paren(thesis)?|right\s+paren(thesis)?)\b", ")"),
+        (
+            r"(?i)\b(open\s+paren(thesis)?|left\s+paren(thesis)?)\b",
+            "(",
+        ),
+        (
+            r"(?i)\b(close\s+paren(thesis)?|right\s+paren(thesis)?)\b",
+            ")",
+        ),
         (r"(?i)\b(quote|quotation[\s\-]*marks?)\b", "\""),
         (r"(?i)\bellipsis\b", "…"),
     ];
@@ -185,7 +191,9 @@ fn apply_backtrack(input: &str) -> String {
                 .trim()
                 .to_string()
             } else {
-                caps.get(0).map(|m| m.as_str().to_string()).unwrap_or_default()
+                caps.get(0)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default()
             }
         })
         .into_owned();
@@ -236,10 +244,8 @@ fn restatement_re() -> &'static Regex {
 }
 
 fn strip_edge_punct(tok: &str) -> String {
-    tok.trim_matches(|c: char| {
-        matches!(c, ',' | '.' | ';' | '!' | '?' | '"' | '\'' | ':' | '…')
-    })
-    .to_string()
+    tok.trim_matches(|c: char| matches!(c, ',' | '.' | ';' | '!' | '?' | '"' | '\'' | ':' | '…'))
+        .to_string()
 }
 
 fn trailing_sentence_punct(tok: &str) -> &'static str {
@@ -389,11 +395,7 @@ fn ensure_terminal_punctuation(input: &str) -> String {
 }
 
 fn looks_like_formatted_list(s: &str) -> bool {
-    let lines: Vec<&str> = s
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
+    let lines: Vec<&str> = s.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     if lines.len() < 2 {
         return false;
     }
@@ -416,8 +418,7 @@ const CARDINAL_MARKERS: &[&str] = &[
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
 ];
 const ORDINAL_MARKERS: &[&str] = &[
-    "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
-    "ninth", "tenth",
+    "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
 ];
 /// Bullet-style spoken cues → `-` list (not numbered).
 const BULLET_MARKERS: &[&str] = &["bullet", "dash", "asterisk", "next item", "next bullet"];
@@ -458,11 +459,7 @@ enum ListStyle {
     Bullet,
 }
 
-fn try_format_with_word_markers(
-    input: &str,
-    markers: &[&str],
-    style: ListStyle,
-) -> Option<String> {
+fn try_format_with_word_markers(input: &str, markers: &[&str], style: ListStyle) -> Option<String> {
     // Longest first so "next item" wins over bare words if both were present.
     let mut sorted: Vec<&str> = markers.to_vec();
     sorted.sort_by_key(|m| std::cmp::Reverse(m.len()));
@@ -519,7 +516,11 @@ fn build_list_from_hits(
         return None;
     }
 
-    let mut prefix = input.get(..hits[0].start()).unwrap_or("").trim().to_string();
+    let mut prefix = input
+        .get(..hits[0].start())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     // Drop trailing glue words/punct before the list.
     prefix = trim_list_prefix(&prefix);
 
@@ -730,11 +731,7 @@ mod tests {
             "are you there question marks",
         ] {
             let r = polish(raw, PolishMode::Smart);
-            assert!(
-                r.polished.ends_with('?'),
-                "input {raw:?} → {}",
-                r.polished
-            );
+            assert!(r.polished.ends_with('?'), "input {raw:?} → {}", r.polished);
             assert!(
                 !r.polished.to_lowercase().contains("question"),
                 "input {raw:?} → {}",
@@ -746,10 +743,7 @@ mod tests {
     /// If STT never emitted "question mark", we cannot invent `?` — only a period.
     #[test]
     fn without_spoken_question_gets_period() {
-        let r = polish(
-            "um let's meet at two actually three",
-            PolishMode::Smart,
-        );
+        let r = polish("um let's meet at two actually three", PolishMode::Smart);
         assert_eq!(r.polished, "Let's meet at three.");
     }
 
@@ -787,7 +781,11 @@ mod tests {
             "steps first open the app second log in third create a project",
             PolishMode::Smart,
         );
-        assert!(r.polished.contains("1. Open the app"), "got: {}", r.polished);
+        assert!(
+            r.polished.contains("1. Open the app"),
+            "got: {}",
+            r.polished
+        );
         assert!(r.polished.contains("2. Log in"), "got: {}", r.polished);
         assert!(
             r.polished.contains("3. Create a project"),
@@ -798,10 +796,7 @@ mod tests {
 
     #[test]
     fn formats_digit_list() {
-        let r = polish(
-            "shopping list 1 milk 2 eggs 3 bread",
-            PolishMode::Smart,
-        );
+        let r = polish("shopping list 1 milk 2 eggs 3 bread", PolishMode::Smart);
         assert!(r.polished.contains("1. Milk"), "got: {}", r.polished);
         assert!(r.polished.contains("2. Eggs"), "got: {}", r.polished);
         assert!(r.polished.contains("3. Bread"), "got: {}", r.polished);
@@ -828,11 +823,7 @@ mod tests {
     fn time_correction_is_not_a_list() {
         // Regression: "two actually three" must not become a two-item list.
         let r = polish("meet at two actually three", PolishMode::Smart);
-        assert!(
-            !r.polished.contains("1."),
-            "got: {}",
-            r.polished
-        );
+        assert!(!r.polished.contains("1."), "got: {}", r.polished);
         assert!(
             r.polished.to_lowercase().contains("three"),
             "got: {}",

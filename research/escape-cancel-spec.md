@@ -3,7 +3,7 @@
 **Status:** Implemented (issues #1–#3)  
 **Date:** 2026-07-10  
 **Priority:** Medium (DICT-03 / P0 in requirements; STATUS default Mac slice)  
-**Related:** [STATUS.md](./STATUS.md) · [requirements-local-app.md](./requirements-local-app.md) (`DICT-03`)
+**Related:** [requirements-local-app.md](./requirements-local-app.md) (`DICT-03`)
 
 This document is the implementable product/behavior contract for **global Escape cancel while recording**. It is not an implementation plan beyond acceptance criteria and intentional non-goals.
 
@@ -158,6 +158,6 @@ Platform note: global shortcuts may require the same macOS **Accessibility / Inp
 
 ## 8. Handoff
 
-**Implemented** (issues #1–#3): global Escape arm/disarm while `recording`, hold-safe release suppress (cleared on next release **or** new session start), Escape-alone rebind rejection. See [STATUS.md](./STATUS.md).
+**Implemented** (issues #1–#3): global Escape arm/disarm while `recording`, hold-safe release suppress (cleared on next release **or** new session start), Escape-alone rebind rejection.
 
 **Do not** expand into STT/LLM abort or clipboard restore without a new product decision.
