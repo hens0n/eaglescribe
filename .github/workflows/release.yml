@@ -1,0 +1,108 @@
+# Build unsigned macOS (Metal, Apple Silicon) + Linux x64 packages and attach to a GitHub Release.
+# Trigger: push tag v* or manual workflow_dispatch.
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin --features metal"
+            rust_targets: aarch64-apple-darwin
+          - platform: ubuntu-22.04
+            args: ""
+            rust_targets: ""
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            pkg-config \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libasound2-dev \
+            libxdo-dev \
+            libx11-dev
+
+      - name: Install macOS build tools
+        if: startsWith(matrix.platform, 'macos')
+        run: |
+          brew install cmake || true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and upload to GitHub Release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Ad-hoc signing so Apple Silicon builds are less likely to be quarantined as "damaged".
+          # Replace with Developer ID secrets when notarizing later.
+          APPLE_SIGNING_IDENTITY: "-"
+        with:
+          projectPath: .
+          tagName: v__VERSION__
+          releaseName: "EagleScribe v__VERSION__"
+          releaseBody: |
+            Local-first voice dictation for **macOS** and **Linux**.
+
+            ### Downloads
+            - **macOS (Apple Silicon):** `.dmg` / `.app` built with **Metal** Whisper acceleration. Requires **macOS 10.15+**.
+            - **Linux (x64):** packages from Tauri (`deb` / AppImage when produced). **X11** is the hard-supported session for global hotkeys; pure Wayland is UI + clipboard fallback — see README.
+
+            ### After install
+            1. Download a Whisper model (`npm run model:download` from a clone, or place a `ggml-*.bin` and point Settings at it). Models are **not** bundled.
+            2. **macOS Gatekeeper (unsigned):** right-click → **Open**, or remove quarantine:
+               `xattr -dr com.apple.quarantine /path/to/EagleScribe.app`
+            3. Grant **Microphone** and **Accessibility** when prompted (paste into other apps).
+
+            ### Notes
+            - No code signing / notarization in this release (dogfood / contributor builds).
+            - Privacy: default dictation path stays fully local; Command Mode uses a user-configured localhost LLM only.
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
