@@ -30,6 +30,10 @@ impl WhisperEngine {
     }
 
     /// Transcribe mono f32 PCM at 16 kHz.
+    ///
+    /// Callers should pass audio that already includes a short trailing silence
+    /// pad (see [`crate::audio::pad_for_whisper_16k`]) so the decoder does not
+    /// clip the last words of a long or multi-sentence take.
     pub fn transcribe_16k_mono(&self, audio: &[f32]) -> AppResult<String> {
         if audio.is_empty() {
             return Err(AppError::from("Empty audio buffer"));
@@ -40,7 +44,12 @@ impl WhisperEngine {
             .create_state()
             .map_err(|e| AppError::from(format!("Whisper state error: {e}")))?;
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        // Beam search is slower than greedy but far less likely to emit an early
+        // EOT mid-sentence on base.en — the main cause of "second sentence cut off".
+        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+            beam_size: 5,
+            patience: 1.0,
+        });
         params.set_n_threads(num_threads());
         params.set_language(Some("en"));
         params.set_print_special(false);
@@ -49,7 +58,14 @@ impl WhisperEngine {
         params.set_print_timestamps(false);
         params.set_translate(false);
         params.set_suppress_blank(true);
+        // Keep non-speech token suppression on so music/noise tags are less likely.
+        params.set_suppress_nst(true);
+        // Do not condition on prior text across windows — dictation takes are
+        // independent and prior context can cause loops on short clips.
         params.set_no_context(true);
+        // Temperature fallbacks (defaults: 0 + 0.2 inc) retry low-quality passes.
+        params.set_temperature(0.0);
+        params.set_temperature_inc(0.2);
 
         state
             .full(params, audio)
@@ -63,18 +79,39 @@ impl WhisperEngine {
             let segment = state
                 .full_get_segment_text(i)
                 .map_err(|e| AppError::from(format!("Segment text failed: {e}")))?;
-            let segment = segment.trim();
+            let segment = clean_segment_text(&segment);
             if segment.is_empty() {
                 continue;
             }
             if !text.is_empty() {
                 text.push(' ');
             }
-            text.push_str(segment);
+            text.push_str(&segment);
         }
 
         Ok(text)
     }
+}
+
+/// Strip Whisper hallucination tags and normalize whitespace on one segment.
+fn clean_segment_text(segment: &str) -> String {
+    let mut s = segment.trim().to_string();
+    // base.en sometimes emits these instead of (or mixed into) real speech.
+    for tag in [
+        "[BLANK_AUDIO]",
+        "[blank_audio]",
+        "[MUSIC]",
+        "[music]",
+        "[NOISE]",
+        "[noise]",
+        "[Silence]",
+        "[silence]",
+        "(blank)",
+        "(silence)",
+    ] {
+        s = s.replace(tag, " ");
+    }
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn num_threads() -> std::ffi::c_int {
@@ -147,6 +184,16 @@ mod tests {
             matches!(a, "metal" | "cuda" | "vulkan" | "cpu"),
             "unexpected stt_accel {a:?}"
         );
+    }
+
+    #[test]
+    fn clean_segment_strips_blank_audio_tags() {
+        assert_eq!(clean_segment_text("[BLANK_AUDIO]"), "");
+        assert_eq!(
+            clean_segment_text("hello [BLANK_AUDIO] world"),
+            "hello world"
+        );
+        assert_eq!(clean_segment_text("  dictation is working.  "), "dictation is working.");
     }
 
     #[test]

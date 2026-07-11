@@ -716,6 +716,19 @@ impl AppState {
             return Err(e);
         }
 
+        // Post-roll: the hold hotkey Released (or Stop) already fired, but the
+        // mic session is still open until `session.stop()`. Keep capturing so
+        // words at the end of a second sentence are not lost when the chord is
+        // lifted a beat early. Offline STT on full audio is fine; history
+        // truncations matched incomplete capture duration, not Whisper.
+        let post_roll = crate::audio::RECORDING_POST_ROLL_MS;
+        if post_roll > 0 {
+            self.push_log(format!(
+                "Post-roll {post_roll}ms (keep mic open after release)…"
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(post_roll));
+        }
+
         let (samples, rate) = match session.stop() {
             Ok(v) => v,
             Err(e) => {
@@ -731,6 +744,15 @@ impl AppState {
             "Captured {duration_s:.1}s audio ({} samples @ 16 kHz, peak={peak:.4}, device rate={rate})",
             audio.len()
         ));
+        // Overwrite last-take dump so we can re-run STT offline if text looks cut off.
+        let capture_path = crate::audio::default_last_capture_path();
+        match crate::audio::write_wav_16k_mono(&capture_path, &audio) {
+            Ok(()) => self.push_log(format!(
+                "Saved last capture ({duration_s:.1}s) → {}",
+                capture_path.display()
+            )),
+            Err(e) => self.push_log(format!("Could not save last capture wav: {e}")),
+        };
 
         // Near-zero peak almost always means macOS denied the mic (or wrong
         // device) and still delivered a stream of silence — not "no speech".
@@ -753,11 +775,12 @@ impl AppState {
             match crate::audio::trim_silence_16k(&audio) {
                 crate::audio::TrimOutcome::Ok(trimmed) => {
                     self.push_log(format!(
-                        "Silence trim: {:.1}s → {:.1}s (removed head {}ms, tail {}ms)",
+                        "Silence trim: {:.1}s → {:.1}s (removed head {}ms, tail {}ms, threshold={:.4})",
                         trimmed.original_ms as f32 / 1000.0,
                         trimmed.trimmed_ms as f32 / 1000.0,
                         trimmed.head_ms,
-                        trimmed.tail_ms
+                        trimmed.tail_ms,
+                        crate::audio::speech_rms_threshold(&audio)
                     ));
                     audio = trimmed.samples;
                 }
@@ -770,10 +793,21 @@ impl AppState {
                     // (Spec intent: normal speech must not die in the fail path.)
                     self.push_log(format!(
                         "Silence trim found no speech frames ({original_ms}ms → {remaining_ms}ms, peak={peak:.4}, threshold={:.4}) — keeping full buffer for STT",
-                        crate::audio::trim_rms_threshold()
+                        crate::audio::speech_rms_threshold(&audio)
                     ));
                 }
             }
+        }
+
+        // Trailing silence so Whisper does not clip the last words / second
+        // sentence when the buffer ends immediately after speech.
+        let pre_pad_samples = audio.len();
+        audio = crate::audio::pad_for_whisper_16k(&audio);
+        if audio.len() > pre_pad_samples {
+            self.push_log(format!(
+                "STT pad: +{}ms trailing silence for decoder",
+                crate::audio::WHISPER_TAIL_PAD_MS
+            ));
         }
 
         // Clone Arc so Whisper runs without holding the state mutex.

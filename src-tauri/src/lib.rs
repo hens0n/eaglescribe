@@ -1,4 +1,4 @@
-mod audio;
+pub mod audio;
 mod dictionary;
 mod error;
 mod history;
@@ -10,7 +10,7 @@ mod polish;
 mod settings;
 mod snippets;
 mod state;
-mod stt;
+pub mod stt;
 
 use error::{AppError, AppResult};
 use hotkey::{

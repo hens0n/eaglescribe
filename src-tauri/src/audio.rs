@@ -458,15 +458,35 @@ pub const SAMPLE_RATE_16K: u32 = 16_000;
 
 /// Frame length for energy detection (~20 ms). Not user-facing.
 const TRIM_FRAME_MS: u32 = 20;
-/// Fixed pad kept before first / after last speech frame (~100 ms).
-const TRIM_PAD_MS: u32 = 100;
+/// Fixed pad kept before first / after last speech frame.
+///
+/// Generous so soft word onsets/offsets are not shaved before Whisper. Spec
+/// range is ~50–150 ms for the energy edge; we use 200 ms plus a separate
+/// Whisper tail pad (see [`pad_for_whisper_16k`]).
+const TRIM_PAD_MS: u32 = 200;
 /// Minimum remaining audio after trim (~150 ms). Below this → fail path.
 const TRIM_MIN_REMAINING_MS: u32 = 150;
-/// RMS energy threshold (f32 PCM in [-1, 1]). Frames at/above count as speech.
+/// Absolute floor for frame RMS (f32 PCM in [-1, 1]). Below this is never speech.
 ///
-/// Kept low enough for quiet laptop mics / soft speech. Near-silent TCC-denied
-/// streams (peak ~0) still fail via the near-zero peak check in the pipeline.
-const TRIM_RMS_THRESHOLD: f32 = 0.005;
+/// Dogfood last_capture.wav (peak ≈ 0.018) had real second-half words at
+/// frame RMS under the old fixed 0.005 gate — trim cut 5+ s of speech and
+/// Whisper never saw them. Floor stays above near-silent TCC denial (~0).
+const TRIM_RMS_FLOOR: f32 = 0.0015;
+/// Cap so loud takes can still drop room noise after the last word.
+const TRIM_RMS_CEILING: f32 = 0.005;
+/// Adaptive gate: `clamp(peak_abs * this, FLOOR, CEILING)`.
+///
+/// Quiet mics (low peak) get a lower threshold so soft follow-on phrases
+/// count as speech; loud mics stay near the historical 0.005 ceiling.
+const TRIM_RMS_RELATIVE: f32 = 0.12;
+/// Pure silence appended after capture/trim so Whisper has decoder "breathing
+/// room" after the last word. Without this, greedy/base models often cut the
+/// end of a long or multi-sentence take.
+pub const WHISPER_TAIL_PAD_MS: u32 = 400;
+/// Keep the mic open this long after the user releases the hold hotkey (or hits
+/// Stop) so trailing words of a second sentence are not lost when the chord is
+/// lifted slightly early. Session still captures during this window.
+pub const RECORDING_POST_ROLL_MS: u64 = 500;
 /// Peak below this after capture is treated as a silent stream (often denied mic).
 pub const SILENT_CAPTURE_PEAK: f32 = 0.001;
 
@@ -475,9 +495,20 @@ pub fn peak_abs(samples: &[f32]) -> f32 {
     samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max)
 }
 
-/// Frame-RMS speech threshold used by silence trim (tests / diagnostics).
+/// Default / floor frame-RMS gate (tests / diagnostics). Prefer
+/// [`speech_rms_threshold`] with the actual buffer when logging a take.
 pub fn trim_rms_threshold() -> f32 {
-    TRIM_RMS_THRESHOLD
+    TRIM_RMS_FLOOR
+}
+
+/// Adaptive speech gate for a mono buffer: scales with peak level so quiet
+/// laptop mics do not lose the second half of an utterance.
+pub fn speech_rms_threshold(samples: &[f32]) -> f32 {
+    let peak = peak_abs(samples);
+    if peak <= 0.0 {
+        return TRIM_RMS_FLOOR;
+    }
+    (peak * TRIM_RMS_RELATIVE).clamp(TRIM_RMS_FLOOR, TRIM_RMS_CEILING)
 }
 
 /// Successful leading/trailing silence trim of 16 kHz mono PCM.
@@ -529,6 +560,9 @@ fn frame_rms(frame: &[f32]) -> f32 {
 /// Mid-utterance quiet frames are never removed — only head/tail padding
 /// outside the first and last speech frames (with a fixed edge pad).
 ///
+/// Speech frames use an **adaptive** RMS gate ([`speech_rms_threshold`]) so
+/// quieter second phrases on a soft mic are not treated as trailing silence.
+///
 /// Pure function: no mic I/O. Unit-test with synthetic buffers.
 pub fn trim_silence_16k(samples: &[f32]) -> TrimOutcome {
     let original_ms = samples_to_ms(samples.len());
@@ -542,6 +576,7 @@ pub fn trim_silence_16k(samples: &[f32]) -> TrimOutcome {
     let frame_len = ms_to_samples(TRIM_FRAME_MS).max(1);
     let pad_samples = ms_to_samples(TRIM_PAD_MS);
     let min_remaining = ms_to_samples(TRIM_MIN_REMAINING_MS);
+    let threshold = speech_rms_threshold(samples);
 
     // Classify frames; last partial frame is included.
     let n_frames = samples.len().div_ceil(frame_len);
@@ -552,7 +587,7 @@ pub fn trim_silence_16k(samples: &[f32]) -> TrimOutcome {
         let start = fi * frame_len;
         let end = (start + frame_len).min(samples.len());
         let rms = frame_rms(&samples[start..end]);
-        if rms >= TRIM_RMS_THRESHOLD {
+        if rms >= threshold {
             if first_speech.is_none() {
                 first_speech = Some(fi);
             }
@@ -592,6 +627,60 @@ pub fn trim_silence_16k(samples: &[f32]) -> TrimOutcome {
         head_ms,
         tail_ms,
     })
+}
+
+/// Append trailing silence so Whisper does not clip the last words of a take.
+///
+/// Call after optional silence trim and before `transcribe_16k_mono`. Does not
+/// change sample rate. Empty input stays empty.
+pub fn pad_for_whisper_16k(samples: &[f32]) -> Vec<f32> {
+    pad_silence_16k(samples, 0, WHISPER_TAIL_PAD_MS)
+}
+
+/// Prepend/append pure silence (zeros) on **16 kHz mono** PCM.
+pub fn pad_silence_16k(samples: &[f32], head_ms: u32, tail_ms: u32) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let head = ms_to_samples(head_ms);
+    let tail = ms_to_samples(tail_ms);
+    let mut out = Vec::with_capacity(samples.len() + head + tail);
+    out.resize(head, 0.0);
+    out.extend_from_slice(samples);
+    out.resize(out.len() + tail, 0.0);
+    out
+}
+
+/// Write mono f32 PCM as a 16-bit PCM WAV at 16 kHz (for last-capture debug).
+pub fn write_wav_16k_mono(path: &std::path::Path, samples: &[f32]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create wav dir: {e}"))?;
+    }
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: SAMPLE_RATE_16K,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer =
+        hound::WavWriter::create(path, spec).map_err(|e| format!("create wav: {e}"))?;
+    for &s in samples {
+        let clamped = s.clamp(-1.0, 1.0);
+        let i = (clamped * i16::MAX as f32).round() as i16;
+        writer
+            .write_sample(i)
+            .map_err(|e| format!("write sample: {e}"))?;
+    }
+    writer.finalize().map_err(|e| format!("finalize wav: {e}"))?;
+    Ok(())
+}
+
+/// Default path for the most recent capture dump (`last_capture.wav`).
+pub fn default_last_capture_path() -> std::path::PathBuf {
+    if let Some(data) = dirs::data_local_dir() {
+        return data.join("eaglescribe").join("last_capture.wav");
+    }
+    std::path::PathBuf::from("last_capture.wav")
 }
 
 /// Linear resample mono audio to 16 kHz (Whisper input).
@@ -811,14 +900,14 @@ mod tests {
 
     #[test]
     fn trim_near_silent_noise_is_below_floor() {
-        // Below RMS threshold — still treated as silence by the trimmer itself.
+        // Below RMS floor — still treated as silence by the trimmer itself.
         // (Pipeline may still soft-recover non-zero peak into Whisper.)
         let s: Vec<f32> = (0..ms_to_samples(500)).map(|_| 0.0005).collect();
         assert!(matches!(
             trim_silence_16k(&s),
             TrimOutcome::BelowFloor { .. }
         ));
-        assert!(peak_abs(&s) < TRIM_RMS_THRESHOLD);
+        assert!(peak_abs(&s) < TRIM_RMS_FLOOR);
     }
 
     #[test]
@@ -834,6 +923,51 @@ mod tests {
         assert!(
             matches!(trim_silence_16k(&s), TrimOutcome::Ok(_)),
             "0.02 amplitude speech must not be fully trimmed"
+        );
+    }
+
+    #[test]
+    fn trim_keeps_quieter_second_half_of_utterance() {
+        // Regression: dogfood last_capture — louder first phrase, softer second
+        // half (still real speech). Old fixed 0.005 gate dropped the second half.
+        // Peak ~0.018, second half ~0.01 peak → frame RMS often < 0.005.
+        let mut s = vec![0.0f32; ms_to_samples(500)];
+        // Louder first phrase (~1.5 s).
+        for i in 0..ms_to_samples(1500) {
+            let t = i as f32 / SAMPLE_RATE_16K as f32;
+            s.push(0.018 * (2.0 * std::f32::consts::PI * 220.0 * t).sin());
+        }
+        // Brief dip (not long enough to matter — mid frames are kept once span is set).
+        s.extend(std::iter::repeat_n(0.0f32, ms_to_samples(200)));
+        // Quieter second phrase (~3 s) that the old gate treated as silence.
+        let second_start = s.len();
+        for i in 0..ms_to_samples(3000) {
+            let t = i as f32 / SAMPLE_RATE_16K as f32;
+            s.push(0.008 * (2.0 * std::f32::consts::PI * 330.0 * t).sin());
+        }
+        let second_end = s.len();
+        s.extend(std::iter::repeat_n(0.0f32, ms_to_samples(800)));
+
+        let out = match trim_silence_16k(&s) {
+            TrimOutcome::Ok(r) => r,
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        // Trimmed buffer must include samples from the quiet second phrase.
+        // Map second phrase into the trimmed window via original indices.
+        let head_samples = ms_to_samples(out.head_ms);
+        let keep_start = head_samples;
+        let keep_end = keep_start + out.samples.len();
+        assert!(
+            keep_start < second_end && keep_end > second_start,
+            "quiet second half must not be fully tail-trimmed; head_ms={} trimmed_ms={} (second span samples {second_start}..{second_end}, kept {keep_start}..{keep_end})",
+            out.head_ms,
+            out.trimmed_ms
+        );
+        // Should keep most of the ~5.2 s of speech content (not collapse to ~1.5 s).
+        assert!(
+            out.trimmed_ms >= 4000,
+            "expected multi-second keep, got {}ms",
+            out.trimmed_ms
         );
     }
 
@@ -869,9 +1003,10 @@ mod tests {
             TrimOutcome::Ok(r) => r,
             other => panic!("expected Ok, got {other:?}"),
         };
+        // 1200 ms trailing silence minus ~TRIM_PAD_MS edge pad (frame-rounded).
         assert!(
-            out.tail_ms >= 1000,
-            "expected ≥1s tail removed, got {}ms",
+            out.tail_ms >= 900,
+            "expected ~1s tail removed, got {}ms",
             out.tail_ms
         );
         assert!(out.trimmed_ms < out.original_ms);
@@ -885,17 +1020,17 @@ mod tests {
             TrimOutcome::Ok(r) => r,
             other => panic!("expected Ok, got {other:?}"),
         };
-        assert!(out.head_ms >= 800, "head_ms={}", out.head_ms);
-        assert!(out.tail_ms >= 800, "tail_ms={}", out.tail_ms);
-        // 500 ms speech + pad each side (100 ms) ≈ 700 ms, not full 2500.
+        assert!(out.head_ms >= 700, "head_ms={}", out.head_ms);
+        assert!(out.tail_ms >= 700, "tail_ms={}", out.tail_ms);
+        // 500 ms speech + pad each side (TRIM_PAD_MS) ≈ 900 ms, not full 2500.
         assert!(
-            out.trimmed_ms >= 500 && out.trimmed_ms <= 900,
+            out.trimmed_ms >= 500 && out.trimmed_ms <= 1100,
             "trimmed_ms={}",
             out.trimmed_ms
         );
         // Edge pad: we should not cut exactly at first non-zero sample.
         // First sample of the original speech block is after 1000 ms head.
-        // With pad, head_ms should be roughly 1000 - PAD (~900), not 1000.
+        // With pad, head_ms should be roughly 1000 - PAD, not 1000.
         assert!(
             out.head_ms < 1000,
             "pad should leave some pre-roll; head_ms={}",
@@ -983,6 +1118,53 @@ mod tests {
             "20ms speech with pad room should pass floor"
         );
         let _ = short; // keep helper exercised via other tests
+    }
+
+    #[test]
+    fn write_wav_16k_mono_roundtrips_peak() {
+        let mut samples = vec![0.0f32; ms_to_samples(50)];
+        samples[10] = 0.5;
+        let dir = std::env::temp_dir().join(format!(
+            "eaglescribe-wav-test-{}",
+            std::process::id()
+        ));
+        let path = dir.join("t.wav");
+        write_wav_16k_mono(&path, &samples).expect("write");
+        assert!(path.is_file());
+        let meta = std::fs::metadata(&path).expect("meta");
+        assert!(meta.len() > 44, "wav should be larger than header");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pad_for_whisper_appends_tail_silence() {
+        let speech = vec![0.25f32; ms_to_samples(200)];
+        let padded = pad_for_whisper_16k(&speech);
+        assert_eq!(
+            padded.len(),
+            speech.len() + ms_to_samples(WHISPER_TAIL_PAD_MS)
+        );
+        assert!(padded[..speech.len()].iter().all(|&s| s == 0.25));
+        assert!(padded[speech.len()..].iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn pad_silence_empty_stays_empty() {
+        assert!(pad_for_whisper_16k(&[]).is_empty());
+        assert!(pad_silence_16k(&[], 100, 100).is_empty());
+    }
+
+    #[test]
+    fn pad_silence_head_and_tail() {
+        let mid = vec![1.0f32; 10];
+        let out = pad_silence_16k(&mid, 0, 0);
+        assert_eq!(out, mid);
+        let out = pad_silence_16k(&mid, 50, 25);
+        assert_eq!(out.len(), 10 + ms_to_samples(50) + ms_to_samples(25));
+        assert!(out[..ms_to_samples(50)].iter().all(|&s| s == 0.0));
+        assert!(out[out.len() - ms_to_samples(25)..]
+            .iter()
+            .all(|&s| s == 0.0));
     }
 
     #[test]
