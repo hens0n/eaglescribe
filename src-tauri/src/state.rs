@@ -93,6 +93,7 @@ impl AppState {
         let history = HistoryBook::load_or_default(&history_path);
         let history_count = history.entries.len();
         let history_enabled = settings.history_enabled;
+        let clipboard_restore = settings.clipboard_restore;
 
         let hotkey_mode = settings.hotkey_mode;
         let command_hotkey = settings.command_hotkey.clone();
@@ -147,6 +148,10 @@ impl AppState {
                         history_path.display(),
                         history_count,
                         if history_enabled { "on" } else { "off" }
+                    ));
+                    log.push(format!(
+                        "Clipboard restore after paste: {}",
+                        if clipboard_restore { "on" } else { "off" }
                     ));
                     log
                 },
@@ -207,6 +212,7 @@ impl AppState {
             history_enabled: g.settings.history_enabled,
             history_max: g.settings.history_max,
             history: g.history.list_newest_first(),
+            clipboard_restore: g.settings.clipboard_restore,
             last_transcript: g.last_transcript.clone(),
             last_raw_transcript: g.last_raw_transcript.clone(),
             last_error: g.last_error.clone(),
@@ -285,6 +291,17 @@ impl AppState {
         g.settings.save(&g.settings_path)?;
         g.log.push(format!(
             "Transcript history: {}",
+            if enabled { "on" } else { "off" }
+        ));
+        Ok(())
+    }
+
+    pub fn set_clipboard_restore(&self, enabled: bool) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        g.settings.clipboard_restore = enabled;
+        g.settings.save(&g.settings_path)?;
+        g.log.push(format!(
+            "Clipboard restore after paste: {}",
             if enabled { "on" } else { "off" }
         ));
         Ok(())
@@ -683,8 +700,13 @@ impl AppState {
         text: &str,
         kind: SessionKind,
     ) -> AppResult<String> {
-        // Paste runs on the main thread; never hold `inner` across this call.
-        match crate::inject::inject_text(app, text) {
+        // Read prefs before paste; never hold `inner` across main-thread inject.
+        let restore_clipboard = {
+            let g = self.inner.lock();
+            g.settings.clipboard_restore
+        };
+
+        match crate::inject::inject_text(app, text, restore_clipboard) {
             Ok(result) => {
                 {
                     let mut g = self.inner.lock();
@@ -695,6 +717,15 @@ impl AppState {
                     if result.pasted {
                         g.log
                             .push(format!("Injected: {}", truncate(&result.text, 80)));
+                        if result.restored {
+                            g.log
+                                .push("Restored previous clipboard after paste.".into());
+                        } else if result.restore_failed {
+                            g.log.push(
+                                "Clipboard restore failed; transcript left on clipboard."
+                                    .into(),
+                            );
+                        }
                     } else {
                         g.log.push(format!(
                             "Copied (paste manually with Cmd/Ctrl+V): {}",
@@ -890,6 +921,8 @@ pub struct StatusSnapshot {
     pub history_enabled: bool,
     pub history_max: usize,
     pub history: Vec<HistoryEntry>,
+    /// When true, previous clipboard text is restored after a successful paste.
+    pub clipboard_restore: bool,
     pub last_transcript: Option<String>,
     pub last_raw_transcript: Option<String>,
     pub last_error: Option<String>,

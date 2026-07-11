@@ -60,7 +60,7 @@ npm run desktop
 3. Focus a text field in another app.
 4. Use the dictation hotkey (default **Ctrl+Shift+Space**) according to that mode (or the UI button, which always toggles).
 
-If paste fails, the text stays on the clipboard — paste manually (`Cmd+V` / `Ctrl+V`).
+If paste fails, the text stays on the clipboard — paste manually (`Cmd+V` / `Ctrl+V`). On a **successful** paste, EagleScribe restores your previous clipboard text by default (toggle under **Settings → Clipboard**).
 
 ### System tray
 
@@ -114,7 +114,8 @@ See [research/STATUS.md](./research/STATUS.md) for the full status, backlog, and
 - [x] Rebindable hotkeys
 - [x] Dense tabbed UI + waiting-LLM status
 - [x] Transcript history (last N, local; History tab)
-- [ ] Global Escape cancel while recording
+- [x] Global Escape cancel while recording
+- [x] Clipboard restore after paste (configurable)
 - [ ] Mic device picker
 - [ ] Linux Wayland hotkey/paste hardening
 - [ ] Packaging (dmg / AppImage)

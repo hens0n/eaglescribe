@@ -6,9 +6,12 @@
 //! `_dispatch_assert_queue_fail` (see DiagnosticReports for eaglescribe).
 //!
 //! We therefore:
-//! 1. Set the clipboard on any thread (safe).
-//! 2. Simulate Cmd/Ctrl+V on the **main thread**, using a physical keycode
+//! 1. Optionally snapshot the previous clipboard text.
+//! 2. Set the clipboard on any thread (safe).
+//! 3. Simulate Cmd/Ctrl+V on the **main thread**, using a physical keycode
 //!    (`Key::Other`) so we never hit layout/TSM lookups.
+//! 4. After a successful paste (and a short delay), restore the snapshot so
+//!    dictation does not leave the transcript stuck on the system clipboard.
 
 use crate::error::{AppError, AppResult};
 use arboard::Clipboard;
@@ -18,6 +21,10 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Runtime};
 
+/// How long to wait after a successful paste before restoring the previous
+/// clipboard. Gives the target app time to read our temporary paste buffer.
+pub const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(200);
+
 /// Virtual keycode for the "V" key (ANSI), layout-independent on macOS.
 /// `kVK_ANSI_V` — used so we never call TSM/layout APIs.
 #[cfg(target_os = "macos")]
@@ -26,14 +33,39 @@ const KEYCODE_V: u16 = 0x09;
 #[cfg(target_os = "macos")]
 const KEYCODE_C: u16 = 0x08;
 
+/// Whether to restore a prior clipboard snapshot after inject.
+///
+/// Restore only when: the user enabled it, paste succeeded (so the target
+/// app has the text), and we actually captured a previous text value.
+/// On paste failure the transcript stays on the clipboard for manual paste.
+pub fn should_restore_clipboard(
+    restore_enabled: bool,
+    pasted: bool,
+    previous: &Option<String>,
+) -> bool {
+    restore_enabled && pasted && previous.is_some()
+}
+
 /// Copy `text` to the clipboard and paste into the focused app.
 ///
-/// Paste key simulation is dispatched to the **main thread** when `app` is provided.
-/// If paste simulation fails, text remains on the clipboard for manual paste.
-pub fn inject_text<R: Runtime>(app: &AppHandle<R>, text: &str) -> AppResult<InjectResult> {
+/// When `restore_clipboard` is true and paste succeeds, the previous
+/// clipboard text (if readable) is put back after [`CLIPBOARD_RESTORE_DELAY`].
+/// If paste simulation fails, text remains on the clipboard for manual paste
+/// and is **not** restored.
+pub fn inject_text<R: Runtime>(
+    app: &AppHandle<R>,
+    text: &str,
+    restore_clipboard: bool,
+) -> AppResult<InjectResult> {
     if text.is_empty() {
         return Err(AppError::from("Nothing to inject (empty transcript)"));
     }
+
+    let previous = if restore_clipboard {
+        read_clipboard_text().ok()
+    } else {
+        None
+    };
 
     copy_to_clipboard(text)?;
 
@@ -42,8 +74,26 @@ pub fn inject_text<R: Runtime>(app: &AppHandle<R>, text: &str) -> AppResult<Inje
 
     let paste_ok = run_paste_on_main_thread(app)?;
 
+    let mut restored = false;
+    let mut restore_failed = false;
+    if should_restore_clipboard(restore_clipboard, paste_ok, &previous) {
+        // Wait so the focused app can consume our paste buffer first.
+        // `should_restore_clipboard` requires `previous` is Some.
+        let prev = previous.expect("guarded by should_restore_clipboard");
+        thread::sleep(CLIPBOARD_RESTORE_DELAY);
+        match copy_to_clipboard(&prev) {
+            Ok(()) => restored = true,
+            Err(e) => {
+                eprintln!("[eaglescribe] clipboard restore failed: {e}");
+                restore_failed = true;
+            }
+        }
+    }
+
     Ok(InjectResult {
         pasted: paste_ok,
+        restored,
+        restore_failed,
         text: text.to_string(),
     })
 }
@@ -111,6 +161,11 @@ fn run_copy_on_main_thread<R: Runtime>(app: &AppHandle<R>) -> AppResult<()> {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct InjectResult {
     pub pasted: bool,
+    /// True when the previous clipboard text was written back after paste.
+    pub restored: bool,
+    /// True when restore was attempted after paste but writing it back failed
+    /// (transcript is left on the clipboard).
+    pub restore_failed: bool,
     pub text: String,
 }
 
@@ -215,5 +270,51 @@ mod tests {
     fn copy_to_clipboard_accepts_text() {
         // May fail in headless CI without pasteboard; skip soft-fail.
         let _ = copy_to_clipboard("eaglescribe-test");
+    }
+
+    #[test]
+    fn should_restore_only_when_enabled_pasted_and_snapshot_present() {
+        let prev = Some("prior".into());
+        assert!(should_restore_clipboard(true, true, &prev));
+        assert!(!should_restore_clipboard(false, true, &prev));
+        assert!(!should_restore_clipboard(true, false, &prev));
+        assert!(!should_restore_clipboard(true, true, &None));
+        assert!(!should_restore_clipboard(false, false, &None));
+    }
+
+    /// Round-trip: after inject-style overwrite, restoring puts prior text back.
+    /// Soft-skips when the system pasteboard is unavailable (headless CI).
+    #[test]
+    fn restore_writes_back_previous_clipboard_text() {
+        let marker_prev = "eaglescribe-clipboard-prev-9f3a";
+        let marker_inject = "eaglescribe-clipboard-inject-9f3a";
+
+        if copy_to_clipboard(marker_prev).is_err() {
+            return;
+        }
+        let previous = match read_clipboard_text() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        assert_eq!(previous, marker_prev);
+
+        copy_to_clipboard(marker_inject).expect("set inject text");
+        assert_eq!(
+            read_clipboard_text().unwrap_or_default(),
+            marker_inject
+        );
+
+        // Same path as successful-paste restore.
+        assert!(should_restore_clipboard(
+            true,
+            true,
+            &Some(previous.clone())
+        ));
+        copy_to_clipboard(&previous).expect("restore prior");
+        assert_eq!(
+            read_clipboard_text().unwrap_or_default(),
+            marker_prev,
+            "previous clipboard text must be restored after successful paste"
+        );
     }
 }

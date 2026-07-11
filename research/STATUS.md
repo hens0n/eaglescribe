@@ -2,8 +2,8 @@
 
 **Last updated:** 2026-07-10  
 **Branch:** `main`  
-**Latest commit:** `20f7214` — global Escape cancel while recording  
-**Previous ship:** `48ccad9` — local transcript history + History tab  
+**Latest commit:** *(clipboard restore after paste — update after commit)*  
+**Previous ship:** `20f7214` — global Escape cancel while recording  
 
 Use this document to resume work in a **new session**. For product research and full requirements, see:
 
@@ -115,12 +115,13 @@ Select text in any app
 | Waiting-LLM status | Distinct badge while Command Mode awaits localhost LLM |
 | STT / paste deadlock fix | No state-mutex hold during Whisper; busy claim before worker |
 | Transcript history | Last N (default 50) in `history.json`; History tab; clear; toggle off |
+| Clipboard restore after paste | On successful paste, restore prior text clipboard after ~200 ms; Settings toggle (`clipboard_restore`, default on); failed paste keeps transcript for manual paste |
 
 ### Local data files (macOS example)
 
 Under `~/Library/Application Support/eaglescribe/` (via `dirs::data_local_dir`):
 
-- `settings.json` — hotkey mode, bindings, LLM, `history_enabled` / `history_max`  
+- `settings.json` — hotkey mode, bindings, LLM, `history_enabled` / `history_max`, `clipboard_restore`  
 - `dictionary.json`  
 - `snippets.json`  
 - `history.json` — transcript history (newest capped by `history_max`)  
@@ -141,7 +142,6 @@ Whisper weights: repo `models/*.bin` (gitignored) or user path.
 | **Medium** | Mic **device picker** | List inputs via `cpal`; persist choice in settings; default device fallback |
 | **Medium** | **VAD / silence trim** | Drop leading/trailing silence before STT; optional min-speech gate |
 | **Medium** | **Tray polish** | Dedicated monochrome template glyph; optional dock-hide (`ActivationPolicy::Accessory`) |
-| **Medium** | **Clipboard restore** after paste | Save prior clipboard; restore after successful inject (with short delay) |
 | **Medium** | Metal/CUDA **packaging UX** | First-class “build with Metal” docs/scripts; surface acceleration status in UI |
 | **Medium** | **Packaging / distribution** | `tauri build` notes; unsigned dmg/AppImage first; later signed + launch at login |
 | Low | In-process llama.cpp | Optional; Command Mode stays HTTP-local by default |
@@ -229,12 +229,14 @@ Pick **one vertical slice** per session. Each should ship usable end-to-end.
 | **1** | **Mic device picker** | Enumerate devices; save id; use on next recording | M |
 | **2** | **VAD / silence trim** | Trim audio before Whisper; log trimmed duration | M |
 | **3** | **Tray polish** | Template menu-bar icon; optional “menu bar only” (no dock) | S–M |
-| **4** | **Clipboard restore** | Restore previous clipboard after inject (configurable) | S |
+| **4** | ~~**Clipboard restore**~~ | ~~Restore previous clipboard after inject (configurable)~~ **done** | S |
 | **5** | **Linux pass** | Distro deps doc; X11/Wayland hotkey + paste matrix; fallbacks | M–L |
 | **6** | **Packaging** | `tauri build` + dmg/AppImage notes; optional Metal release script | M |
 | **7** | **Accel packaging UX** | Surface Metal/CUDA in UI; first-class build docs | S–M |
 
-**Done this session:** Escape cancel ([escape-cancel-spec.md](./escape-cancel-spec.md); issues #1–#3).  
+**Done this session:** Clipboard restore after successful paste (INJ-04; Settings toggle; default on).  
+
+**Earlier:** Escape cancel ([escape-cancel-spec.md](./escape-cancel-spec.md); issues #1–#3).  
 
 **Default recommendation (Mac dogfooding):** **(1) Mic device picker**.  
 
@@ -258,6 +260,7 @@ Pick **one vertical slice** per session. Each should ship usable end-to-end.
 | `7cebf0a` | Dense tabbed UI, `waiting_llm` status, STT deadlock fix |
 | `48ccad9` | Local transcript history + History tab |
 | `20f7214` | Global Escape cancel while recording + hold-safe + reject Esc-alone binds |
+| *(pending)* | Clipboard restore after paste (`clipboard_restore` setting) |
 
 ---
 

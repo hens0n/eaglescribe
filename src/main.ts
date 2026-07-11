@@ -54,6 +54,7 @@ interface StatusSnapshot {
   history_enabled: boolean;
   history_max: number;
   history: HistoryEntry[];
+  clipboard_restore: boolean;
   last_transcript: string | null;
   last_raw_transcript: string | null;
   last_error: string | null;
@@ -132,6 +133,8 @@ const els = {
     document.querySelector("#history-max-label") as HTMLElement,
   btnClearHistory: () =>
     document.querySelector("#btn-clear-history") as HTMLButtonElement,
+  clipboardRestore: () =>
+    document.querySelector("#clipboard-restore") as HTMLInputElement,
 };
 
 /** Map a KeyboardEvent to a global-hotkey string (modifiers + e.code). */
@@ -408,6 +411,9 @@ function applyStatus(s: StatusSnapshot) {
     s.history_enabled ?? true,
     s.history_max ?? 50,
   );
+  if (document.activeElement !== els.clipboardRestore()) {
+    els.clipboardRestore().checked = s.clipboard_restore ?? true;
+  }
 
   if (s.polish_mode === "verbatim") {
     els.polishVerbatim().checked = true;
@@ -490,6 +496,18 @@ window.addEventListener("DOMContentLoaded", async () => {
     try {
       const s = await invoke<StatusSnapshot>("set_history_enabled", {
         enabled: els.historyEnabled().checked,
+      });
+      applyStatus(s);
+    } catch (e) {
+      alert(String(e));
+      await refresh();
+    }
+  });
+
+  els.clipboardRestore().addEventListener("change", async () => {
+    try {
+      const s = await invoke<StatusSnapshot>("set_clipboard_restore", {
+        enabled: els.clipboardRestore().checked,
       });
       applyStatus(s);
     } catch (e) {

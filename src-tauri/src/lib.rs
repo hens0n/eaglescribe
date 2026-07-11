@@ -129,6 +129,15 @@ fn set_history_enabled(
 }
 
 #[tauri::command]
+fn set_clipboard_restore(
+    enabled: bool,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    state.inner().set_clipboard_restore(enabled)?;
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
 fn clear_history(state: tauri::State<'_, SharedState>) -> AppResult<StatusSnapshot> {
     state.inner().clear_history()?;
     Ok(state.inner().snapshot())
@@ -550,6 +559,7 @@ pub fn run() {
             reset_hotkeys,
             set_llm_settings,
             set_history_enabled,
+            set_clipboard_restore,
             clear_history,
             dictionary_add,
             dictionary_remove,

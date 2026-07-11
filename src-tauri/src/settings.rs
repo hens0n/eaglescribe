@@ -66,6 +66,10 @@ pub struct AppSettings {
     /// Max retained history entries (newest kept).
     #[serde(default = "default_history_max")]
     pub history_max: usize,
+    /// After a successful paste, restore the previous clipboard text
+    /// (INJ-04). When false, the injected transcript remains on the clipboard.
+    #[serde(default = "default_true")]
+    pub clipboard_restore: bool,
 }
 
 fn default_true() -> bool {
@@ -103,7 +107,53 @@ impl Default for AppSettings {
             llm_api_key: String::new(),
             history_enabled: true,
             history_max: default_history_max(),
+            clipboard_restore: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_settings_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("eaglescribe-settings-{label}-{nanos}.json"))
+    }
+
+    #[test]
+    fn default_enables_clipboard_restore() {
+        let s = AppSettings::default();
+        assert!(s.clipboard_restore);
+    }
+
+    #[test]
+    fn missing_clipboard_restore_field_defaults_true() {
+        // Older settings.json without the field must keep restore on.
+        let path = unique_settings_path("legacy");
+        fs::write(
+            &path,
+            r#"{"hotkey_mode":"hold","history_enabled":true,"history_max":50}"#,
+        )
+        .expect("write");
+        let s = AppSettings::load(&path).expect("load");
+        let _ = fs::remove_file(&path);
+        assert!(s.clipboard_restore);
+    }
+
+    #[test]
+    fn clipboard_restore_false_roundtrips() {
+        let path = unique_settings_path("off");
+        let mut s = AppSettings::default();
+        s.clipboard_restore = false;
+        s.save(&path).expect("save");
+        let loaded = AppSettings::load(&path).expect("load");
+        let _ = fs::remove_file(&path);
+        assert!(!loaded.clipboard_restore);
     }
 }
 
