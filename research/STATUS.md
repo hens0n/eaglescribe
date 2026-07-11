@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-07-10  
 **Branch:** `main`  
-**Latest commit:** (pending) — global Escape cancel while recording  
+**Latest commit:** `20f7214` — global Escape cancel while recording  
 **Previous ship:** `48ccad9` — local transcript history + History tab  
 
 Use this document to resume work in a **new session**. For product research and full requirements, see:
@@ -257,7 +257,7 @@ Pick **one vertical slice** per session. Each should ship usable end-to-end.
 | `37b7b86` | System tray, rebindable hotkeys, rename → EagleScribe |
 | `7cebf0a` | Dense tabbed UI, `waiting_llm` status, STT deadlock fix |
 | `48ccad9` | Local transcript history + History tab |
-| (pending) | Global Escape cancel while recording + hold-safe + reject Esc-alone binds |
+| `20f7214` | Global Escape cancel while recording + hold-safe + reject Esc-alone binds |
 
 ---
 
