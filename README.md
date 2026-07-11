@@ -55,7 +55,7 @@ On **Apple Silicon**, use the Metal dogfood build for faster STT (see [Packaging
 
 ## Packaging (macOS unsigned dogfood)
 
-macOS is the first-class dogfood path. Builds are **unsigned** — no Developer ID, notarization, or release CI in this repo yet.
+macOS is the first-class dogfood path. Builds are **unsigned** (ad-hoc / no Developer ID or notarization yet). **GitHub Actions** (`.github/workflows/release.yml`) builds and attaches packages on version tags (`v*`) and manual `workflow_dispatch` — macOS Apple Silicon **Metal** + Linux x64.
 
 **macOS floor:** release builds (`desktop:build` / `desktop:build:metal`) set `bundle.macOS.minimumSystemVersion` to **10.15** so whisper.cpp can use `std::filesystem` (Tauri’s default was 10.13 and fails to compile current whisper-rs). The resulting app requires **macOS 10.15+**.
 
@@ -92,7 +92,7 @@ After a successful `tauri build` (CPU or Metal), Tauri 2 writes under `src-tauri
 | Artifact | Typical path |
 | --- | --- |
 | **`.app`** | `src-tauri/target/release/bundle/macos/EagleScribe.app` |
-| **`.dmg`** | `src-tauri/target/release/bundle/dmg/EagleScribe_<version>_<arch>.dmg` (e.g. `EagleScribe_0.1.0_aarch64.dmg`) |
+| **`.dmg`** | `src-tauri/target/release/bundle/dmg/EagleScribe_<version>_<arch>.dmg` (e.g. `EagleScribe_0.1.1_aarch64.dmg`) |
 
 Open the `.app` from Finder or install from the `.dmg`. Product name / identifier come from `src-tauri/tauri.conf.json` (`EagleScribe` / `ai.eaglescribe.app`).
 
@@ -126,13 +126,13 @@ After `npm run desktop:build:metal`, open `EagleScribe.app`, load a model, and r
 
 ## Linux packaging (contributor notes)
 
-Linux packaging is **docs-only** this pass — not equal to macOS dogfood acceptance. On a Linux host with the [Prerequisites](#prerequisites) (cmake, ALSA/PipeWire, etc.):
+macOS remains first-class for day-to-day dogfood, but **release CI also ships Linux x64** packages (`.deb` / AppImage / `.rpm` when Tauri produces them) on each version tag. Local contributor builds:
 
 ```bash
 npm run desktop:build
 ```
 
-Produces whatever Tauri 2 targets your machine supports (e.g. `.deb` / AppImage under `src-tauri/target/release/bundle/` when enabled). AppImage / distro packaging may improve later; there is no CI gate that an AppImage must ship.
+Requires the [Prerequisites](#prerequisites) (cmake, ALSA/PipeWire, etc.). Artifacts land under `src-tauri/target/release/bundle/`.
 
 ### Linux hotkeys & paste (X11 vs Wayland)
 
@@ -229,14 +229,15 @@ npm run tauri -- build --features vulkan
 
 Or from the crate: `cd src-tauri && cargo build --release --features cuda` (then bundle separately if needed). Default `desktop:build` stays CPU so contributors without GPU toolkits are not blocked.
 
-## Using the spike
+## Using the app
 
-1. Click **Load** (or the first release will load the model).
-2. Choose **Hold to talk** or **Toggle**, and optionally **Change** the global hotkeys (saved locally).
-3. Focus a text field in another app.
-4. Use the dictation hotkey (default **Ctrl+Shift+Space**) according to that mode (or the **Start dictation** window button, which always toggles and works when global hotkeys are unavailable).
+1. Complete the first-run **setup checklist** if shown (mic, Accessibility on macOS, Whisper model), or open it anytime from **Settings**.
+2. Click **Load** after setting a model path (or point `EAGLESCRIBE_WHISPER_MODEL` / use `npm run model:download`).
+3. Choose **Hold to talk** or **Toggle**, and optionally **Change** the global hotkeys (saved locally). Prefer a named mic under **Settings** if you have more than one input.
+4. Focus a text field in another app.
+5. Use the dictation hotkey (default **Ctrl+Shift+Space**) according to that mode (or the **Start dictation** window button, which always toggles and works when global hotkeys are unavailable).
 
-If paste fails, the text stays on the clipboard — paste manually (`Cmd+V` / `Ctrl+V`). On a **successful** paste, EagleScribe restores your previous clipboard text by default (toggle under **Settings → Clipboard**).
+If paste fails, the text stays on the clipboard — paste manually (`Cmd+V` / `Ctrl+V`). On a **successful** paste, EagleScribe restores your previous clipboard text by default (toggle under **Settings → Clipboard**). Leading/trailing silence trim before Whisper is on by default (**Settings → Silence trim**).
 
 ### System tray
 
@@ -253,9 +254,11 @@ EagleScribe stays in the **menu bar** (macOS) or **system tray** (Linux/Windows)
 ```
 src/                 # Tauri frontend (settings / status UI)
 src-tauri/src/       # Rust core: audio, STT, inject, state
+docs/images/         # README screenshots
 models/              # ggml weights (gitignored)
 research/            # product research + requirements + ADR
 scripts/             # model download helper
+.github/workflows/   # release CI (macOS Metal + Linux)
 ```
 
 ## Polish (smart cleanup)
@@ -280,35 +283,37 @@ Map a short **cue** to a longer **expansion** (signatures, links, templates). If
 
 ## What’s next
 
-Shipped features stay checked below. **Open product work** is tracked as GitHub issues and locked in `research/*-spec.md` (run `/to-tickets` when a Ready-for-`/to-tickets` spec still lacks implementation issues).
+Specs and stance docs live under [`research/`](./research/). Recent map slices are **implemented** (issues closed); use GitHub issues for new work.
 
-| Area | Spec / stance | Implementation issues (when present) |
-| --- | --- | --- |
-| Mic device picker | [mic-device-picker-spec.md](./research/mic-device-picker-spec.md) | [#4](https://github.com/hens0n/eaglescribe/issues/4), [#5](https://github.com/hens0n/eaglescribe/issues/5) |
-| Tray polish | [tray-polish-spec.md](./research/tray-polish-spec.md) | [#14](https://github.com/hens0n/eaglescribe/issues/14)–[#16](https://github.com/hens0n/eaglescribe/issues/16) |
-| VAD / silence trim | [vad-silence-trim-spec.md](./research/vad-silence-trim-spec.md) | (ready for `/to-tickets`) |
-| Packaging + acceleration UX | [packaging-spec.md](./research/packaging-spec.md) | (ready for `/to-tickets`) |
-| Linux hotkey / paste | [linux-hotkey-paste-spec.md](./research/linux-hotkey-paste-spec.md) | [#20](https://github.com/hens0n/eaglescribe/issues/20)–[#22](https://github.com/hens0n/eaglescribe/issues/22) |
-| Onboarding / permissions | [onboarding-permissions-spec.md](./research/onboarding-permissions-spec.md) | (ready for `/to-tickets`) |
-| In-process llama.cpp | [in-process-llm-stance.md](./research/in-process-llm-stance.md) | Deferred (HTTP Command Mode only) |
+### Shipped (dogfood baseline)
 
 - [x] Deterministic polish (fillers, punctuation, backtrack, lists)
-- [x] Personal dictionary
-- [x] Snippets
-- [x] Push-to-talk hold (UI button still toggles)
+- [x] Personal dictionary + snippets
+- [x] Push-to-talk hold / toggle + rebindable hotkeys
 - [x] Command Mode via local OpenAI-compatible LLM (Ollama / llama-server)
-- [x] System tray / hide window (close hides to tray; Quit from tray menu)
-- [x] Rebindable hotkeys
+- [x] System tray, template glyph, reliable Show/left-click restore
+- [x] Optional macOS menu-bar-only (hide Dock; next launch)
 - [x] Dense tabbed UI + waiting-LLM status
-- [x] Transcript history (last N, local; History tab)
+- [x] Transcript history (local; History tab)
 - [x] Global Escape cancel while recording
 - [x] Clipboard restore after paste (configurable)
-- [ ] Mic device picker ([#4](https://github.com/hens0n/eaglescribe/issues/4), [#5](https://github.com/hens0n/eaglescribe/issues/5))
-- [ ] Tray polish ([#14](https://github.com/hens0n/eaglescribe/issues/14)–[#16](https://github.com/hens0n/eaglescribe/issues/16))
-- [ ] VAD / silence trim (spec ready)
-- [ ] Packaging / acceleration UX (spec ready)
-- [ ] Linux hotkey & paste reliability ([#20](https://github.com/hens0n/eaglescribe/issues/20)–[#22](https://github.com/hens0n/eaglescribe/issues/22); inject/hotkey UX shipped, docs in progress)
-- [ ] Onboarding / permissions copy (spec ready)
+- [x] Mic device picker + fallback when preferred is missing
+- [x] Leading/trailing silence trim (Settings toggle; default on)
+- [x] First-run setup checklist + failure-time permissions help
+- [x] Read-only STT acceleration label in Settings
+- [x] Unsigned macOS Metal + Linux x64 **release CI** on `v*` tags
+- [x] Linux hotkey registration honesty + clipboard ownership notes (X11 hard path; Wayland best-effort)
+
+### Still open / deferred
+
+| Area | Notes |
+| --- | --- |
+| **Code signing / notarization** | Dogfood builds stay unsigned; Gatekeeper steps still apply ([packaging-spec.md](./research/packaging-spec.md)) |
+| **Pure Wayland global hotkeys** | Not guaranteed; UI + clipboard remain the reliable path ([linux-hotkey-paste-spec.md](./research/linux-hotkey-paste-spec.md)) |
+| **In-process llama.cpp** | **Deferred** — Command Mode stays HTTP to a local OpenAI-compatible server ([in-process-llm-stance.md](./research/in-process-llm-stance.md)) |
+| **Windows first-class dogfood** | Not a current packaging target |
+
+Behavior contracts for shipped slices (mic, tray, silence trim, packaging, Linux, onboarding, Escape cancel) remain in `research/*-spec.md` for regression context.
 
 ## Command Mode
 
@@ -322,4 +327,4 @@ Works with any OpenAI-compatible local server (`llama-server`, LM Studio, etc.).
 
 ## License
 
-TBD.
+[MIT](./LICENSE)
