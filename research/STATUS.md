@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-07-10  
 **Branch:** `main`  
-**Latest commit:** *(clipboard restore after paste — update after commit)*  
+**Latest commit:** `36a2036` — clipboard restore after successful paste  
 **Previous ship:** `20f7214` — global Escape cancel while recording  
 
 Use this document to resume work in a **new session**. For product research and full requirements, see:
@@ -260,7 +260,7 @@ Pick **one vertical slice** per session. Each should ship usable end-to-end.
 | `7cebf0a` | Dense tabbed UI, `waiting_llm` status, STT deadlock fix |
 | `48ccad9` | Local transcript history + History tab |
 | `20f7214` | Global Escape cancel while recording + hold-safe + reject Esc-alone binds |
-| *(pending)* | Clipboard restore after paste (`clipboard_restore` setting) |
+| `36a2036` | Clipboard restore after paste (`clipboard_restore` setting) |
 
 ---
 
