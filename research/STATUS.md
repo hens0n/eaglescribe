@@ -1,9 +1,9 @@
 # EagleScribe — project status & session handoff
 
 **Last updated:** 2026-07-10  
-**Branch:** `main` (synced with `origin/main`)  
-**Latest commit:** `48ccad9` — local transcript history + History tab  
-**Previous ship:** `7cebf0a` — dense UI, waiting-LLM, STT deadlock fix  
+**Branch:** `main`  
+**Latest commit:** (pending) — global Escape cancel while recording  
+**Previous ship:** `48ccad9` — local transcript history + History tab  
 
 Use this document to resume work in a **new session**. For product research and full requirements, see:
 
@@ -12,6 +12,7 @@ Use this document to resume work in a **new session**. For product research and 
 | [wispr-flow.md](./wispr-flow.md) | Competitor research (Wispr Flow) |
 | [requirements-local-app.md](./requirements-local-app.md) | Local-app requirements (P0–P2) |
 | [stack-decision.md](./stack-decision.md) | ADR: Rust / Tauri / whisper.cpp / local LLM |
+| [escape-cancel-spec.md](./escape-cancel-spec.md) | Behavior spec: global Escape cancel while recording (**implemented**) |
 | [../README.md](../README.md) | How to run & user-facing feature notes |
 
 ---
@@ -98,7 +99,7 @@ Select text in any app
 | Global dictation hotkey | Default `Ctrl+Shift+Space` (rebindable) |
 | Hold vs toggle (user choice) | Saved in `settings.json` |
 | UI always-toggle button | Independent of hotkey mode |
-| Cancel recording | UI Cancel (global Escape still open) |
+| Cancel recording | UI Cancel + **global Escape** while `recording` only (dictation + Command Mode); hold-safe release suppress; Escape-alone rebinds rejected |
 | Local Whisper model path | UI + `EAGLESCRIBE_WHISPER_MODEL` + `models/ggml-base.en.bin` |
 | Smart polish | Fillers, spoken punct, backtrack, **lists**, cap + period |
 | Verbatim mode | Raw-ish STT (whitespace only) |
@@ -137,7 +138,6 @@ Whisper weights: repo `models/*.bin` (gitignored) or user path.
 | Priority | Gap | Why / acceptance sketch |
 | --- | --- | --- |
 | **High (Linux)** | Wayland global hotkeys + paste reliability | X11-oriented crates; document distro deps; test X11 vs Wayland; fallbacks (clipboard-only if paste fails) |
-| **Medium** | **Escape cancel** (global) | While `recording`, Escape cancels (same as UI Cancel); must not fire when typing in focused fields if window focused — define scope (global always vs window-focused) |
 | **Medium** | Mic **device picker** | List inputs via `cpal`; persist choice in settings; default device fallback |
 | **Medium** | **VAD / silence trim** | Drop leading/trailing silence before STT; optional min-speech gate |
 | **Medium** | **Tray polish** | Dedicated monochrome template glyph; optional dock-hide (`ActivationPolicy::Accessory`) |
@@ -226,18 +226,19 @@ Pick **one vertical slice** per session. Each should ship usable end-to-end.
 
 | # | Slice | Deliverable | Effort (rough) |
 | --- | --- | --- | --- |
-| **1** | **Escape cancel** | Global Escape cancels active recording; document interaction with capture UI | S |
-| **2** | **Mic device picker** | Enumerate devices; save id; use on next recording | M |
-| **3** | **VAD / silence trim** | Trim audio before Whisper; log trimmed duration | M |
-| **4** | **Tray polish** | Template menu-bar icon; optional “menu bar only” (no dock) | S–M |
-| **5** | **Clipboard restore** | Restore previous clipboard after inject (configurable) | S |
-| **6** | **Linux pass** | Distro deps doc; X11/Wayland hotkey + paste matrix; fallbacks | M–L |
-| **7** | **Packaging** | `tauri build` + dmg/AppImage notes; optional Metal release script | M |
-| **8** | **Accel packaging UX** | Surface Metal/CUDA in UI; first-class build docs | S–M |
+| **1** | **Mic device picker** | Enumerate devices; save id; use on next recording | M |
+| **2** | **VAD / silence trim** | Trim audio before Whisper; log trimmed duration | M |
+| **3** | **Tray polish** | Template menu-bar icon; optional “menu bar only” (no dock) | S–M |
+| **4** | **Clipboard restore** | Restore previous clipboard after inject (configurable) | S |
+| **5** | **Linux pass** | Distro deps doc; X11/Wayland hotkey + paste matrix; fallbacks | M–L |
+| **6** | **Packaging** | `tauri build` + dmg/AppImage notes; optional Metal release script | M |
+| **7** | **Accel packaging UX** | Surface Metal/CUDA in UI; first-class build docs | S–M |
 
-**Default recommendation (Mac dogfooding):** **(1) Escape cancel** — small, high-friction fix while recording.  
+**Done this session:** Escape cancel ([escape-cancel-spec.md](./escape-cancel-spec.md); issues #1–#3).  
 
-**If multi-platform soon:** **(6) Linux pass**.
+**Default recommendation (Mac dogfooding):** **(1) Mic device picker**.  
+
+**If multi-platform soon:** **(5) Linux pass**.
 
 ---
 
@@ -256,6 +257,7 @@ Pick **one vertical slice** per session. Each should ship usable end-to-end.
 | `37b7b86` | System tray, rebindable hotkeys, rename → EagleScribe |
 | `7cebf0a` | Dense tabbed UI, `waiting_llm` status, STT deadlock fix |
 | `48ccad9` | Local transcript history + History tab |
+| (pending) | Global Escape cancel while recording + hold-safe + reject Esc-alone binds |
 
 ---
 

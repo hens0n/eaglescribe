@@ -12,7 +12,9 @@ mod state;
 mod stt;
 
 use error::{AppError, AppResult};
-use hotkey::{parse_shortcut, DEFAULT_COMMAND_HOTKEY, DEFAULT_DICTATION_HOTKEY};
+use hotkey::{
+    parse_shortcut, DEFAULT_COMMAND_HOTKEY, DEFAULT_DICTATION_HOTKEY, ESCAPE_CANCEL_HOTKEY,
+};
 use polish::PolishMode;
 use settings::HotkeyMode;
 use state::{AppState, SharedState, StatusSnapshot};
@@ -23,7 +25,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, RunEvent, WindowEvent,
 };
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 #[tauri::command]
 fn get_status(state: tauri::State<'_, SharedState>) -> StatusSnapshot {
@@ -197,9 +199,15 @@ fn toggle_command_mode(
 }
 
 #[tauri::command]
-fn cancel_dictation(state: tauri::State<'_, SharedState>) -> AppResult<StatusSnapshot> {
+fn cancel_dictation(
+    app: AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
     state.inner().cancel_recording()?;
-    Ok(state.inner().snapshot())
+    disarm_escape_cancel(&app);
+    let snap = state.inner().snapshot();
+    let _ = app.emit("dictation-status", &snap);
+    Ok(snap)
 }
 
 fn busy_message(status: state::DictationStatus) -> AppError {
@@ -219,6 +227,7 @@ fn start_dictation(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     match status {
         state::DictationStatus::Idle | state::DictationStatus::Error => {
             state.start_recording()?;
+            arm_escape_cancel(app, state);
             let _ = app.emit("dictation-status", state.snapshot());
             Ok(())
         }
@@ -235,6 +244,7 @@ fn start_command(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     match status {
         state::DictationStatus::Idle | state::DictationStatus::Error => {
             state.start_command_recording(app)?;
+            arm_escape_cancel(app, state);
             let _ = app.emit("dictation-status", state.snapshot());
             Ok(())
         }
@@ -250,6 +260,8 @@ fn stop_session(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     }
     match status {
         state::DictationStatus::Recording => {
+            // Leave recording → disarm Escape before STT/LLM (spec: armed only while recording).
+            disarm_escape_cancel(app);
             let app_bg = app.clone();
             let state_bg = Arc::clone(state);
             std::thread::spawn(move || {
@@ -296,11 +308,23 @@ fn handle_dictation_hotkey(app: &AppHandle, state: &SharedState, key_state: Shor
     let result = match state.hotkey_mode() {
         HotkeyMode::Hold => match key_state {
             ShortcutState::Pressed => start_dictation(app, state),
-            ShortcutState::Released => stop_session(app, state),
+            ShortcutState::Released => {
+                // Hold-safe cancel: discard leftover release after Escape / UI Cancel.
+                if state.consume_hotkey_release_suppress() {
+                    Ok(())
+                } else {
+                    stop_session(app, state)
+                }
+            }
         },
         HotkeyMode::Toggle => match key_state {
             ShortcutState::Pressed => toggle_dictation_inner(app, state),
-            ShortcutState::Released => Ok(()),
+            ShortcutState::Released => {
+                // Toggle ignores release for start/stop, but still clear post-cancel suppress
+                // so a later hold-mode switch or shared flag does not stick.
+                let _ = state.consume_hotkey_release_suppress();
+                Ok(())
+            }
         },
     };
     if let Err(e) = result {
@@ -315,8 +339,8 @@ fn handle_command_hotkey(app: &AppHandle, state: &SharedState, key_state: Shortc
         ShortcutState::Pressed => start_command(app, state),
         ShortcutState::Released => {
             if state.should_ignore_command_release() {
-                // Synthetic Cmd/Ctrl+C during selection capture often looks like
-                // a release of the command chord — ignore those.
+                // Synthetic Cmd/Ctrl+C during selection capture, or leftover release
+                // after Escape cancel mid-hold — ignore those.
                 Ok(())
             } else {
                 stop_session(app, state)
@@ -326,6 +350,53 @@ fn handle_command_hotkey(app: &AppHandle, state: &SharedState, key_state: Shortc
     if let Err(e) = result {
         state.push_log(format!("Command hotkey error: {e}"));
         let _ = app.emit("dictation-status", state.snapshot());
+    }
+}
+
+fn escape_shortcut() -> AppResult<Shortcut> {
+    parse_shortcut(ESCAPE_CANCEL_HOTKEY)
+}
+
+/// Register global Escape only while `recording`. Failures are logged, not fatal.
+fn arm_escape_cancel(app: &AppHandle, state: &SharedState) {
+    let sc = match escape_shortcut() {
+        Ok(s) => s,
+        Err(e) => {
+            state.push_log(format!("Escape cancel: cannot parse key: {e}"));
+            return;
+        }
+    };
+
+    // Idempotent: drop any prior Escape registration before re-arming.
+    let _ = app.global_shortcut().unregister(sc);
+
+    let handle = app.clone();
+    let state_h = Arc::clone(state);
+    if let Err(e) = app.global_shortcut().on_shortcut(sc, move |_app, _sc, event| {
+        if event.state != ShortcutState::Pressed {
+            return;
+        }
+        match state_h.cancel_recording() {
+            Ok(()) => {
+                disarm_escape_cancel(&handle);
+                let _ = handle.emit("dictation-status", state_h.snapshot());
+            }
+            Err(_) => {
+                // Race: left recording between arm and key; ensure disarmed.
+                disarm_escape_cancel(&handle);
+            }
+        }
+    }) {
+        state.push_log(format!(
+            "Escape cancel: could not register global shortcut ({e}). Use UI Cancel instead."
+        ));
+    }
+}
+
+/// Unregister global Escape (idempotent). Must run on every exit from `recording`.
+fn disarm_escape_cancel(app: &AppHandle) {
+    if let Ok(sc) = escape_shortcut() {
+        let _ = app.global_shortcut().unregister(sc);
     }
 }
 
@@ -363,19 +434,24 @@ fn handle_tray_menu_id(app: &AppHandle, id: &str) {
     match id {
         TRAY_SHOW => show_main_window(app),
         TRAY_HIDE => hide_main_window(app),
-        TRAY_QUIT => app.exit(0),
+        TRAY_QUIT => {
+            // Explicitly drop global shortcuts (incl. Escape) before exit.
+            let _ = app.global_shortcut().unregister_all();
+            app.exit(0);
+        }
         _ => {}
     }
 }
 
 /// Unregister all global shortcuts, then register dictation + command from settings.
+/// Re-arms Escape cancel if a recording is in progress (rebind while recording).
 fn register_app_hotkeys(app: &AppHandle, state: &SharedState) -> AppResult<()> {
     let dictation_str = state.dictation_hotkey();
     let command_str = state.command_hotkey();
     let dictation = parse_shortcut(&dictation_str)?;
     let command = parse_shortcut(&command_str)?;
 
-    // Clear previous bindings so rebind is clean.
+    // Clear previous bindings so rebind is clean (includes Escape if it was armed).
     let _ = app.global_shortcut().unregister_all();
 
     {
@@ -396,6 +472,11 @@ fn register_app_hotkeys(app: &AppHandle, state: &SharedState) -> AppResult<()> {
                 handle_command_hotkey(&handle, &state, event.state);
             })
             .map_err(|e| AppError::from(format!("Register command hotkey failed: {e}")))?;
+    }
+
+    // Dynamic Escape is not part of persistent settings; restore if still recording.
+    if state.is_recording() {
+        arm_escape_cancel(app, state);
     }
 
     Ok(())

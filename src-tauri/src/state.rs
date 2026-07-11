@@ -44,6 +44,10 @@ pub struct AppState {
     /// While true, Command Mode hotkey Released events are ignored.
     /// Prevents synthetic Cmd/Ctrl+C (selection capture) from ending the session.
     suppress_command_release: AtomicBool,
+    /// After cancel mid-hold (Escape / UI Cancel): ignore dictation & command
+    /// hotkey Released so a still-held chord does not stop-into-transcribe.
+    /// Cleared on the next Released (consumed) so a later press starts cleanly.
+    suppress_hotkey_release_after_cancel: AtomicBool,
 }
 
 struct InnerState {
@@ -96,6 +100,7 @@ impl AppState {
 
         Self {
             suppress_command_release: AtomicBool::new(false),
+            suppress_hotkey_release_after_cancel: AtomicBool::new(false),
             inner: Mutex::new(InnerState {
                 status: DictationStatus::Idle,
                 session_kind: SessionKind::Dictation,
@@ -154,10 +159,32 @@ impl AppState {
         if self.suppress_command_release.load(Ordering::SeqCst) {
             return true;
         }
+        if self.consume_hotkey_release_suppress() {
+            return true;
+        }
         let g = self.inner.lock();
         g.command_ignore_release_until
             .map(|t| Instant::now() < t)
             .unwrap_or(false)
+    }
+
+    /// True while a dictation or command session is actively capturing audio.
+    pub fn is_recording(&self) -> bool {
+        self.inner.lock().status == DictationStatus::Recording
+    }
+
+    /// After cancel mid-hold: next hotkey Released should be ignored (once).
+    /// Returns true if this release was suppressed (caller must not stop/transcribe).
+    pub fn consume_hotkey_release_suppress(&self) -> bool {
+        self.suppress_hotkey_release_after_cancel
+            .swap(false, Ordering::SeqCst)
+    }
+
+    /// Whether a post-cancel release suppress is still pending (does not clear).
+    #[cfg(test)]
+    pub fn has_hotkey_release_suppress(&self) -> bool {
+        self.suppress_hotkey_release_after_cancel
+            .load(Ordering::SeqCst)
     }
 
     pub fn snapshot(&self) -> StatusSnapshot {
@@ -380,6 +407,10 @@ impl AppState {
         g.last_error = None;
         g.log
             .push("Recording… (release hotkey or use Stop to finish)".into());
+        // New intentional session: do not inherit a post-cancel release suppress
+        // from a prior cancel that happened without a held chord.
+        self.suppress_hotkey_release_after_cancel
+            .store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -425,6 +456,9 @@ impl AppState {
                 "Command Mode recording… speak your instruction (e.g. make this more concise)"
                     .into(),
             );
+            // Fresh session — drop any leftover post-cancel release suppress.
+            self.suppress_hotkey_release_after_cancel
+                .store(false, Ordering::SeqCst);
             Ok(())
         })();
 
@@ -718,17 +752,122 @@ impl AppState {
     }
 
     pub fn cancel_recording(&self) -> AppResult<()> {
-        let mut g = self.inner.lock();
-        if g.status != DictationStatus::Recording {
-            return Err(AppError::from("Not recording"));
+        {
+            let mut g = self.inner.lock();
+            if g.status != DictationStatus::Recording {
+                return Err(AppError::from("Not recording"));
+            }
+            let _ = g.session.take();
+            g.command_selection = None;
+            // Keep ignore window clear; hold-safety uses suppress_hotkey_release_after_cancel.
+            g.command_ignore_release_until = None;
+            g.session_kind = SessionKind::Dictation;
+            g.status = DictationStatus::Idle;
         }
-        let _ = g.session.take();
-        g.command_selection = None;
-        g.command_ignore_release_until = None;
-        g.session_kind = SessionKind::Dictation;
-        g.status = DictationStatus::Idle;
-        g.log.push("Recording cancelled.".into());
+        // Ignore leftover hotkey Released from a still-held chord (dictation hold
+        // or Command Mode). Cleared on the next Released *or* when a new session starts.
+        self.suppress_hotkey_release_after_cancel
+            .store(true, Ordering::SeqCst);
+        self.push_log("Recording cancelled.");
         Ok(())
+    }
+
+    /// Test helper: mark status as recording without opening the mic.
+    #[cfg(test)]
+    pub fn force_recording_for_test(&self) {
+        let mut g = self.inner.lock();
+        g.status = DictationStatus::Recording;
+        g.session_kind = SessionKind::Dictation;
+        g.session = None;
+        g.command_selection = None;
+        // Match start_recording: a new session clears stale post-cancel suppress.
+        self.suppress_hotkey_release_after_cancel
+            .store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> AppState {
+        AppState::new(PathBuf::from("/tmp/eaglescribe-test-model.bin"))
+    }
+
+    #[test]
+    fn cancel_recording_sets_idle_and_logs() {
+        let state = test_state();
+        state.force_recording_for_test();
+        state.cancel_recording().unwrap();
+        let snap = state.snapshot();
+        assert_eq!(snap.status, DictationStatus::Idle);
+        assert!(
+            snap.log.iter().any(|l| l.contains("cancelled")),
+            "expected cancel log, got {:?}",
+            snap.log
+        );
+    }
+
+    #[test]
+    fn cancel_when_not_recording_is_error() {
+        let state = test_state();
+        let err = state.cancel_recording().unwrap_err().to_string();
+        assert!(err.contains("Not recording"), "{err}");
+        assert!(!state.has_hotkey_release_suppress());
+    }
+
+    #[test]
+    fn cancel_suppresses_next_hotkey_release() {
+        let state = test_state();
+        state.force_recording_for_test();
+        state.cancel_recording().unwrap();
+        assert!(state.has_hotkey_release_suppress());
+        // Dictation path: one Released is consumed.
+        assert!(state.consume_hotkey_release_suppress());
+        assert!(!state.consume_hotkey_release_suppress());
+    }
+
+    #[test]
+    fn cancel_suppresses_command_release_once() {
+        let state = test_state();
+        state.force_recording_for_test();
+        state.cancel_recording().unwrap();
+        // Command path shares the same suppress flag via should_ignore_command_release.
+        assert!(state.should_ignore_command_release());
+        assert!(!state.should_ignore_command_release());
+    }
+
+    #[test]
+    fn cancel_clears_command_session_fields() {
+        let state = test_state();
+        {
+            let mut g = state.inner.lock();
+            g.status = DictationStatus::Recording;
+            g.session_kind = SessionKind::Command;
+            g.command_selection = Some("selected text".into());
+            g.command_ignore_release_until = Some(Instant::now() + Duration::from_secs(10));
+        }
+        state.cancel_recording().unwrap();
+        let snap = state.snapshot();
+        assert_eq!(snap.status, DictationStatus::Idle);
+        assert_eq!(snap.session_kind, "dictation");
+        let g = state.inner.lock();
+        assert!(g.command_selection.is_none());
+        assert!(g.command_ignore_release_until.is_none());
+    }
+
+    #[test]
+    fn new_session_clears_stale_release_suppress() {
+        // Cancel without a held chord must not poison the *next* session's release.
+        let state = test_state();
+        state.force_recording_for_test();
+        state.cancel_recording().unwrap();
+        assert!(state.has_hotkey_release_suppress());
+        state.force_recording_for_test();
+        assert!(
+            !state.has_hotkey_release_suppress(),
+            "starting a new session should clear post-cancel release suppress"
+        );
     }
 }
 

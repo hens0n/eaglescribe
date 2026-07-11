@@ -11,6 +11,9 @@ pub const DEFAULT_DICTATION_HOTKEY: &str = "Ctrl+Shift+Space";
 /// Must not use `C` as the main key — selection capture synthesizes Cmd/Ctrl+C.
 pub const DEFAULT_COMMAND_HOTKEY: &str = "Ctrl+Shift+X";
 
+/// Fixed cancel key while recording (not user-rebindable). Registered only when `recording`.
+pub const ESCAPE_CANCEL_HOTKEY: &str = "Escape";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyRole {
     Dictation,
@@ -132,10 +135,23 @@ fn code_label(code: Code) -> String {
     }
 }
 
+/// True when the shortcut is bare Escape (no modifiers) — reserved for cancel.
+pub fn is_escape_alone(shortcut: &Shortcut) -> bool {
+    shortcut.key == Code::Escape && shortcut.mods.is_empty()
+}
+
 /// Validate one binding. Returns a normalized display string for storage.
 pub fn validate_binding(raw: &str, role: HotkeyRole) -> AppResult<String> {
     let normalized = normalize_combo(raw);
     let sc = parse_shortcut(&normalized)?;
+
+    // Escape alone is reserved to cancel an active recording (see escape-cancel-spec).
+    if is_escape_alone(&sc) {
+        return Err(AppError::from(format!(
+            "Cannot bind {} to Escape alone — Escape is reserved to cancel recording",
+            role.label()
+        )));
+    }
 
     if sc.mods.is_empty() {
         return Err(AppError::from(format!(
@@ -213,5 +229,39 @@ mod tests {
     #[test]
     fn normalize_whitespace() {
         assert_eq!(normalize_combo(" Ctrl + Shift + Space "), "Ctrl+Shift+Space");
+    }
+
+    #[test]
+    fn rejects_escape_alone_for_dictation_and_command() {
+        for raw in ["Escape", "Esc", "ESCAPE", "esc"] {
+            let d = validate_binding(raw, HotkeyRole::Dictation);
+            assert!(d.is_err(), "expected reject for dictation {raw:?}");
+            let msg = d.unwrap_err().to_string();
+            assert!(
+                msg.contains("Escape") && msg.contains("cancel"),
+                "dictation error should mention Escape cancel: {msg}"
+            );
+
+            let c = validate_binding(raw, HotkeyRole::Command);
+            assert!(c.is_err(), "expected reject for command {raw:?}");
+            let msg = c.unwrap_err().to_string();
+            assert!(
+                msg.contains("Escape") && msg.contains("cancel"),
+                "command error should mention Escape cancel: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_escape_with_modifiers() {
+        // Spec: Esc+modifiers not banned; only bare Escape is reserved.
+        assert!(validate_binding("Ctrl+Esc", HotkeyRole::Dictation).is_ok());
+        assert!(validate_binding("Ctrl+Shift+Escape", HotkeyRole::Command).is_ok());
+    }
+
+    #[test]
+    fn escape_cancel_hotkey_parses() {
+        let sc = parse_shortcut(ESCAPE_CANCEL_HOTKEY).unwrap();
+        assert!(is_escape_alone(&sc));
     }
 }
