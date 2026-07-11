@@ -4,6 +4,7 @@ version = "0.1.1"
 description = "Local voice dictation for macOS and Linux"
 authors = ["EagleScribe"]
 edition = "2021"
+license = "MIT"
 
 [lib]
 name = "eaglescribe_lib"

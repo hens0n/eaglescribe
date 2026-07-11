@@ -8,6 +8,8 @@ Local-first voice dictation for **macOS** and **Linux**. Speak → on-device Whi
 
 **Backlog & orientation:** [GitHub issues](https://github.com/hens0n/eaglescribe/issues) · behavior specs and ADRs under [`research/`](./research/) · requirements: [`research/requirements-local-app.md`](./research/requirements-local-app.md) · stack: [`research/stack-decision.md`](./research/stack-decision.md).
 
+**License:** [MIT](./LICENSE)
+
 ## Stack
 
 | Layer | Choice |
