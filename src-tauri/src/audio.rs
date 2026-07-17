@@ -490,6 +490,13 @@ pub const RECORDING_POST_ROLL_MS: u64 = 500;
 /// Peak below this after capture is treated as a silent stream (often denied mic).
 pub const SILENT_CAPTURE_PEAK: f32 = 0.001;
 
+/// Exact production preprocessing configuration used by Recognition Fingerprints.
+pub fn preprocessing_behavior_descriptor() -> String {
+    format!(
+        "resampler=linear;sample_rate={SAMPLE_RATE_16K};trim_frame_ms={TRIM_FRAME_MS};trim_pad_ms={TRIM_PAD_MS};trim_min_ms={TRIM_MIN_REMAINING_MS};rms_floor={TRIM_RMS_FLOOR};rms_ceiling={TRIM_RMS_CEILING};rms_relative={TRIM_RMS_RELATIVE};tail_pad_ms={WHISPER_TAIL_PAD_MS};silent_peak={SILENT_CAPTURE_PEAK}"
+    )
+}
+
 /// Peak absolute sample in a mono buffer (for diagnostics / silent-stream detect).
 pub fn peak_abs(samples: &[f32]) -> f32 {
     samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max)

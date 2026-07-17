@@ -44,6 +44,12 @@ pub struct MigrationConflict {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationConflictResolution {
+    pub conflict_id: String,
+    pub selected_entry_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DictionaryEntryIdentity {
     pub id: String,
     pub version: u64,
@@ -112,7 +118,7 @@ impl Dictionary {
 
     pub fn load(path: &Path) -> AppResult<Self> {
         if !path.is_file() {
-            if let Ok(backup) = fs::read_to_string(dictionary_backup_path(path)) {
+            if let Some(backup) = read_recovery_backup(path, false) {
                 return parse_dictionary(&backup).map(|(dictionary, _)| dictionary);
             }
             return Ok(Self::default());
@@ -120,7 +126,7 @@ impl Dictionary {
         let data = fs::read_to_string(path)
             .map_err(|e| AppError::from(format!("Read dictionary failed: {e}")))?;
         if data.trim().is_empty() {
-            if let Ok(backup) = fs::read_to_string(dictionary_backup_path(path)) {
+            if let Some(backup) = read_recovery_backup(path, true) {
                 return parse_dictionary(&backup).map(|(dictionary, _)| dictionary);
             }
             return Ok(Self::default());
@@ -132,8 +138,7 @@ impl Dictionary {
                 Ok(dictionary)
             }
             Err(primary_error) => {
-                let backup_path = dictionary_backup_path(path);
-                let Ok(backup) = fs::read_to_string(&backup_path) else {
+                let Some(backup) = read_recovery_backup(path, true) else {
                     return Err(primary_error);
                 };
                 parse_dictionary(&backup)
@@ -169,10 +174,19 @@ impl Dictionary {
             }
         }
         let needs_initial_backup = !backed_up_primary && !backup_path.is_file();
-        atomic_replace(path, data.as_bytes())?;
         if needs_initial_backup {
-            atomic_replace(&backup_path, data.as_bytes())?;
+            let pending_backup = dictionary_pending_backup_path(path);
+            atomic_replace(&pending_backup, data.as_bytes())?;
+            if let Err(error) = atomic_replace(path, data.as_bytes()) {
+                let _ = fs::remove_file(pending_backup);
+                return Err(error);
+            }
+            // The primary rename is the commit point. A failed promotion leaves
+            // the synced provisional file as the recovery source for that commit.
+            let _ = fs::rename(pending_backup, backup_path);
+            return Ok(());
         }
+        atomic_replace(path, data.as_bytes())?;
         Ok(())
     }
 
@@ -182,8 +196,7 @@ impl Dictionary {
         match parse_dictionary(&primary) {
             Ok((dictionary, _)) => Ok(dictionary),
             Err(primary_error) => {
-                let backup =
-                    fs::read_to_string(dictionary_backup_path(path)).map_err(|_| primary_error)?;
+                let backup = read_recovery_backup(path, true).ok_or(primary_error)?;
                 parse_dictionary(&backup).map(|(dictionary, _)| dictionary)
             }
         }
@@ -249,18 +262,17 @@ impl Dictionary {
 
     pub fn resolve_migration_conflict(
         &mut self,
-        conflict_id: &str,
-        selected_entry_id: &str,
+        resolution: &MigrationConflictResolution,
     ) -> AppResult<()> {
         let conflict_index = self
             .migration_conflicts
             .iter()
-            .position(|conflict| conflict.id == conflict_id)
+            .position(|conflict| conflict.id == resolution.conflict_id)
             .ok_or_else(|| AppError::from("Dictionary migration conflict no longer exists"))?;
         let selected = self.migration_conflicts[conflict_index]
             .choices
             .iter()
-            .find(|entry| entry.id == selected_entry_id)
+            .find(|entry| entry.id == resolution.selected_entry_id)
             .cloned()
             .ok_or_else(|| AppError::from("Selected dictionary mapping is not in this conflict"))?;
         if self
@@ -327,18 +339,8 @@ impl Dictionary {
         if to.is_empty() {
             return Err(AppError::from("Replacement text is empty"));
         }
-        let entry_index = self
-            .entries
-            .iter()
-            .position(|entry| entry.id == identity.id)
-            .ok_or_else(|| AppError::from("Dictionary entry no longer exists"))?;
+        let entry_index = self.entry_index_for_identity(identity)?;
         let entry = &self.entries[entry_index];
-        if entry.version != identity.version {
-            return Err(AppError::from(format!(
-                "Dictionary entry changed concurrently (expected version {}, found {})",
-                identity.version, entry.version
-            )));
-        }
         let canonical_from = canonical_text(&from);
         if self.entries.iter().enumerate().any(|(index, entry)| {
             index != entry_index && canonical_text(&entry.from) == canonical_from
@@ -364,6 +366,13 @@ impl Dictionary {
     }
 
     pub fn remove_entry(&mut self, identity: &DictionaryEntryIdentity) -> AppResult<()> {
+        let entry_index = self.entry_index_for_identity(identity)?;
+        self.entries.remove(entry_index);
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    fn entry_index_for_identity(&self, identity: &DictionaryEntryIdentity) -> AppResult<usize> {
         let entry_index = self
             .entries
             .iter()
@@ -376,9 +385,7 @@ impl Dictionary {
                 identity.version, entry.version
             )));
         }
-        self.entries.remove(entry_index);
-        self.revision = self.revision.saturating_add(1);
-        Ok(())
+        Ok(entry_index)
     }
 
     /// Remove by case-insensitive `from` key. Returns true if something was removed.
@@ -575,6 +582,22 @@ pub fn dictionary_backup_path(path: &Path) -> PathBuf {
     PathBuf::from(backup)
 }
 
+fn dictionary_pending_backup_path(path: &Path) -> PathBuf {
+    let mut pending = path.as_os_str().to_os_string();
+    pending.push(".bak.pending");
+    PathBuf::from(pending)
+}
+
+fn read_recovery_backup(path: &Path, include_pending: bool) -> Option<String> {
+    fs::read_to_string(dictionary_backup_path(path))
+        .ok()
+        .or_else(|| {
+            include_pending
+                .then(|| fs::read_to_string(dictionary_pending_backup_path(path)).ok())
+                .flatten()
+        })
+}
+
 fn atomic_replace(path: &Path, data: &[u8]) -> AppResult<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
@@ -762,7 +785,10 @@ mod tests {
         let conflict_id = conflict.id.clone();
         let selected_id = conflict.choices[1].id.clone();
         dictionary
-            .resolve_migration_conflict(&conflict_id, &selected_id)
+            .resolve_migration_conflict(&MigrationConflictResolution {
+                conflict_id,
+                selected_entry_id: selected_id.clone(),
+            })
             .expect("resolve conflict explicitly");
         dictionary.save(&path).expect("save resolution");
 
@@ -949,6 +975,26 @@ mod tests {
         let recovered = Dictionary::load(&path).expect("load after failed write");
 
         assert!(recovered.entries.is_empty());
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn first_write_remains_committed_when_backup_promotion_fails() {
+        let path = unique_dictionary_path("backup-promotion-failure");
+        fs::create_dir_all(path.parent().unwrap()).expect("create test directory");
+        fs::create_dir(dictionary_backup_path(&path)).expect("block backup promotion");
+        let mut dictionary = Dictionary::default();
+        dictionary.upsert("committed", "mapping").unwrap();
+
+        dictionary.save(&path).expect("primary commit succeeds");
+        fs::write(&path, "{ interrupted").expect("corrupt primary");
+        let recovered = Dictionary::load(&path).expect("recover provisional backup");
+
+        assert_eq!(
+            recovered.entries[0].to, "mapping",
+            "successful write must remain committed and recoverable"
+        );
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

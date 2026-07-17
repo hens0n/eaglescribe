@@ -332,13 +332,12 @@ fn dictionary_remove_entry(
 
 #[tauri::command]
 fn dictionary_resolve_migration_conflict(
-    conflict_id: String,
-    selected_entry_id: String,
+    resolution: dictionary::MigrationConflictResolution,
     state: tauri::State<'_, SharedState>,
 ) -> AppResult<StatusSnapshot> {
     state
         .inner()
-        .dictionary_resolve_migration_conflict(&conflict_id, &selected_entry_id)?;
+        .dictionary_resolve_migration_conflict(&resolution)?;
     Ok(state.inner().snapshot())
 }
 

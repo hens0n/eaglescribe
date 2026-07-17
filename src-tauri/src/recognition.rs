@@ -5,8 +5,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const RECOGNITION_FINGERPRINT_VERSION: &str = "recognition-v1";
-/// Bump whenever resampling, silence detection/trimming, or decoder padding changes.
-const PREPROCESSING_BEHAVIOR_VERSION: &str = "linear-16k-trim-v1-tail-400ms";
 
 /// Stable identity of model content plus decoder and audio-preprocessing behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -14,6 +12,7 @@ const PREPROCESSING_BEHAVIOR_VERSION: &str = "linear-16k-trim-v1-tail-400ms";
 pub struct RecognitionFingerprint(String);
 
 impl RecognitionFingerprint {
+    #[cfg(test)]
     pub fn from_stable_id(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -29,8 +28,9 @@ pub fn recognition_fingerprint(
     options: RecognitionOptions,
 ) -> RecognitionFingerprint {
     let descriptor = format!(
-        "model_sha256={model_content_sha256};decoder={};preprocessing={PREPROCESSING_BEHAVIOR_VERSION};silence_trim={};backend={}",
+        "model_sha256={model_content_sha256};decoder={};preprocessing={};silence_trim={};backend={}",
         crate::stt::decoder_behavior_descriptor(),
+        audio::preprocessing_behavior_descriptor(),
         options.silence_trim,
         crate::stt::stt_acceleration(),
     );

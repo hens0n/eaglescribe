@@ -37,6 +37,11 @@ interface DictionaryMigrationConflict {
   choices: DictEntry[];
 }
 
+interface MigrationConflictResolution {
+  conflict_id: string;
+  selected_entry_id: string;
+}
+
 interface Snippet {
   cue: string;
   expansion: string;
@@ -496,12 +501,15 @@ function renderDictionary(
       btn.className = "secondary";
       btn.textContent = `${choice.from} → ${choice.to}`;
       btn.addEventListener("click", async () => {
+        const resolution: MigrationConflictResolution = {
+          conflict_id: conflict.id,
+          selected_entry_id: choice.id,
+        };
         try {
           const s = await invoke<StatusSnapshot>(
             "dictionary_resolve_migration_conflict",
             {
-              conflictId: conflict.id,
-              selectedEntryId: choice.id,
+              resolution,
             },
           );
           applyStatus(s);

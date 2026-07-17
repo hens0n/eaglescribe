@@ -1,6 +1,7 @@
 use crate::audio::{self, RecordingSession};
 use crate::dictionary::{
     self, DictEntry, Dictionary, DictionaryEntryIdentity, MigrationConflict,
+    MigrationConflictResolution,
 };
 use crate::error::{AppError, AppResult};
 use crate::history::{self, HistoryBook, HistoryEntry};
@@ -551,12 +552,11 @@ impl AppState {
 
     pub fn dictionary_resolve_migration_conflict(
         &self,
-        conflict_id: &str,
-        selected_entry_id: &str,
+        resolution: &MigrationConflictResolution,
     ) -> AppResult<()> {
         let mut g = self.inner.lock();
         Self::persist_dictionary_update(&mut g, |dictionary| {
-            dictionary.resolve_migration_conflict(conflict_id, selected_entry_id)
+            dictionary.resolve_migration_conflict(resolution)
         })?;
         g.log
             .push("Dictionary migration conflict resolved explicitly.".into());
