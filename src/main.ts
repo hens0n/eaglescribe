@@ -60,6 +60,33 @@ interface MicDeviceInfo {
   is_default: boolean;
 }
 
+type TuningStage =
+  | "ready"
+  | "practice"
+  | "first_reading"
+  | "second_reading"
+  | "review"
+  | "verify"
+  | "result";
+type TuningActivity = "idle" | "preflight" | "recording" | "transcribing";
+type TuningViewMode = "ready" | "resume" | "active" | "incompatible";
+
+interface TuningSnapshot {
+  mode: TuningViewMode;
+  activity: TuningActivity;
+  screen_active: boolean;
+  last_durable_stage: TuningStage | null;
+  interrupted_attempt: boolean;
+  incompatible_reason: string | null;
+  error: string | null;
+  practice_prompt: string;
+  stages: {
+    id: TuningStage;
+    label: string;
+    state: "completed" | "current" | "remaining";
+  }[];
+}
+
 interface StatusSnapshot {
   status: DictationStatus;
   model_path: string;
@@ -250,6 +277,24 @@ const els = {
     document.querySelector("#btn-pfh-focus-model") as HTMLButtonElement,
   btnPfhShowChecklist: () =>
     document.querySelector("#btn-pfh-show-checklist") as HTMLButtonElement,
+  tuningStageRail: () =>
+    document.querySelector("#tuning-stage-rail") as HTMLOListElement,
+  tuningTitle: () => document.querySelector("#tuning-title") as HTMLElement,
+  tuningReadyCopy: () =>
+    document.querySelector("#tuning-ready-copy") as HTMLElement,
+  tuningMessage: () =>
+    document.querySelector("#tuning-message") as HTMLElement,
+  tuningError: () => document.querySelector("#tuning-error") as HTMLElement,
+  tuningPracticePrompt: () =>
+    document.querySelector("#tuning-practice-prompt") as HTMLElement,
+  btnTuningStart: () =>
+    document.querySelector("#btn-tuning-start") as HTMLButtonElement,
+  btnTuningResume: () =>
+    document.querySelector("#btn-tuning-resume") as HTMLButtonElement,
+  btnTuningStartOver: () =>
+    document.querySelector("#btn-tuning-start-over") as HTMLButtonElement,
+  btnTuningPractice: () =>
+    document.querySelector("#btn-tuning-practice") as HTMLButtonElement,
 };
 
 /**
@@ -268,6 +313,8 @@ let hostOs: string = "other";
 let pfhUserDismissedKind: string | null = null;
 /** Last permissions_help code applied from status (for dismiss tracking). */
 let lastPermissionsHelpKind: string | null = null;
+let tuningScreenActive = false;
+let tuningActivity: TuningActivity = "idle";
 
 /** Same checklist guidance, used for failure-time help (spec §3.3). */
 type PermissionsHelpKind = "microphone" | "accessibility" | "model";
@@ -883,6 +930,109 @@ function applyMicFallbackFromStatus(s: StatusSnapshot) {
   refreshMicStatusHint(s.input_device_name ?? null);
 }
 
+function formatTuningStage(stage: TuningStage | null): string {
+  switch (stage) {
+    case "first_reading":
+      return "First reading";
+    case "second_reading":
+      return "Second reading";
+    case "ready":
+      return "Ready";
+    case "practice":
+      return "Practice";
+    case "review":
+      return "Review";
+    case "verify":
+      return "Verify";
+    case "result":
+      return "Result";
+    default:
+      return "unknown";
+  }
+}
+
+function applyTuningStatus(s: TuningSnapshot) {
+  tuningScreenActive = s.screen_active;
+  tuningActivity = s.activity;
+  const rail = els.tuningStageRail();
+  rail.innerHTML = "";
+  for (const stage of s.stages) {
+    const li = document.createElement("li");
+    li.className = `tuning-stage ${stage.state}`;
+    li.textContent = stage.label;
+    li.setAttribute("aria-current", stage.state === "current" ? "step" : "false");
+    rail.appendChild(li);
+  }
+
+  const ready = s.mode === "ready";
+  const resume = s.mode === "resume";
+  const incompatible = s.mode === "incompatible";
+  const active = s.mode === "active";
+  const busy = s.activity !== "idle";
+
+  els.tuningReadyCopy().hidden = !ready;
+  els.btnTuningStart().hidden = !ready;
+  els.btnTuningResume().hidden = !resume;
+  els.btnTuningStartOver().hidden = !(resume || incompatible || active);
+  els.btnTuningPractice().hidden = true;
+  els.tuningPracticePrompt().hidden = true;
+
+  let title = "Ready";
+  let message = "Before any scored evidence, preflight loads the model, opens the microphone, computes the Recognition Fingerprint, and proves the checkpoint can be saved atomically.";
+  if (resume) {
+    title = "Resume Tuning";
+    message = `Last durable stage: ${formatTuningStage(s.last_durable_stage)}. ${
+      s.interrupted_attempt
+        ? "The interrupted attempt was discarded and must be repeated."
+        : "No acknowledged work needs to be repeated."
+    }`;
+  } else if (incompatible) {
+    title = "Start over required";
+    message =
+      s.incompatible_reason ??
+      "Saved Tuning progress is incompatible and cannot be reinterpreted.";
+  } else if (active && s.last_durable_stage === "practice") {
+    title = "Practice";
+    els.tuningPracticePrompt().hidden = false;
+    els.tuningPracticePrompt().textContent = s.practice_prompt;
+    els.btnTuningPractice().hidden = false;
+    if (s.activity === "recording") {
+      message = "Read the prompt naturally, then stop. Practice is unscored.";
+      els.btnTuningPractice().textContent = "Stop & transcribe Practice";
+    } else if (s.activity === "transcribing") {
+      message = "Transcribing locally. Audio and the complete Practice transcript will be discarded.";
+      els.btnTuningPractice().textContent = "Transcribing…";
+    } else {
+      message = s.interrupted_attempt
+        ? "The prior attempt was interrupted and discarded. Read the unscored prompt again."
+        : "One successful local capture and transcription is required before the first reading.";
+      els.btnTuningPractice().textContent = "Start Practice";
+    }
+  } else if (active && s.last_durable_stage === "first_reading") {
+    title = "Practice complete";
+    message =
+      "Practice was saved successfully. First reading is now the current durable stage.";
+  }
+
+  els.tuningTitle().textContent = title;
+  els.tuningMessage().textContent = message;
+  const error = els.tuningError();
+  error.hidden = !s.error;
+  error.textContent = s.error ?? "";
+  els.btnTuningStart().disabled = busy;
+  els.btnTuningResume().disabled = busy;
+  els.btnTuningStartOver().disabled = busy;
+  els.btnTuningPractice().disabled = busy && s.activity !== "recording";
+
+  // The Tuning screen owns microphone/model operations. Hotkeys are also
+  // rejected by Rust, while these controls make the in-window rule visible.
+  if (tuningScreenActive) {
+    els.btnToggle().disabled = true;
+    els.btnCommand().disabled = true;
+  }
+  if (!tuningScreenActive) void refresh();
+}
+
 function applyStatus(s: StatusSnapshot) {
   const badge = els.badge();
   const status = (s.status ?? "idle") as DictationStatus;
@@ -1026,8 +1176,16 @@ function applyStatus(s: StatusSnapshot) {
   const busy = status === "transcribing" || status === "waiting_llm";
   const recording = status === "recording";
   const isCommand = s.session_kind === "command";
-  els.btnToggle().disabled = busy || (recording && isCommand);
-  els.btnCommand().disabled = busy || (recording && !isCommand);
+  els.btnToggle().disabled =
+    tuningScreenActive ||
+    tuningActivity !== "idle" ||
+    busy ||
+    (recording && isCommand);
+  els.btnCommand().disabled =
+    tuningScreenActive ||
+    tuningActivity !== "idle" ||
+    busy ||
+    (recording && !isCommand);
   els.btnCancel().disabled = !recording;
   els.btnToggle().textContent =
     recording && !isCommand
@@ -1046,7 +1204,7 @@ async function refresh() {
   applyStatus(s);
 }
 
-type TabName = "settings" | "library" | "history" | "log";
+type TabName = "settings" | "library" | "history" | "tuning" | "log";
 
 function activateTab(name: TabName) {
   const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>(".tab"));
@@ -1054,6 +1212,7 @@ function activateTab(name: TabName) {
     settings: document.querySelector("#panel-settings") as HTMLElement,
     library: document.querySelector("#panel-library") as HTMLElement,
     history: document.querySelector("#panel-history") as HTMLElement,
+    tuning: document.querySelector("#panel-tuning") as HTMLElement,
     log: document.querySelector("#panel-log") as HTMLElement,
   };
   for (const tab of tabs) {
@@ -1068,12 +1227,34 @@ function activateTab(name: TabName) {
   }
 }
 
+async function selectTab(name: TabName) {
+  const current = document.querySelector<HTMLButtonElement>(".tab.active")?.dataset
+    .tab as TabName | undefined;
+  if (current === name) return;
+  if (current === "tuning") {
+    try {
+      applyTuningStatus(await invoke<TuningSnapshot>("tuning_leave"));
+    } catch (e) {
+      console.error("Failed to pause Tuning", e);
+    }
+  }
+  activateTab(name);
+  if (name === "tuning") {
+    try {
+      applyTuningStatus(await invoke<TuningSnapshot>("tuning_enter"));
+    } catch (e) {
+      console.error(e);
+      alert(String(e));
+    }
+  }
+}
+
 function setupTabs() {
   const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>(".tab"));
   for (const tab of tabs) {
     tab.addEventListener("click", () => {
       const name = tab.dataset.tab as TabName;
-      if (name) activateTab(name);
+      if (name) void selectTab(name);
     });
   }
 }
@@ -1127,8 +1308,8 @@ async function dismissSetupChecklist() {
   }
 }
 
-function focusModelSettings() {
-  activateTab("settings");
+async function focusModelSettings() {
+  await selectTab("settings");
   const input = els.modelPath();
   if (input) {
     input.focus();
@@ -1155,6 +1336,33 @@ async function openMacPrivacy(pane: "microphone" | "accessibility", label: strin
 
 window.addEventListener("DOMContentLoaded", async () => {
   setupTabs();
+
+  const invokeTuning = async (command: string) => {
+    try {
+      applyTuningStatus(await invoke<TuningSnapshot>(command));
+    } catch (e) {
+      console.error(e);
+      alert(String(e));
+      applyTuningStatus(await invoke<TuningSnapshot>("get_tuning_status"));
+    }
+  };
+
+  els.btnTuningStart().addEventListener("click", () => {
+    void invokeTuning("tuning_start");
+  });
+  els.btnTuningResume().addEventListener("click", () => {
+    void invokeTuning("tuning_resume");
+  });
+  els.btnTuningStartOver().addEventListener("click", () => {
+    void invokeTuning("tuning_start_over");
+  });
+  els.btnTuningPractice().addEventListener("click", () => {
+    void invokeTuning(
+      tuningActivity === "recording"
+        ? "tuning_stop_practice"
+        : "tuning_start_practice",
+    );
+  });
 
   els.btnSetupDismiss().addEventListener("click", () => {
     void dismissSetupChecklist();
@@ -1478,9 +1686,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   await listen<StatusSnapshot>("dictation-status", (event) => {
     applyStatus(event.payload);
   });
+  await listen<TuningSnapshot>("tuning-status", (event) => {
+    applyTuningStatus(event.payload);
+  });
 
   try {
     await refresh();
+    applyTuningStatus(await invoke<TuningSnapshot>("get_tuning_status"));
     await loadMicDevices(currentInputDeviceName);
   } catch (e) {
     console.error("Failed to load status", e);
