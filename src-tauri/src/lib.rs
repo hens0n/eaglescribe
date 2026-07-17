@@ -13,6 +13,7 @@ mod snippets;
 mod state;
 pub mod stt;
 pub mod tuning;
+pub mod tuning_diagnostics;
 
 use error::{AppError, AppResult};
 use hotkey::{
