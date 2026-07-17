@@ -9,13 +9,20 @@ use crate::hotkey;
 use crate::llm;
 use crate::polish::{self, PolishMode};
 use crate::recognition::{
-    recognition_fingerprint, recognize_resampled, resample_capture, CapturedAudio,
+    recognition_fingerprint, recognize_raw, recognize_resampled, resample_capture, CapturedAudio,
     PreprocessingReport, RecognitionErrorKind, RecognitionFingerprint, RecognitionOptions,
     SilenceTrimReport,
 };
 use crate::settings::{self, AppSettings, HotkeyMode};
 use crate::snippets::{self, Snippet, SnippetBook};
 use crate::stt::{self, WhisperEngine};
+use crate::tuning_diagnostics::{
+    self, EventKind as TuningEventKind, OutcomeCode as TuningOutcomeCode,
+    ReasonCode as TuningReasonCode, TuningDiagnosticEvent, TuningDiagnosticsStore, TuningStage,
+};
+use crate::tuning_session::{
+    self, CheckpointState, CompatibilityEnvelope, TuningCheckpoint, TuningCheckpointStore,
+};
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,6 +54,15 @@ enum SessionKind {
     Command,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningActivity {
+    Idle,
+    Preflight,
+    Recording,
+    Transcribing,
+}
+
 pub struct AppState {
     inner: Mutex<InnerState>,
     /// While true, Command Mode hotkey Released events are ignored.
@@ -75,6 +91,17 @@ struct InnerState {
     snippets: SnippetBook,
     history_path: PathBuf,
     history: HistoryBook,
+    tuning_store: TuningCheckpointStore,
+    tuning_checkpoint: Option<TuningCheckpoint>,
+    tuning_checkpoint_compatible: bool,
+    tuning_incompatible_reason: Option<String>,
+    tuning_session_active: bool,
+    tuning_screen_active: bool,
+    tuning_activity: TuningActivity,
+    tuning_recording: Option<RecordingSession>,
+    tuning_attempt_generation: u64,
+    tuning_last_error: Option<String>,
+    tuning_diagnostics: TuningDiagnosticsStore,
     /// Shared so STT can run without holding the state mutex (avoids main-thread deadlock).
     engine: Option<Arc<WhisperEngine>>,
     session: Option<RecordingSession>,
@@ -120,6 +147,12 @@ impl AppState {
         let hotkey_mode = settings.hotkey_mode;
         let command_hotkey = settings.command_hotkey.clone();
         let dictation_hotkey = settings.dictation_hotkey.clone();
+        let tuning_store =
+            TuningCheckpointStore::new(tuning_session::default_tuning_checkpoint_path());
+        let (tuning_diagnostics, _) = TuningDiagnosticsStore::open(
+            tuning_diagnostics::default_tuning_diagnostics_path(),
+            unix_time_ms(),
+        );
 
         Self {
             suppress_command_release: AtomicBool::new(false),
@@ -139,6 +172,17 @@ impl AppState {
                 snippets,
                 history_path: history_path.clone(),
                 history,
+                tuning_store,
+                tuning_checkpoint: None,
+                tuning_checkpoint_compatible: false,
+                tuning_incompatible_reason: None,
+                tuning_session_active: false,
+                tuning_screen_active: false,
+                tuning_activity: TuningActivity::Idle,
+                tuning_recording: None,
+                tuning_attempt_generation: 0,
+                tuning_last_error: None,
+                tuning_diagnostics,
                 engine: None,
                 session: None,
                 polish_mode: PolishMode::Smart,
@@ -297,6 +341,489 @@ impl AppState {
             // Compile-time host OS for first-run / permissions copy (macos | linux | other).
             host_os: host_os_label().into(),
         }
+    }
+
+    pub fn tuning_snapshot(&self) -> TuningSnapshot {
+        let g = self.inner.lock();
+        let mode = if g.tuning_incompatible_reason.is_some() {
+            TuningViewMode::Incompatible
+        } else if g.tuning_checkpoint.is_none() {
+            TuningViewMode::Ready
+        } else if g.tuning_session_active && g.tuning_screen_active {
+            TuningViewMode::Active
+        } else {
+            TuningViewMode::Resume
+        };
+        let durable_stage = g.tuning_checkpoint.as_ref().map(TuningCheckpoint::stage);
+        TuningSnapshot {
+            mode,
+            activity: g.tuning_activity,
+            screen_active: g.tuning_screen_active,
+            last_durable_stage: durable_stage,
+            interrupted_attempt: g
+                .tuning_checkpoint
+                .as_ref()
+                .is_some_and(TuningCheckpoint::interrupted_attempt),
+            incompatible_reason: g.tuning_incompatible_reason.clone(),
+            error: g.tuning_last_error.clone(),
+            practice_prompt: crate::tuning::builtin_corpus().practice_prompt,
+            stages: tuning_stage_snapshots(durable_stage),
+        }
+    }
+
+    /// Entering the Tuning screen inspects the one unfinished checkpoint. A
+    /// saved session is not claimed until the user explicitly chooses Resume.
+    pub fn tuning_enter(&self) -> AppResult<TuningSnapshot> {
+        let store = {
+            let mut g = self.inner.lock();
+            g.tuning_screen_active = true;
+            g.tuning_session_active = false;
+            g.tuning_checkpoint_compatible = false;
+            g.tuning_last_error = None;
+            g.tuning_store.clone()
+        };
+        let saved = match store.load_saved() {
+            Ok(saved) => saved,
+            Err(reason) => {
+                let mut g = self.inner.lock();
+                g.tuning_checkpoint = None;
+                g.tuning_checkpoint_compatible = false;
+                g.tuning_incompatible_reason = Some(reason);
+                return Ok(drop_and_tuning_snapshot(g, self));
+            }
+        };
+        let Some(_) = saved else {
+            let mut g = self.inner.lock();
+            g.tuning_checkpoint = None;
+            g.tuning_checkpoint_compatible = false;
+            g.tuning_incompatible_reason = None;
+            return Ok(drop_and_tuning_snapshot(g, self));
+        };
+
+        if let Err(error) = self.ensure_engine() {
+            let mut g = self.inner.lock();
+            g.tuning_checkpoint = saved;
+            g.tuning_last_error = Some(format!(
+                "The saved Tuning Session cannot be checked until the Whisper model loads: {error}"
+            ));
+            return Ok(drop_and_tuning_snapshot(g, self));
+        }
+        let envelope = self.current_tuning_envelope()?;
+        let mut g = self.inner.lock();
+        match store.inspect(&envelope) {
+            CheckpointState::Compatible(checkpoint) => {
+                g.tuning_checkpoint = Some(checkpoint);
+                g.tuning_checkpoint_compatible = true;
+                g.tuning_incompatible_reason = None;
+            }
+            CheckpointState::Incompatible { reason } => {
+                g.tuning_checkpoint = saved;
+                g.tuning_checkpoint_compatible = false;
+                g.tuning_incompatible_reason = Some(reason);
+            }
+            CheckpointState::None => {
+                g.tuning_checkpoint = None;
+                g.tuning_checkpoint_compatible = false;
+                g.tuning_incompatible_reason = None;
+            }
+        }
+        Ok(drop_and_tuning_snapshot(g, self))
+    }
+
+    pub fn tuning_resume(&self) -> AppResult<TuningSnapshot> {
+        self.tuning_enter()?;
+        let mut g = self.inner.lock();
+        if let Some(reason) = &g.tuning_incompatible_reason {
+            return Err(AppError::from(reason.clone()));
+        }
+        if !g.tuning_checkpoint_compatible {
+            return Err(AppError::from(
+                "Saved Tuning compatibility could not be verified. Fix the model preflight before resuming.",
+            ));
+        }
+        let checkpoint = g
+            .tuning_checkpoint
+            .clone()
+            .ok_or_else(|| AppError::from("No unfinished Tuning Session to resume"))?;
+        g.tuning_screen_active = true;
+        g.tuning_session_active = true;
+        g.tuning_last_error = None;
+        append_tuning_diagnostic(
+            &mut g,
+            TuningDiagnosticEvent::new(
+                unix_time_ms(),
+                checkpoint.session_id().clone(),
+                TuningEventKind::SessionResumed,
+                checkpoint.stage(),
+                TuningOutcomeCode::Resumed,
+            ),
+        );
+        Ok(drop_and_tuning_snapshot(g, self))
+    }
+
+    /// Run model, microphone, fingerprint, and atomic-write preflight before
+    /// exposing a new Practice stage. `start_over` atomically replaces the old checkpoint.
+    pub fn tuning_start(&self, start_over: bool) -> AppResult<TuningSnapshot> {
+        {
+            let mut g = self.inner.lock();
+            Self::reject_tuning_start_for_dictation(g.status)?;
+            if g.tuning_activity != TuningActivity::Idle || g.tuning_recording.is_some() {
+                return Err(AppError::from(
+                    "Wait for the current Tuning operation before starting over",
+                ));
+            }
+            g.tuning_screen_active = true;
+            g.tuning_session_active = false;
+            g.tuning_activity = TuningActivity::Preflight;
+            g.tuning_last_error = None;
+        }
+
+        if let Err(error) = self.ensure_engine() {
+            self.fail_tuning_preflight(format!("Whisper model preflight failed: {error}"));
+            return Err(error);
+        }
+
+        let preferred = self.preferred_input_device();
+        let mic_probe = RecordingSession::start(preferred.as_deref()).and_then(|session| {
+            std::thread::sleep(Duration::from_millis(80));
+            session.stop().map(|_| ())
+        });
+        if let Err(error) = mic_probe {
+            self.fail_tuning_preflight(format!("Microphone preflight failed: {error}"));
+            return Err(error);
+        }
+
+        let envelope = self.current_tuning_envelope()?;
+        let (store, previous) = {
+            let g = self.inner.lock();
+            (g.tuning_store.clone(), g.tuning_checkpoint.clone())
+        };
+        let checkpoint = match store.start(envelope) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                self.fail_tuning_preflight(format!("Checkpoint preflight failed: {error}"));
+                self.emit_tuning_preflight_failure(TuningReasonCode::CheckpointWriteFailed);
+                return Err(AppError::from(error));
+            }
+        };
+
+        let mut g = self.inner.lock();
+        if start_over {
+            if let Some(previous) = previous {
+                append_tuning_diagnostic(
+                    &mut g,
+                    TuningDiagnosticEvent::new(
+                        unix_time_ms(),
+                        previous.session_id().clone(),
+                        TuningEventKind::SessionRestarted,
+                        previous.stage(),
+                        TuningOutcomeCode::Restarted,
+                    ),
+                );
+            }
+        }
+        append_tuning_diagnostic(
+            &mut g,
+            TuningDiagnosticEvent::new(
+                unix_time_ms(),
+                checkpoint.session_id().clone(),
+                TuningEventKind::SessionCreated,
+                TuningStage::Ready,
+                TuningOutcomeCode::Started,
+            ),
+        );
+        g.tuning_checkpoint = Some(checkpoint);
+        g.tuning_checkpoint_compatible = true;
+        g.tuning_incompatible_reason = None;
+        g.tuning_session_active = true;
+        g.tuning_activity = TuningActivity::Idle;
+        g.tuning_last_error = None;
+        Ok(drop_and_tuning_snapshot(g, self))
+    }
+
+    pub fn tuning_start_practice(&self) -> AppResult<TuningSnapshot> {
+        let (store, checkpoint, preferred) = {
+            let g = self.inner.lock();
+            if !g.tuning_screen_active || !g.tuning_session_active {
+                return Err(AppError::from("Resume or start Tuning before Practice"));
+            }
+            if g.tuning_activity != TuningActivity::Idle {
+                return Err(AppError::from(
+                    "Tuning is already using the microphone or model",
+                ));
+            }
+            let checkpoint = g
+                .tuning_checkpoint
+                .clone()
+                .ok_or_else(|| AppError::from("No active Tuning checkpoint"))?;
+            if checkpoint.stage() != TuningStage::Practice {
+                return Err(AppError::from("Practice is already complete"));
+            }
+            (
+                g.tuning_store.clone(),
+                checkpoint,
+                audio::normalize_input_device_name(g.settings.input_device_name.as_deref()),
+            )
+        };
+        let interrupted = match store.begin_attempt(&checkpoint) {
+            Ok(interrupted) => interrupted,
+            Err(error) => {
+                let mut g = self.inner.lock();
+                g.tuning_last_error = Some(
+                    "Practice did not start because the interrupted-attempt checkpoint could not be saved."
+                        .into(),
+                );
+                append_tuning_diagnostic(
+                    &mut g,
+                    TuningDiagnosticEvent::new(
+                        unix_time_ms(),
+                        checkpoint.session_id().clone(),
+                        TuningEventKind::StorageFailure,
+                        TuningStage::Practice,
+                        TuningOutcomeCode::OperationalFailure,
+                    )
+                    .with_reason(TuningReasonCode::CheckpointWriteFailed),
+                );
+                return Err(AppError::from(error));
+            }
+        };
+        let recording = match RecordingSession::start(preferred.as_deref()) {
+            Ok(recording) => recording,
+            Err(error) => {
+                let mut g = self.inner.lock();
+                g.tuning_checkpoint = Some(interrupted.clone());
+                g.tuning_last_error =
+                    Some("Practice could not open the microphone. Try again.".into());
+                append_tuning_diagnostic(
+                    &mut g,
+                    TuningDiagnosticEvent::new(
+                        unix_time_ms(),
+                        interrupted.session_id().clone(),
+                        TuningEventKind::PhraseAttempt,
+                        TuningStage::Practice,
+                        TuningOutcomeCode::OperationalFailure,
+                    )
+                    .with_reason(TuningReasonCode::MicrophoneUnavailable),
+                );
+                return Err(error);
+            }
+        };
+        let mut g = self.inner.lock();
+        g.tuning_checkpoint = Some(interrupted);
+        g.tuning_recording = Some(recording);
+        g.tuning_activity = TuningActivity::Recording;
+        g.tuning_last_error = None;
+        Ok(drop_and_tuning_snapshot(g, self))
+    }
+
+    pub fn tuning_stop_practice<R: Runtime>(
+        self: &Arc<Self>,
+        app: &AppHandle<R>,
+    ) -> AppResult<TuningSnapshot> {
+        let (recording, checkpoint, store, engine, options, generation) = {
+            let mut g = self.inner.lock();
+            if g.tuning_activity != TuningActivity::Recording {
+                return Err(AppError::from("Practice is not recording"));
+            }
+            let recording = g
+                .tuning_recording
+                .take()
+                .ok_or_else(|| AppError::from("Missing Practice recording"))?;
+            let checkpoint = g
+                .tuning_checkpoint
+                .clone()
+                .ok_or_else(|| AppError::from("Missing Practice checkpoint"))?;
+            let engine = g
+                .engine
+                .clone()
+                .ok_or_else(|| AppError::from("Whisper model is not loaded"))?;
+            let options = RecognitionOptions {
+                silence_trim: g.settings.silence_trim,
+            };
+            g.tuning_activity = TuningActivity::Transcribing;
+            (
+                recording,
+                checkpoint,
+                g.tuning_store.clone(),
+                engine,
+                options,
+                g.tuning_attempt_generation,
+            )
+        };
+        let app_bg = app.clone();
+        let state_bg = Arc::clone(self);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(audio::RECORDING_POST_ROLL_MS));
+            let capture = CapturedAudio::from_capture(recording.stop());
+            let recognition =
+                capture.and_then(|audio| recognize_raw(audio, options, engine.as_ref()));
+            let mut g = state_bg.inner.lock();
+            if generation != g.tuning_attempt_generation
+                || !g.tuning_screen_active
+                || !g.tuning_session_active
+            {
+                g.tuning_activity = TuningActivity::Idle;
+                drop(g);
+                let _ = app_bg.emit("tuning-status", state_bg.tuning_snapshot());
+                return;
+            }
+            match recognition {
+                Ok(recognition) => {
+                    // Practice validates only the local capture/transcription path.
+                    // Drop the complete transcript before any checkpoint, event, or log write.
+                    drop(recognition);
+                    match store.complete_practice(&checkpoint) {
+                        Ok(completed) => {
+                            append_tuning_diagnostic(
+                                &mut g,
+                                TuningDiagnosticEvent::new(
+                                    unix_time_ms(),
+                                    completed.session_id().clone(),
+                                    TuningEventKind::PhraseAttempt,
+                                    TuningStage::Practice,
+                                    TuningOutcomeCode::Valid,
+                                ),
+                            );
+                            append_tuning_diagnostic(
+                                &mut g,
+                                TuningDiagnosticEvent::new(
+                                    unix_time_ms(),
+                                    completed.session_id().clone(),
+                                    TuningEventKind::StageCompleted,
+                                    TuningStage::Practice,
+                                    TuningOutcomeCode::Completed,
+                                ),
+                            );
+                            g.tuning_checkpoint = Some(completed);
+                            g.tuning_last_error = None;
+                        }
+                        Err(_) => {
+                            append_tuning_diagnostic(
+                                &mut g,
+                                TuningDiagnosticEvent::new(
+                                    unix_time_ms(),
+                                    checkpoint.session_id().clone(),
+                                    TuningEventKind::StorageFailure,
+                                    TuningStage::Practice,
+                                    TuningOutcomeCode::OperationalFailure,
+                                )
+                                .with_reason(TuningReasonCode::CheckpointWriteFailed),
+                            );
+                            g.tuning_last_error = Some(
+                                "Practice was transcribed, but progress could not be saved. Practice remains incomplete; try again."
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    let reason = match error.kind() {
+                        RecognitionErrorKind::Capture => TuningReasonCode::MicrophoneUnavailable,
+                        _ => TuningReasonCode::TranscriptionFailed,
+                    };
+                    append_tuning_diagnostic(
+                        &mut g,
+                        TuningDiagnosticEvent::new(
+                            unix_time_ms(),
+                            checkpoint.session_id().clone(),
+                            TuningEventKind::PhraseAttempt,
+                            TuningStage::Practice,
+                            TuningOutcomeCode::OperationalFailure,
+                        )
+                        .with_reason(reason),
+                    );
+                    g.tuning_last_error = Some(
+                        "Practice could not complete local transcription. The attempt was discarded; try again."
+                            .into(),
+                    );
+                }
+            }
+            g.tuning_activity = TuningActivity::Idle;
+            drop(g);
+            let _ = app_bg.emit("tuning-status", state_bg.tuning_snapshot());
+        });
+        Ok(self.tuning_snapshot())
+    }
+
+    pub fn tuning_leave(&self) -> TuningSnapshot {
+        let mut g = self.inner.lock();
+        let was_active = g.tuning_session_active;
+        let interrupted = g.tuning_activity != TuningActivity::Idle;
+        g.tuning_attempt_generation = g.tuning_attempt_generation.wrapping_add(1);
+        g.tuning_recording.take();
+        if g.tuning_activity == TuningActivity::Recording {
+            g.tuning_activity = TuningActivity::Idle;
+        }
+        g.tuning_screen_active = false;
+        g.tuning_session_active = false;
+        if was_active {
+            let checkpoint = g.tuning_checkpoint.clone();
+            if let Some(checkpoint) = checkpoint {
+                append_tuning_diagnostic(
+                    &mut g,
+                    TuningDiagnosticEvent::new(
+                        unix_time_ms(),
+                        checkpoint.session_id().clone(),
+                        TuningEventKind::SessionPaused,
+                        checkpoint.stage(),
+                        if interrupted {
+                            TuningOutcomeCode::Interrupted
+                        } else {
+                            TuningOutcomeCode::Paused
+                        },
+                    ),
+                );
+            }
+        }
+        drop_and_tuning_snapshot(g, self)
+    }
+
+    fn current_tuning_envelope(&self) -> AppResult<CompatibilityEnvelope> {
+        let g = self.inner.lock();
+        let engine = g
+            .engine
+            .as_ref()
+            .ok_or_else(|| AppError::from("Whisper model is not loaded"))?;
+        Ok(CompatibilityEnvelope::current(recognition_fingerprint(
+            engine.model_content_sha256(),
+            RecognitionOptions {
+                silence_trim: g.settings.silence_trim,
+            },
+        )))
+    }
+
+    fn reject_tuning_start_for_dictation(status: DictationStatus) -> AppResult<()> {
+        if status == DictationStatus::Recording || status.is_busy() {
+            return Err(AppError::from(
+                "Finish or cancel ordinary dictation before starting Tuning",
+            ));
+        }
+        Ok(())
+    }
+
+    fn fail_tuning_preflight(&self, message: String) {
+        let mut g = self.inner.lock();
+        g.tuning_activity = TuningActivity::Idle;
+        g.tuning_session_active = false;
+        g.tuning_last_error = Some(message);
+    }
+
+    fn emit_tuning_preflight_failure(&self, reason: TuningReasonCode) {
+        let mut g = self.inner.lock();
+        let Some(checkpoint) = g.tuning_checkpoint.clone() else {
+            return;
+        };
+        append_tuning_diagnostic(
+            &mut g,
+            TuningDiagnosticEvent::new(
+                unix_time_ms(),
+                checkpoint.session_id().clone(),
+                TuningEventKind::StorageFailure,
+                TuningStage::Ready,
+                TuningOutcomeCode::OperationalFailure,
+            )
+            .with_reason(reason),
+        );
     }
 
     /// Persist first-run checklist dismiss (Settings re-open still works).
@@ -634,9 +1161,19 @@ impl AppState {
         Ok(())
     }
 
+    fn reject_if_tuning_owns_audio_or_model(g: &InnerState) -> AppResult<()> {
+        if g.tuning_screen_active || g.tuning_activity != TuningActivity::Idle {
+            return Err(AppError::from(
+                "Tuning is using the microphone and model. Leave Tuning before starting ordinary dictation.",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn start_recording(&self) -> AppResult<()> {
         {
             let g = self.inner.lock();
+            Self::reject_if_tuning_owns_audio_or_model(&g)?;
             Self::reject_if_unavailable(g.status)?;
         }
 
@@ -650,7 +1187,11 @@ impl AppState {
 
         let mut g = self.inner.lock();
         // Another session may have started while we opened the mic.
-        if g.status == DictationStatus::Recording || g.status.is_busy() {
+        if g.status == DictationStatus::Recording
+            || g.status.is_busy()
+            || g.tuning_screen_active
+            || g.tuning_activity != TuningActivity::Idle
+        {
             drop(session);
             return Err(AppError::from("Busy — cannot start recording"));
         }
@@ -679,6 +1220,7 @@ impl AppState {
     pub fn start_command_recording<R: Runtime>(&self, app: &AppHandle<R>) -> AppResult<()> {
         {
             let g = self.inner.lock();
+            Self::reject_if_tuning_owns_audio_or_model(&g)?;
             Self::reject_if_unavailable(g.status)?;
         }
 
@@ -704,7 +1246,11 @@ impl AppState {
             };
             let mut g = self.inner.lock();
             // Another session may have started while we captured selection.
-            if g.status == DictationStatus::Recording || g.status.is_busy() {
+            if g.status == DictationStatus::Recording
+                || g.status.is_busy()
+                || g.tuning_screen_active
+                || g.tuning_activity != TuningActivity::Idle
+            {
                 return Err(AppError::from("Busy — cannot start Command Mode"));
             }
             g.session = Some(session);
@@ -1558,6 +2104,47 @@ mod tests {
         }
         assert!(state.snapshot().permissions_help.is_none());
     }
+
+    #[test]
+    fn tuning_start_is_rejected_while_ordinary_dictation_is_recording() {
+        let state = test_state();
+        state.force_recording_for_test();
+
+        let error = state.tuning_start(false).unwrap_err().to_string();
+
+        assert!(
+            error.contains("Finish or cancel ordinary dictation"),
+            "{error}"
+        );
+        assert_eq!(state.snapshot().status, DictationStatus::Recording);
+    }
+
+    #[test]
+    fn ordinary_dictation_is_rejected_while_the_tuning_screen_owns_resources() {
+        let state = test_state();
+        {
+            let mut g = state.inner.lock();
+            g.tuning_screen_active = true;
+        }
+
+        let error = state.start_recording().unwrap_err().to_string();
+
+        assert!(error.contains("Leave Tuning"), "{error}");
+        assert_eq!(state.snapshot().status, DictationStatus::Idle);
+    }
+
+    #[test]
+    fn tuning_stage_rail_is_complete_ordered_and_not_navigation() {
+        let rail = tuning_stage_snapshots(Some(TuningStage::Practice));
+
+        assert_eq!(rail.len(), 7);
+        assert_eq!(rail[0].id, TuningStage::Ready);
+        assert_eq!(rail[0].state, TuningStageState::Completed);
+        assert_eq!(rail[1].id, TuningStage::Practice);
+        assert_eq!(rail[1].state, TuningStageState::Current);
+        assert_eq!(rail[6].id, TuningStage::Result);
+        assert_eq!(rail[6].state, TuningStageState::Remaining);
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1622,6 +2209,90 @@ pub struct StatusSnapshot {
     pub onboarding_dismissed: bool,
     /// Compile-time host: `macos` | `linux` | `other` (permissions copy branches).
     pub host_os: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningViewMode {
+    Ready,
+    Resume,
+    Active,
+    Incompatible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningStageState {
+    Completed,
+    Current,
+    Remaining,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TuningStageSnapshot {
+    pub id: TuningStage,
+    pub label: &'static str,
+    pub state: TuningStageState,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TuningSnapshot {
+    pub mode: TuningViewMode,
+    pub activity: TuningActivity,
+    pub screen_active: bool,
+    pub last_durable_stage: Option<TuningStage>,
+    pub interrupted_attempt: bool,
+    pub incompatible_reason: Option<String>,
+    pub error: Option<String>,
+    pub practice_prompt: &'static str,
+    pub stages: Vec<TuningStageSnapshot>,
+}
+
+fn drop_and_tuning_snapshot(
+    guard: parking_lot::MutexGuard<'_, InnerState>,
+    state: &AppState,
+) -> TuningSnapshot {
+    drop(guard);
+    state.tuning_snapshot()
+}
+
+fn append_tuning_diagnostic(g: &mut InnerState, event: TuningDiagnosticEvent) {
+    // Diagnostics are deliberately non-authoritative. The typed event API has
+    // no speech-content or arbitrary-metadata fields, and a write failure can
+    // never change checkpoint/session outcomes.
+    let _ = g.tuning_diagnostics.append(event, unix_time_ms());
+}
+
+fn tuning_stage_snapshots(current: Option<TuningStage>) -> Vec<TuningStageSnapshot> {
+    const STAGES: [(TuningStage, &str); 7] = [
+        (TuningStage::Ready, "Ready"),
+        (TuningStage::Practice, "Practice"),
+        (TuningStage::FirstReading, "First reading"),
+        (TuningStage::SecondReading, "Second reading"),
+        (TuningStage::Review, "Review"),
+        (TuningStage::Verify, "Verify"),
+        (TuningStage::Result, "Result"),
+    ];
+    STAGES
+        .into_iter()
+        .map(|(id, label)| {
+            let state = match current {
+                Some(active) if id < active => TuningStageState::Completed,
+                Some(active) if id == active => TuningStageState::Current,
+                Some(_) => TuningStageState::Remaining,
+                None if id == TuningStage::Ready => TuningStageState::Current,
+                None => TuningStageState::Remaining,
+            };
+            TuningStageSnapshot { id, label, state }
+        })
+        .collect()
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Host OS token for UI onboarding / permissions copy.

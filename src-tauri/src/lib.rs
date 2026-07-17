@@ -14,6 +14,7 @@ mod state;
 pub mod stt;
 pub mod tuning;
 pub mod tuning_diagnostics;
+pub mod tuning_session;
 
 use error::{AppError, AppResult};
 use hotkey::{
@@ -23,7 +24,7 @@ use hotkey::{
 };
 use polish::PolishMode;
 use settings::HotkeyMode;
-use state::{AppState, SharedState, StatusSnapshot};
+use state::{AppState, SharedState, StatusSnapshot, TuningSnapshot};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use stt::resolve_model_path;
@@ -37,6 +38,49 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 #[tauri::command]
 fn get_status(state: tauri::State<'_, SharedState>) -> StatusSnapshot {
     state.inner().snapshot()
+}
+
+#[tauri::command]
+fn get_tuning_status(state: tauri::State<'_, SharedState>) -> TuningSnapshot {
+    state.inner().tuning_snapshot()
+}
+
+#[tauri::command]
+fn tuning_enter(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_enter()
+}
+
+#[tauri::command]
+fn tuning_resume(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_resume()
+}
+
+#[tauri::command]
+fn tuning_start(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_start(false)
+}
+
+#[tauri::command]
+fn tuning_start_over(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_start(true)
+}
+
+#[tauri::command]
+fn tuning_start_practice(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_start_practice()
+}
+
+#[tauri::command]
+fn tuning_stop_practice(
+    app: AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_stop_practice(&app)
+}
+
+#[tauri::command]
+fn tuning_leave(state: tauri::State<'_, SharedState>) -> TuningSnapshot {
+    state.inner().tuning_leave()
 }
 
 #[tauri::command]
@@ -781,6 +825,7 @@ fn show_main_window(app: &AppHandle) {
 }
 
 fn hide_main_window(app: &AppHandle) {
+    pause_tuning_for_hidden_window(app);
     // Drop any pending deferred restore so it cannot re-show after hide.
     invalidate_window_restore_gen();
     if let Some(window) = main_window(app) {
@@ -788,11 +833,18 @@ fn hide_main_window(app: &AppHandle) {
     }
 }
 
+fn pause_tuning_for_hidden_window(app: &AppHandle) {
+    let state = Arc::clone(app.state::<SharedState>().inner());
+    let snapshot = state.tuning_leave();
+    let _ = app.emit("tuning-status", snapshot);
+}
+
 fn handle_tray_menu_id(app: &AppHandle, id: &str) {
     match id {
         TRAY_SHOW => show_main_window(app),
         TRAY_HIDE => hide_main_window(app),
         TRAY_QUIT => {
+            pause_tuning_for_hidden_window(app);
             // Explicitly drop global shortcuts (incl. Escape) before exit.
             let _ = app.global_shortcut().unregister_all();
             // Linux: drop process-held clipboard so arboard can hand off / join cleanly.
@@ -1055,6 +1107,14 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             get_status,
+            get_tuning_status,
+            tuning_enter,
+            tuning_resume,
+            tuning_start,
+            tuning_start_over,
+            tuning_start_practice,
+            tuning_stop_practice,
+            tuning_leave,
             set_model_path,
             set_polish_mode,
             set_hotkey_mode,
@@ -1086,6 +1146,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                pause_tuning_for_hidden_window(window.app_handle());
                 // Invalidate deferred Show re-focus (same race as Hide Window).
                 invalidate_window_restore_gen();
                 let _ = window.hide();

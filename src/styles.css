@@ -279,6 +279,80 @@ body {
   display: flex;
 }
 
+/* —— Guided Tuning —— */
+.tuning-panel {
+  gap: 0.9rem;
+}
+
+.tuning-stage-rail {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 0.25rem;
+}
+
+.tuning-stage {
+  min-width: 0;
+  padding: 0.35rem 0.25rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.2;
+  text-align: center;
+}
+
+.tuning-stage.completed {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
+
+.tuning-stage.current {
+  background: color-mix(in srgb, var(--accent-dim) 45%, transparent);
+  border-color: var(--accent);
+  color: #ecfdf5;
+  font-weight: 650;
+}
+
+.tuning-task {
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: #0e1016;
+}
+
+.tuning-task h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.tuning-task p,
+.tuning-task ul {
+  margin: 0.15rem 0;
+}
+
+.tuning-task ul {
+  padding-left: 1.25rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.tuning-prompt {
+  margin: 0.35rem 0;
+  padding: 0.65rem 0.8rem;
+  border-left: 3px solid var(--accent);
+  background: var(--card);
+  font-size: 1.05rem;
+}
+
+@media (max-width: 620px) {
+  .tuning-stage-rail {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
 .panel-section {
   display: flex;
   flex-direction: column;

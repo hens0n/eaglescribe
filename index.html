@@ -308,6 +308,16 @@
           class="tab"
           role="tab"
           aria-selected="false"
+          data-tab="tuning"
+          id="tab-tuning"
+        >
+          Tuning
+        </button>
+        <button
+          type="button"
+          class="tab"
+          role="tab"
+          aria-selected="false"
           data-tab="log"
           id="tab-log"
         >
@@ -629,6 +639,90 @@
             <p class="hint tight path-line">
               <code id="history-path">—</code>
             </p>
+          </div>
+        </section>
+
+        <!-- Tuning: persistent staged local workflow -->
+        <section
+          id="panel-tuning"
+          class="tab-panel tuning-panel"
+          role="tabpanel"
+          aria-labelledby="tab-tuning"
+          hidden
+        >
+          <div class="panel-section">
+            <div class="section-title">Tuning Session</div>
+            <ol
+              id="tuning-stage-rail"
+              class="tuning-stage-rail"
+              aria-label="Tuning stages"
+            >
+              <li class="tuning-stage current" aria-current="step">Ready</li>
+              <li class="tuning-stage remaining">Practice</li>
+              <li class="tuning-stage remaining">First reading</li>
+              <li class="tuning-stage remaining">Second reading</li>
+              <li class="tuning-stage remaining">Review</li>
+              <li class="tuning-stage remaining">Verify</li>
+              <li class="tuning-stage remaining">Result</li>
+            </ol>
+          </div>
+
+          <div class="panel-section tuning-task" aria-live="polite">
+            <h2 id="tuning-title">Ready</h2>
+            <div id="tuning-ready-copy">
+              <p>
+                Set aside about <strong>4–6 minutes</strong>. Tuning runs entirely
+                on this device and never learns from dictation history.
+              </p>
+              <ul>
+                <li>
+                  It can only learn corrections covered by the fixed built-in
+                  English phrases—not unseen names or jargon.
+                </li>
+                <li>You’ll read every phrase twice, in two separated readings.</li>
+                <li>You explicitly approve every proposed Correction Rule.</li>
+                <li>
+                  Approved rules must pass a different required Verification
+                  Pass before they become active.
+                </li>
+              </ul>
+            </div>
+            <p id="tuning-message" class="hint tight"></p>
+            <p id="tuning-error" class="error" role="alert" hidden></p>
+            <blockquote
+              id="tuning-practice-prompt"
+              class="tuning-prompt"
+              hidden
+            ></blockquote>
+            <div class="row">
+              <button id="btn-tuning-start" type="button" class="primary">
+                Start Tuning
+              </button>
+              <button
+                id="btn-tuning-resume"
+                type="button"
+                class="primary"
+                hidden
+              >
+                Resume
+              </button>
+              <button
+                id="btn-tuning-start-over"
+                type="button"
+                class="secondary"
+                hidden
+              >
+                Start over
+              </button>
+              <button
+                id="btn-tuning-practice"
+                type="button"
+                class="primary"
+                hidden
+              >
+                Start Practice
+              </button>
+            </div>
           </div>
         </section>
 
