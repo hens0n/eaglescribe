@@ -19,8 +19,22 @@ type PolishMode = "smart" | "verbatim";
 type HotkeyMode = "hold" | "toggle";
 
 interface DictEntry {
+  id: string;
   from: string;
   to: string;
+  origin: "manual" | "tuning";
+  edit_state: "unmodified" | "modified_after_verification";
+  verified_fingerprints: {
+    fingerprint: string;
+    verified_at_ms: number;
+  }[];
+  version: number;
+}
+
+interface DictionaryMigrationConflict {
+  id: string;
+  canonical_from: string;
+  choices: DictEntry[];
 }
 
 interface Snippet {
@@ -53,6 +67,8 @@ interface StatusSnapshot {
   llm_model: string;
   dictionary_path: string;
   dictionary: DictEntry[];
+  dictionary_revision: number;
+  dictionary_conflicts: DictionaryMigrationConflict[];
   snippets_path: string;
   snippets: Snippet[];
   history_path: string;
@@ -442,16 +458,52 @@ function updateHotkeyDisplays(dictation: string, command: string) {
   els.commandHotkeyDisplay().textContent = command;
 }
 
-function renderDictionary(entries: DictEntry[], path: string) {
+function renderDictionary(
+  entries: DictEntry[],
+  conflicts: DictionaryMigrationConflict[],
+  path: string,
+) {
   els.dictPath().textContent = path || "—";
   const list = els.dictList();
   list.innerHTML = "";
-  if (!entries.length) {
+  if (!entries.length && !conflicts.length) {
     const li = document.createElement("li");
     li.className = "dict-empty";
     li.textContent = "No entries yet.";
     list.appendChild(li);
     return;
+  }
+  for (const conflict of conflicts) {
+    const li = document.createElement("li");
+    li.className = "dict-item";
+
+    const text = document.createElement("span");
+    text.className = "dict-text";
+    text.textContent = `Choose the mapping for “${conflict.canonical_from}”: `;
+    li.appendChild(text);
+
+    for (const choice of conflict.choices) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "secondary";
+      btn.textContent = `${choice.from} → ${choice.to}`;
+      btn.addEventListener("click", async () => {
+        try {
+          const s = await invoke<StatusSnapshot>(
+            "dictionary_resolve_migration_conflict",
+            {
+              conflictId: conflict.id,
+              selectedEntryId: choice.id,
+            },
+          );
+          applyStatus(s);
+        } catch (e) {
+          alert(String(e));
+        }
+      });
+      li.appendChild(btn);
+    }
+    list.appendChild(li);
   }
   for (const entry of entries) {
     const li = document.createElement("li");
@@ -459,16 +511,47 @@ function renderDictionary(entries: DictEntry[], path: string) {
 
     const text = document.createElement("span");
     text.className = "dict-text";
-    text.innerHTML = `<code>${escapeHtml(entry.from)}</code> → <strong>${escapeHtml(entry.to)}</strong>`;
+    const lifecycle =
+      entry.origin === "tuning"
+        ? entry.edit_state === "modified_after_verification"
+          ? "Tuning · explicitly edited"
+          : entry.verified_fingerprints.length
+            ? `Tuning · scoped to ${entry.verified_fingerprints.length} verified model${entry.verified_fingerprints.length === 1 ? "" : "s"}`
+            : "Tuning · needs verification"
+        : "Manual";
+    text.innerHTML = `<code>${escapeHtml(entry.from)}</code> → <strong>${escapeHtml(entry.to)}</strong><span class="dict-meta">${escapeHtml(lifecycle)}</span>`;
 
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "secondary dict-remove";
-    btn.textContent = "Remove";
-    btn.addEventListener("click", async () => {
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "secondary";
+    edit.textContent = "Edit";
+    edit.addEventListener("click", async () => {
+      const from = window.prompt("What EagleScribe should match", entry.from);
+      if (from === null) return;
+      const to = window.prompt("Preferred text", entry.to);
+      if (to === null) return;
       try {
-        const s = await invoke<StatusSnapshot>("dictionary_remove", {
-          from: entry.from,
+        const s = await invoke<StatusSnapshot>("dictionary_edit", {
+          entryId: entry.id,
+          expectedVersion: entry.version,
+          from,
+          to,
+        });
+        applyStatus(s);
+      } catch (e) {
+        alert(String(e));
+      }
+    });
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "secondary dict-remove";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", async () => {
+      try {
+        const s = await invoke<StatusSnapshot>("dictionary_remove_entry", {
+          entryId: entry.id,
+          expectedVersion: entry.version,
         });
         applyStatus(s);
       } catch (e) {
@@ -477,7 +560,8 @@ function renderDictionary(entries: DictEntry[], path: string) {
     });
 
     li.appendChild(text);
-    li.appendChild(btn);
+    li.appendChild(edit);
+    li.appendChild(remove);
     list.appendChild(li);
   }
 }
@@ -868,7 +952,11 @@ function applyStatus(s: StatusSnapshot) {
   els.transcript().textContent = s.last_transcript ?? "—";
   els.transcriptRaw().textContent = s.last_raw_transcript ?? "—";
   els.log().textContent = s.log.join("\n");
-  renderDictionary(s.dictionary ?? [], s.dictionary_path ?? "");
+  renderDictionary(
+    s.dictionary ?? [],
+    s.dictionary_conflicts ?? [],
+    s.dictionary_path ?? "",
+  );
   renderSnippets(s.snippets ?? [], s.snippets_path ?? "");
   renderHistory(
     s.history ?? [],

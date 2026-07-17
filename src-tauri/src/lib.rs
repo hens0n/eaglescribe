@@ -309,6 +309,44 @@ fn dictionary_remove(
 }
 
 #[tauri::command]
+fn dictionary_edit(
+    entry_id: String,
+    expected_version: u64,
+    from: String,
+    to: String,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    state
+        .inner()
+        .dictionary_edit(&entry_id, expected_version, &from, &to)?;
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
+fn dictionary_remove_entry(
+    entry_id: String,
+    expected_version: u64,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    state
+        .inner()
+        .dictionary_remove_entry(&entry_id, expected_version)?;
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
+fn dictionary_resolve_migration_conflict(
+    conflict_id: String,
+    selected_entry_id: String,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<StatusSnapshot> {
+    state
+        .inner()
+        .dictionary_resolve_migration_conflict(&conflict_id, &selected_entry_id)?;
+    Ok(state.inner().snapshot())
+}
+
+#[tauri::command]
 fn snippet_add(
     cue: String,
     expansion: String,
@@ -1037,6 +1075,9 @@ pub fn run() {
             clear_history,
             dictionary_add,
             dictionary_remove,
+            dictionary_edit,
+            dictionary_remove_entry,
+            dictionary_resolve_migration_conflict,
             snippet_add,
             snippet_remove,
             load_model,

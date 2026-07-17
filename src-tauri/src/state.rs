@@ -1,5 +1,5 @@
 use crate::audio::{self, RecordingSession};
-use crate::dictionary::{self, DictEntry, Dictionary};
+use crate::dictionary::{self, DictEntry, Dictionary, MigrationConflict};
 use crate::error::{AppError, AppResult};
 use crate::history::{self, HistoryBook, HistoryEntry};
 use crate::hotkey;
@@ -232,6 +232,8 @@ impl AppState {
             llm_model: g.settings.llm_model.clone(),
             dictionary_path: g.dictionary_path.display().to_string(),
             dictionary: g.dictionary.list(),
+            dictionary_revision: g.dictionary.revision,
+            dictionary_conflicts: g.dictionary.migration_conflicts.clone(),
             snippets_path: g.snippets_path.display().to_string(),
             snippets: g.snippets.list(),
             history_path: g.history_path.display().to_string(),
@@ -479,8 +481,10 @@ impl AppState {
 
     pub fn dictionary_add(&self, from: &str, to: &str) -> AppResult<()> {
         let mut g = self.inner.lock();
-        g.dictionary.upsert(from, to)?;
-        g.dictionary.save(&g.dictionary_path)?;
+        let mut next = g.dictionary.clone();
+        next.upsert(from, to)?;
+        next.save(&g.dictionary_path)?;
+        g.dictionary = next;
         g.log
             .push(format!("Dictionary: {:?} → {:?}", from.trim(), to.trim()));
         Ok(())
@@ -488,14 +492,63 @@ impl AppState {
 
     pub fn dictionary_remove(&self, from: &str) -> AppResult<()> {
         let mut g = self.inner.lock();
-        if !g.dictionary.remove(from) {
+        let mut next = g.dictionary.clone();
+        if !next.remove(from) {
             return Err(AppError::from(format!(
                 "No dictionary entry for {:?}",
                 from.trim()
             )));
         }
-        g.dictionary.save(&g.dictionary_path)?;
+        next.save(&g.dictionary_path)?;
+        g.dictionary = next;
         g.log.push(format!("Dictionary removed: {:?}", from.trim()));
+        Ok(())
+    }
+
+    pub fn dictionary_edit(
+        &self,
+        entry_id: &str,
+        expected_version: u64,
+        from: &str,
+        to: &str,
+    ) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        let mut next = g.dictionary.clone();
+        next.edit_entry(entry_id, expected_version, from, to)?;
+        next.save(&g.dictionary_path)?;
+        g.dictionary = next;
+        g.log
+            .push(format!("Dictionary edited: {:?} → {:?}", from, to));
+        Ok(())
+    }
+
+    pub fn dictionary_remove_entry(
+        &self,
+        entry_id: &str,
+        expected_version: u64,
+    ) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        let mut next = g.dictionary.clone();
+        next.remove_entry(entry_id, expected_version)?;
+        next.save(&g.dictionary_path)?;
+        g.dictionary = next;
+        g.log
+            .push(format!("Dictionary entry removed: {entry_id}"));
+        Ok(())
+    }
+
+    pub fn dictionary_resolve_migration_conflict(
+        &self,
+        conflict_id: &str,
+        selected_entry_id: &str,
+    ) -> AppResult<()> {
+        let mut g = self.inner.lock();
+        let mut next = g.dictionary.clone();
+        next.resolve_migration_conflict(conflict_id, selected_entry_id)?;
+        next.save(&g.dictionary_path)?;
+        g.dictionary = next;
+        g.log
+            .push("Dictionary migration conflict resolved explicitly.".into());
         Ok(())
     }
 
@@ -1494,6 +1547,8 @@ pub struct StatusSnapshot {
     pub llm_model: String,
     pub dictionary_path: String,
     pub dictionary: Vec<DictEntry>,
+    pub dictionary_revision: u64,
+    pub dictionary_conflicts: Vec<MigrationConflict>,
     pub snippets_path: String,
     pub snippets: Vec<Snippet>,
     pub history_path: String,

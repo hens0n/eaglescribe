@@ -615,6 +615,13 @@ textarea {
   font-size: 0.85em;
 }
 
+.dict-meta {
+  display: block;
+  color: var(--muted);
+  font-size: 0.68rem;
+  margin-top: 0.12rem;
+}
+
 .dict-remove {
   flex-shrink: 0;
   padding: 0.22rem 0.45rem;
