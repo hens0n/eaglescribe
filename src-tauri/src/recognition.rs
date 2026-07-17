@@ -35,6 +35,7 @@ impl RecognitionErrorKind {
 pub struct RecognitionError {
     kind: RecognitionErrorKind,
     message: String,
+    preprocessing: Option<PreprocessingReport>,
 }
 
 impl RecognitionError {
@@ -42,6 +43,19 @@ impl RecognitionError {
         Self {
             kind,
             message: message.into(),
+            preprocessing: None,
+        }
+    }
+
+    fn after_preprocessing(
+        kind: RecognitionErrorKind,
+        message: impl Into<String>,
+        preprocessing: PreprocessingReport,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            preprocessing: Some(preprocessing),
         }
     }
 
@@ -51,6 +65,11 @@ impl RecognitionError {
 
     pub fn kind(&self) -> RecognitionErrorKind {
         self.kind
+    }
+
+    /// Completed preprocessing facts, when failure happened during transcription.
+    pub fn preprocessing(&self) -> Option<&PreprocessingReport> {
+        self.preprocessing.as_ref()
     }
 }
 
@@ -168,9 +187,7 @@ pub fn recognize_raw(
     recognize_resampled(audio, options, transcriber)
 }
 
-pub(crate) fn resample_capture(
-    capture: CapturedAudio,
-) -> RecognitionResult<ResampledAudio16K> {
+pub(crate) fn resample_capture(capture: CapturedAudio) -> RecognitionResult<ResampledAudio16K> {
     if capture.sample_rate == 0 {
         return Err(RecognitionError::new(
             RecognitionErrorKind::InvalidAudio,
@@ -229,24 +246,30 @@ pub(crate) fn recognize_resampled(
         SilenceTrimReport::Disabled
     };
     let samples = audio::pad_for_whisper_16k(&samples);
+    let preprocessing = PreprocessingReport {
+        input_sample_rate,
+        captured_samples_16k,
+        peak,
+        silence_trim,
+        decoder_tail_padding_ms: audio::WHISPER_TAIL_PAD_MS,
+    };
     let transcript = transcriber.transcribe_16k_mono(&samples).map_err(|error| {
-        RecognitionError::new(RecognitionErrorKind::Transcription, error.to_string())
+        RecognitionError::after_preprocessing(
+            RecognitionErrorKind::Transcription,
+            error.to_string(),
+            preprocessing.clone(),
+        )
     })?;
     if transcript.trim().is_empty() {
-        return Err(RecognitionError::new(
+        return Err(RecognitionError::after_preprocessing(
             RecognitionErrorKind::EmptyTranscript,
             "Empty transcript",
+            preprocessing,
         ));
     }
     Ok(RawRecognition {
         transcript,
-        preprocessing: PreprocessingReport {
-            input_sample_rate,
-            captured_samples_16k,
-            peak,
-            silence_trim,
-            decoder_tail_padding_ms: audio::WHISPER_TAIL_PAD_MS,
-        },
+        preprocessing,
     })
 }
 
@@ -331,6 +354,11 @@ mod tests {
         assert_eq!(error.stage(), RecognitionStage::Transcription);
         assert_eq!(error.kind(), RecognitionErrorKind::Transcription);
         assert!(error.to_string().contains("decoder stopped"));
+        let preprocessing = error
+            .preprocessing()
+            .expect("completed preprocessing should remain available on transcription failure");
+        assert_eq!(preprocessing.captured_samples_16k, 16_000);
+        assert_eq!(preprocessing.decoder_tail_padding_ms, 400);
     }
 
     #[test]
@@ -352,7 +380,10 @@ mod tests {
         )
         .expect("raw recognition should succeed");
 
-        assert_eq!(result.preprocessing.silence_trim, SilenceTrimReport::Disabled);
+        assert_eq!(
+            result.preprocessing.silence_trim,
+            SilenceTrimReport::Disabled
+        );
         assert_eq!(transcriber.received.borrow().len(), 16_000 + 6_400);
     }
 }

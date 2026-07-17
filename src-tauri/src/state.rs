@@ -6,8 +6,8 @@ use crate::hotkey;
 use crate::llm;
 use crate::polish::{self, PolishMode};
 use crate::recognition::{
-    recognize_resampled, resample_capture, CapturedAudio, RecognitionErrorKind,
-    RecognitionOptions, SilenceTrimReport,
+    recognize_resampled, resample_capture, CapturedAudio, PreprocessingReport,
+    RecognitionErrorKind, RecognitionOptions, SilenceTrimReport,
 };
 use crate::settings::{self, AppSettings, HotkeyMode};
 use crate::snippets::{self, Snippet, SnippetBook};
@@ -687,6 +687,35 @@ impl AppState {
         let _ = app.emit("dictation-status", self.snapshot());
     }
 
+    fn log_preprocessing(&self, report: &PreprocessingReport) {
+        match report.silence_trim {
+            SilenceTrimReport::Disabled => {}
+            SilenceTrimReport::Applied {
+                original_ms,
+                trimmed_ms,
+                head_ms,
+                tail_ms,
+                threshold,
+            } => self.push_log(format!(
+                "Silence trim: {:.1}s → {:.1}s (removed head {head_ms}ms, tail {tail_ms}ms, threshold={threshold:.4})",
+                original_ms as f32 / 1000.0,
+                trimmed_ms as f32 / 1000.0,
+            )),
+            SilenceTrimReport::KeptFullBuffer {
+                original_ms,
+                remaining_ms,
+                threshold,
+            } => self.push_log(format!(
+                "Silence trim found no speech frames ({original_ms}ms → {remaining_ms}ms, peak={peak:.4}, threshold={threshold:.4}) — keeping full buffer for STT",
+                peak = report.peak,
+            )),
+        }
+        self.push_log(format!(
+            "STT pad: +{}ms trailing silence for decoder",
+            report.decoder_tail_padding_ms
+        ));
+    }
+
     /// For Command Mode, runs local LLM rewrite instead of normal paste pipeline.
     pub fn stop_and_transcribe<R: Runtime>(&self, app: &AppHandle<R>) -> AppResult<String> {
         // Claim the session and mark busy under one lock so back-to-back
@@ -781,11 +810,17 @@ impl AppState {
                 .ok_or_else(|| AppError::from("Engine not loaded"))?
         };
 
-        let recognition = match recognize_resampled(
+        let recognition = recognize_resampled(
             resampled,
             RecognitionOptions { silence_trim },
             engine.as_ref(),
-        ) {
+        );
+        if let Err(error) = &recognition {
+            if let Some(preprocessing) = error.preprocessing() {
+                self.log_preprocessing(preprocessing);
+            }
+        }
+        let recognition = match recognition {
             Ok(recognition) => recognition,
             Err(error) if error.kind() == RecognitionErrorKind::EmptyTranscript => {
                 {
@@ -798,36 +833,15 @@ impl AppState {
                 return Err(AppError::from(error.to_string()));
             }
             Err(error) => {
+                if error.kind() == RecognitionErrorKind::SilentAudio {
+                    self.push_log(error.to_string());
+                }
                 self.fail_status(app, DictationStatus::Error, error.to_string());
                 return Err(AppError::from(error.to_string()));
             }
         };
 
-        match recognition.preprocessing.silence_trim {
-            SilenceTrimReport::Disabled => {}
-            SilenceTrimReport::Applied {
-                original_ms,
-                trimmed_ms,
-                head_ms,
-                tail_ms,
-                threshold,
-            } => self.push_log(format!(
-                "Silence trim: {:.1}s → {:.1}s (removed head {head_ms}ms, tail {tail_ms}ms, threshold={threshold:.4})",
-                original_ms as f32 / 1000.0,
-                trimmed_ms as f32 / 1000.0,
-            )),
-            SilenceTrimReport::KeptFullBuffer {
-                original_ms,
-                remaining_ms,
-                threshold,
-            } => self.push_log(format!(
-                "Silence trim found no speech frames ({original_ms}ms → {remaining_ms}ms, peak={peak:.4}, threshold={threshold:.4}) — keeping full buffer for STT"
-            )),
-        }
-        self.push_log(format!(
-            "STT pad: +{}ms trailing silence for decoder",
-            recognition.preprocessing.decoder_tail_padding_ms
-        ));
+        self.log_preprocessing(&recognition.preprocessing);
 
         let raw = recognition.transcript;
 
