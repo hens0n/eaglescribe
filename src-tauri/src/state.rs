@@ -21,7 +21,8 @@ use crate::tuning_diagnostics::{
     ReasonCode as TuningReasonCode, TuningDiagnosticEvent, TuningDiagnosticsStore, TuningStage,
 };
 use crate::tuning_session::{
-    self, CheckpointState, CompatibilityEnvelope, TuningCheckpoint, TuningCheckpointStore,
+    self, CheckpointState, CompatibilityEnvelope, ReadingPass, TuningCheckpoint,
+    TuningCheckpointStore,
 };
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -355,6 +356,13 @@ impl AppState {
             TuningViewMode::Resume
         };
         let durable_stage = g.tuning_checkpoint.as_ref().map(TuningCheckpoint::stage);
+        let reading_progress = g
+            .tuning_checkpoint
+            .as_ref()
+            .and_then(TuningCheckpoint::reading_progress);
+        let candidate_count = g.tuning_checkpoint.as_ref().and_then(|checkpoint| {
+            (checkpoint.stage() == TuningStage::Review).then(|| checkpoint.candidate_count())
+        });
         TuningSnapshot {
             mode,
             activity: g.tuning_activity,
@@ -367,6 +375,14 @@ impl AppState {
             incompatible_reason: g.tuning_incompatible_reason.clone(),
             error: g.tuning_last_error.clone(),
             practice_prompt: crate::tuning::builtin_corpus().practice_prompt,
+            reading_pass: reading_progress.as_ref().map(|progress| progress.pass),
+            phrase_id: reading_progress
+                .as_ref()
+                .map(|progress| progress.phrase_id.clone()),
+            phrase_text: reading_progress.as_ref().map(|progress| progress.phrase_text),
+            phrase_position: reading_progress.as_ref().map(|progress| progress.position),
+            phrase_total: reading_progress.as_ref().map(|progress| progress.total),
+            candidate_count,
             stages: tuning_stage_snapshots(durable_stage),
         }
     }
@@ -743,6 +759,300 @@ impl AppState {
             let _ = app_bg.emit("tuning-status", state_bg.tuning_snapshot());
         });
         Ok(self.tuning_snapshot())
+    }
+
+    pub fn tuning_start_reading(&self) -> AppResult<TuningSnapshot> {
+        let (store, checkpoint, preferred, stage, phrase_id) = {
+            let g = self.inner.lock();
+            if !g.tuning_screen_active || !g.tuning_session_active {
+                return Err(AppError::from("Resume or start Tuning before reading"));
+            }
+            if g.tuning_activity != TuningActivity::Idle {
+                return Err(AppError::from(
+                    "Tuning is already using the microphone or model",
+                ));
+            }
+            let checkpoint = g
+                .tuning_checkpoint
+                .clone()
+                .ok_or_else(|| AppError::from("No active Tuning checkpoint"))?;
+            let progress = checkpoint
+                .reading_progress()
+                .ok_or_else(|| AppError::from("A Tuning Phrase is not ready to read"))?;
+            (
+                g.tuning_store.clone(),
+                checkpoint.clone(),
+                audio::normalize_input_device_name(g.settings.input_device_name.as_deref()),
+                checkpoint.stage(),
+                progress.phrase_id,
+            )
+        };
+        let interrupted = match store.begin_attempt(&checkpoint) {
+            Ok(interrupted) => interrupted,
+            Err(error) => {
+                let mut g = self.inner.lock();
+                g.tuning_last_error = Some(
+                    "The phrase did not start because its interrupted-attempt checkpoint could not be saved."
+                        .into(),
+                );
+                append_tuning_diagnostic(
+                    &mut g,
+                    TuningDiagnosticEvent::new(
+                        unix_time_ms(),
+                        checkpoint.session_id().clone(),
+                        TuningEventKind::StorageFailure,
+                        stage,
+                        TuningOutcomeCode::OperationalFailure,
+                    )
+                    .with_reason(TuningReasonCode::CheckpointWriteFailed),
+                );
+                return Err(AppError::from(error));
+            }
+        };
+        let recording = match RecordingSession::start(preferred.as_deref()) {
+            Ok(recording) => recording,
+            Err(error) => {
+                let mut g = self.inner.lock();
+                g.tuning_checkpoint = Some(interrupted.clone());
+                g.tuning_last_error = Some(
+                    "The phrase could not open the microphone. The attempt was discarded; try again."
+                        .into(),
+                );
+                append_phrase_diagnostic(
+                    &mut g,
+                    &interrupted,
+                    TuningEventKind::PhraseAttempt,
+                    stage,
+                    TuningOutcomeCode::OperationalFailure,
+                    &phrase_id,
+                    Some(TuningReasonCode::MicrophoneUnavailable),
+                );
+                return Err(error);
+            }
+        };
+        let mut g = self.inner.lock();
+        g.tuning_checkpoint = Some(interrupted);
+        g.tuning_recording = Some(recording);
+        g.tuning_activity = TuningActivity::Recording;
+        g.tuning_last_error = None;
+        Ok(drop_and_tuning_snapshot(g, self))
+    }
+
+    pub fn tuning_stop_reading<R: Runtime>(
+        self: &Arc<Self>,
+        app: &AppHandle<R>,
+    ) -> AppResult<TuningSnapshot> {
+        let (recording, checkpoint, store, engine, options, generation, stage, phrase_id) = {
+            let mut g = self.inner.lock();
+            if g.tuning_activity != TuningActivity::Recording {
+                return Err(AppError::from("A Tuning Phrase is not recording"));
+            }
+            let checkpoint = g
+                .tuning_checkpoint
+                .clone()
+                .ok_or_else(|| AppError::from("Missing Tuning reading checkpoint"))?;
+            let progress = checkpoint
+                .reading_progress()
+                .ok_or_else(|| AppError::from("Missing current Tuning Phrase"))?;
+            let engine = g
+                .engine
+                .clone()
+                .ok_or_else(|| AppError::from("Whisper model is not loaded"))?;
+            let recording = g
+                .tuning_recording
+                .take()
+                .ok_or_else(|| AppError::from("Missing Tuning Phrase recording"))?;
+            let options = RecognitionOptions {
+                silence_trim: g.settings.silence_trim,
+            };
+            g.tuning_activity = TuningActivity::Transcribing;
+            (
+                recording,
+                checkpoint.clone(),
+                g.tuning_store.clone(),
+                engine,
+                options,
+                g.tuning_attempt_generation,
+                checkpoint.stage(),
+                progress.phrase_id,
+            )
+        };
+        let app_bg = app.clone();
+        let state_bg = Arc::clone(self);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(audio::RECORDING_POST_ROLL_MS));
+            let capture = CapturedAudio::from_capture(recording.stop());
+            let recognition =
+                capture.and_then(|audio| recognize_raw(audio, options, engine.as_ref()));
+            let mut g = state_bg.inner.lock();
+            if generation != g.tuning_attempt_generation
+                || !g.tuning_screen_active
+                || !g.tuning_session_active
+            {
+                g.tuning_activity = TuningActivity::Idle;
+                drop(g);
+                let _ = app_bg.emit("tuning-status", state_bg.tuning_snapshot());
+                return;
+            }
+            match recognition {
+                Ok(recognition) => {
+                    let raw_transcript = recognition.transcript;
+                    match store.complete_reading(&checkpoint, &raw_transcript) {
+                        Ok(completed) => {
+                            drop(raw_transcript);
+                            append_phrase_diagnostic(
+                                &mut g,
+                                &completed,
+                                TuningEventKind::PhraseAttempt,
+                                stage,
+                                TuningOutcomeCode::Valid,
+                                &phrase_id,
+                                None,
+                            );
+                            if completed.stage() != stage {
+                                append_tuning_diagnostic(
+                                    &mut g,
+                                    TuningDiagnosticEvent::new(
+                                        unix_time_ms(),
+                                        completed.session_id().clone(),
+                                        TuningEventKind::StageCompleted,
+                                        stage,
+                                        TuningOutcomeCode::Completed,
+                                    ),
+                                );
+                            }
+                            if completed.stage() == TuningStage::Review {
+                                append_inference_diagnostics(&mut g, &completed);
+                            }
+                            g.tuning_checkpoint = Some(completed);
+                            g.tuning_last_error = None;
+                        }
+                        Err(_) => {
+                            drop(raw_transcript);
+                            append_phrase_diagnostic(
+                                &mut g,
+                                &checkpoint,
+                                TuningEventKind::StorageFailure,
+                                stage,
+                                TuningOutcomeCode::OperationalFailure,
+                                &phrase_id,
+                                Some(TuningReasonCode::CheckpointWriteFailed),
+                            );
+                            g.tuning_last_error = Some(
+                                "The phrase was transcribed, but its evidence and progress could not be saved atomically. It remains incomplete; try again."
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    let reason = match error.kind() {
+                        RecognitionErrorKind::Capture => TuningReasonCode::MicrophoneUnavailable,
+                        _ => TuningReasonCode::TranscriptionFailed,
+                    };
+                    append_phrase_diagnostic(
+                        &mut g,
+                        &checkpoint,
+                        TuningEventKind::PhraseAttempt,
+                        stage,
+                        TuningOutcomeCode::OperationalFailure,
+                        &phrase_id,
+                        Some(reason),
+                    );
+                    g.tuning_last_error = Some(
+                        "The phrase could not complete local transcription. The attempt was discarded and does not count; try again."
+                            .into(),
+                    );
+                }
+            }
+            g.tuning_activity = TuningActivity::Idle;
+            drop(g);
+            let _ = app_bg.emit("tuning-status", state_bg.tuning_snapshot());
+        });
+        Ok(self.tuning_snapshot())
+    }
+
+    pub fn tuning_retry_phrase(&self) -> AppResult<TuningSnapshot> {
+        let (store, checkpoint, stage, phrase_id) = {
+            let g = self.inner.lock();
+            if g.tuning_activity == TuningActivity::Transcribing {
+                return Err(AppError::from(
+                    "Wait for the current local transcription before retrying",
+                ));
+            }
+            let checkpoint = g
+                .tuning_checkpoint
+                .clone()
+                .ok_or_else(|| AppError::from("No active Tuning checkpoint"))?;
+            let progress = checkpoint
+                .reading_progress()
+                .ok_or_else(|| AppError::from("No current Tuning Phrase to retry"))?;
+            (
+                g.tuning_store.clone(),
+                checkpoint.clone(),
+                checkpoint.stage(),
+                progress.phrase_id,
+            )
+        };
+        let retried = store
+            .discard_current_attempt(&checkpoint)
+            .map_err(AppError::from)?;
+        let mut g = self.inner.lock();
+        g.tuning_attempt_generation = g.tuning_attempt_generation.wrapping_add(1);
+        g.tuning_recording.take();
+        g.tuning_activity = TuningActivity::Idle;
+        g.tuning_last_error = None;
+        append_phrase_diagnostic(
+            &mut g,
+            &retried,
+            TuningEventKind::PhraseAttempt,
+            stage,
+            TuningOutcomeCode::Discarded,
+            &phrase_id,
+            None,
+        );
+        g.tuning_checkpoint = Some(retried);
+        Ok(drop_and_tuning_snapshot(g, self))
+    }
+
+    pub fn tuning_defer_phrase(&self) -> AppResult<TuningSnapshot> {
+        let (store, checkpoint, stage, phrase_id) = {
+            let g = self.inner.lock();
+            if g.tuning_activity != TuningActivity::Idle {
+                return Err(AppError::from(
+                    "Retry the current attempt before choosing Do later",
+                ));
+            }
+            let checkpoint = g
+                .tuning_checkpoint
+                .clone()
+                .ok_or_else(|| AppError::from("No active Tuning checkpoint"))?;
+            let progress = checkpoint
+                .reading_progress()
+                .ok_or_else(|| AppError::from("No current Tuning Phrase to defer"))?;
+            (
+                g.tuning_store.clone(),
+                checkpoint.clone(),
+                checkpoint.stage(),
+                progress.phrase_id,
+            )
+        };
+        let deferred = store
+            .defer_current_phrase(&checkpoint)
+            .map_err(AppError::from)?;
+        let mut g = self.inner.lock();
+        append_phrase_diagnostic(
+            &mut g,
+            &deferred,
+            TuningEventKind::PhraseAttempt,
+            stage,
+            TuningOutcomeCode::Deferred,
+            &phrase_id,
+            None,
+        );
+        g.tuning_checkpoint = Some(deferred);
+        g.tuning_last_error = None;
+        Ok(drop_and_tuning_snapshot(g, self))
     }
 
     pub fn tuning_leave(&self) -> TuningSnapshot {
@@ -2145,6 +2455,58 @@ mod tests {
         assert_eq!(rail[6].id, TuningStage::Result);
         assert_eq!(rail[6].state, TuningStageState::Remaining);
     }
+
+    #[test]
+    fn reading_snapshot_exposes_only_prompt_progress_until_review() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("eaglescribe-reading-snapshot-{nanos}"))
+            .join("checkpoint.json");
+        let store = TuningCheckpointStore::new(path);
+        let started = store
+            .start(CompatibilityEnvelope::current(
+                RecognitionFingerprint::from_stable_id("snapshot-test"),
+            ))
+            .unwrap();
+        let mut checkpoint = store.complete_practice(&started).unwrap();
+        let state = test_state();
+        {
+            let mut g = state.inner.lock();
+            g.tuning_store = store.clone();
+            g.tuning_checkpoint = Some(checkpoint.clone());
+            g.tuning_session_active = true;
+            g.tuning_screen_active = true;
+        }
+
+        let reading = state.tuning_snapshot();
+        assert_eq!(reading.last_durable_stage, Some(TuningStage::FirstReading));
+        assert_eq!(reading.phrase_id.as_deref(), Some("T01"));
+        assert_eq!(reading.phrase_position, Some(1));
+        assert_eq!(reading.phrase_total, Some(10));
+        assert_eq!(reading.candidate_count, None);
+
+        while checkpoint.stage() != TuningStage::Review {
+            let progress = checkpoint.reading_progress().unwrap();
+            let transcript = if progress.phrase_id == "T01" {
+                "That quick chip carries heavy blue boxes"
+            } else {
+                progress.phrase_text
+            };
+            checkpoint = store.complete_reading(&checkpoint, transcript).unwrap();
+        }
+        {
+            state.inner.lock().tuning_checkpoint = Some(checkpoint);
+        }
+        let review = state.tuning_snapshot();
+        assert_eq!(review.last_durable_stage, Some(TuningStage::Review));
+        assert_eq!(review.phrase_id, None);
+        assert_eq!(review.phrase_text, None);
+        assert_eq!(review.candidate_count, Some(1));
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2245,6 +2607,14 @@ pub struct TuningSnapshot {
     pub incompatible_reason: Option<String>,
     pub error: Option<String>,
     pub practice_prompt: &'static str,
+    pub reading_pass: Option<ReadingPass>,
+    pub phrase_id: Option<String>,
+    pub phrase_text: Option<&'static str>,
+    pub phrase_position: Option<usize>,
+    pub phrase_total: Option<usize>,
+    /// Deliberately absent throughout both reading stages. Review is the first
+    /// stage that may reveal whether Candidate Corrections exist.
+    pub candidate_count: Option<usize>,
     pub stages: Vec<TuningStageSnapshot>,
 }
 
@@ -2261,6 +2631,70 @@ fn append_tuning_diagnostic(g: &mut InnerState, event: TuningDiagnosticEvent) {
     // no speech-content or arbitrary-metadata fields, and a write failure can
     // never change checkpoint/session outcomes.
     let _ = g.tuning_diagnostics.append(event, unix_time_ms());
+}
+
+fn append_phrase_diagnostic(
+    g: &mut InnerState,
+    checkpoint: &TuningCheckpoint,
+    kind: TuningEventKind,
+    stage: TuningStage,
+    outcome: TuningOutcomeCode,
+    phrase_id: &str,
+    reason: Option<TuningReasonCode>,
+) {
+    let mut event = TuningDiagnosticEvent::new(
+        unix_time_ms(),
+        checkpoint.session_id().clone(),
+        kind,
+        stage,
+        outcome,
+    );
+    if let Some(reason) = reason {
+        event = event.with_reason(reason);
+    }
+    if let Ok(event) = event.with_phrase(phrase_id) {
+        append_tuning_diagnostic(g, event);
+    }
+}
+
+fn append_inference_diagnostics(g: &mut InnerState, checkpoint: &TuningCheckpoint) {
+    for result in checkpoint.inference_results() {
+        let outcome = match result.decision {
+            crate::tuning::InferenceDecision::Candidate(_) => TuningOutcomeCode::Proposed,
+            crate::tuning::InferenceDecision::Rejected => TuningOutcomeCode::Rejected,
+        };
+        let mut event = TuningDiagnosticEvent::new(
+            unix_time_ms(),
+            checkpoint.session_id().clone(),
+            TuningEventKind::CandidateDecision,
+            TuningStage::SecondReading,
+            outcome,
+        );
+        for reason in &result.aggregate_reason_codes {
+            event = event.with_reason(inference_reason_code(*reason));
+        }
+        if let crate::tuning::InferenceDecision::Candidate(candidate) = &result.decision {
+            if let Ok(with_probe) = event.clone().with_probe(&candidate.probe_span_id) {
+                event = with_probe;
+            }
+        }
+        if let Ok(event) = event.with_phrase(&result.phrase_id) {
+            append_tuning_diagnostic(g, event);
+        }
+    }
+}
+
+fn inference_reason_code(reason: crate::tuning::ReasonCode) -> TuningReasonCode {
+    match reason {
+        crate::tuning::ReasonCode::NoMismatch => TuningReasonCode::NoMismatch,
+        crate::tuning::ReasonCode::MissingContext => TuningReasonCode::MissingContext,
+        crate::tuning::ReasonCode::InsertionOrDeletion => TuningReasonCode::InsertionOrDeletion,
+        crate::tuning::ReasonCode::MultipleHunks => TuningReasonCode::MultipleHunks,
+        crate::tuning::ReasonCode::OutsideEligibleSpan => TuningReasonCode::OutsideEligibleSpan,
+        crate::tuning::ReasonCode::SpanMappingFailed => TuningReasonCode::SpanMappingFailed,
+        crate::tuning::ReasonCode::SingleWordSource => TuningReasonCode::SingleWordSource,
+        crate::tuning::ReasonCode::ReadingsDisagree => TuningReasonCode::ReadingsDisagree,
+    }
 }
 
 fn tuning_stage_snapshots(current: Option<TuningStage>) -> Vec<TuningStageSnapshot> {
