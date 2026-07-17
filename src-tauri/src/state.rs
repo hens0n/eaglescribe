@@ -388,6 +388,10 @@ impl AppState {
         }
     }
 
+    // TUNING_PRIVACY_BOUNDARY_BEGIN
+    // Keep the Tuning Session command path inside this boundary. The
+    // deterministic CI privacy gate audits it for free-form output and network
+    // capabilities in addition to exercising captured runtime channels.
     pub fn tuning_snapshot(&self) -> TuningSnapshot {
         let g = self.inner.lock();
         let mode = if g.tuning_incompatible_reason.is_some() {
@@ -2052,6 +2056,7 @@ impl AppState {
             .with_reason(reason),
         );
     }
+    // TUNING_PRIVACY_BOUNDARY_END
 
     /// Persist first-run checklist dismiss (Settings re-open still works).
     pub fn set_onboarding_dismissed(&self, dismissed: bool) -> AppResult<()> {
