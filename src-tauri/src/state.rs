@@ -17,12 +17,14 @@ use crate::settings::{self, AppSettings, HotkeyMode};
 use crate::snippets::{self, Snippet, SnippetBook};
 use crate::stt::{self, WhisperEngine};
 use crate::tuning_diagnostics::{
-    self, EventKind as TuningEventKind, OutcomeCode as TuningOutcomeCode,
+    self, CountKind as TuningCountKind, EventKind as TuningEventKind,
+    OutcomeCode as TuningOutcomeCode,
     ReasonCode as TuningReasonCode, TuningDiagnosticEvent, TuningDiagnosticsStore, TuningStage,
 };
 use crate::tuning_session::{
-    self, CheckpointState, CompatibilityEnvelope, ReadingPass, TuningCheckpoint,
-    TuningCheckpointStore,
+    self, ambiguous_phrase_ids, review_explanations, AlreadyCoveredRow, CheckpointState,
+    CompatibilityEnvelope, ReadingPass, ReviewDecision, ReviewExplanation, ReviewRow,
+    TuningCheckpoint, TuningCheckpointStore, UnchangedResultReason,
 };
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -94,6 +96,9 @@ struct InnerState {
     history: HistoryBook,
     tuning_store: TuningCheckpointStore,
     tuning_checkpoint: Option<TuningCheckpoint>,
+    /// Ephemeral receipt for a completed unchanged session. The durable
+    /// checkpoint and all derived evidence have already been deleted.
+    tuning_terminal_result: Option<UnchangedResultReason>,
     tuning_checkpoint_compatible: bool,
     tuning_incompatible_reason: Option<String>,
     tuning_session_active: bool,
@@ -175,6 +180,7 @@ impl AppState {
                 history,
                 tuning_store,
                 tuning_checkpoint: None,
+                tuning_terminal_result: None,
                 tuning_checkpoint_compatible: false,
                 tuning_incompatible_reason: None,
                 tuning_session_active: false,
@@ -348,6 +354,11 @@ impl AppState {
         let g = self.inner.lock();
         let mode = if g.tuning_incompatible_reason.is_some() {
             TuningViewMode::Incompatible
+        } else if g.tuning_terminal_result.is_some()
+            && g.tuning_session_active
+            && g.tuning_screen_active
+        {
+            TuningViewMode::Active
         } else if g.tuning_checkpoint.is_none() {
             TuningViewMode::Ready
         } else if g.tuning_session_active && g.tuning_screen_active {
@@ -355,7 +366,10 @@ impl AppState {
         } else {
             TuningViewMode::Resume
         };
-        let durable_stage = g.tuning_checkpoint.as_ref().map(TuningCheckpoint::stage);
+        let durable_stage = g
+            .tuning_terminal_result
+            .map(|_| TuningStage::Result)
+            .or_else(|| g.tuning_checkpoint.as_ref().map(TuningCheckpoint::stage));
         let reading_progress = g
             .tuning_checkpoint
             .as_ref()
@@ -363,6 +377,16 @@ impl AppState {
         let candidate_count = g.tuning_checkpoint.as_ref().and_then(|checkpoint| {
             (checkpoint.stage() == TuningStage::Review).then(|| checkpoint.candidate_count())
         });
+        let review = g
+            .tuning_checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.stage() == TuningStage::Review)
+            .map(TuningCheckpoint::review);
+        let verify_not_needed = g.tuning_terminal_result.is_some()
+            || g.tuning_checkpoint.as_ref().is_some_and(|checkpoint| {
+                checkpoint.stage() == TuningStage::Result
+                    && checkpoint.unchanged_result_reason().is_some()
+            });
         TuningSnapshot {
             mode,
             activity: g.tuning_activity,
@@ -383,7 +407,33 @@ impl AppState {
             phrase_position: reading_progress.as_ref().map(|progress| progress.position),
             phrase_total: reading_progress.as_ref().map(|progress| progress.total),
             candidate_count,
-            stages: tuning_stage_snapshots(durable_stage),
+            review_rows: review.map(|review| review.rows.clone()).unwrap_or_default(),
+            already_covered: review
+                .map(|review| review.already_covered.clone())
+                .unwrap_or_default(),
+            review_explanations: g
+                .tuning_checkpoint
+                .as_ref()
+                .filter(|checkpoint| checkpoint.stage() == TuningStage::Review)
+                .map(|checkpoint| review_explanations(checkpoint.inference_results()))
+                .unwrap_or_default(),
+            review_complete: g
+                .tuning_checkpoint
+                .as_ref()
+                .is_some_and(TuningCheckpoint::review_complete),
+            staged_rule_count: g
+                .tuning_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.staged_rules().len())
+                .unwrap_or(0),
+            unchanged_result_reason: g
+                .tuning_terminal_result
+                .or_else(|| {
+                    g.tuning_checkpoint
+                        .as_ref()
+                        .and_then(TuningCheckpoint::unchanged_result_reason)
+                }),
+            stages: tuning_stage_snapshots(durable_stage, verify_not_needed),
         }
     }
 
@@ -396,6 +446,7 @@ impl AppState {
             g.tuning_session_active = false;
             g.tuning_checkpoint_compatible = false;
             g.tuning_last_error = None;
+            g.tuning_terminal_result = None;
             g.tuning_store.clone()
         };
         let saved = match store.load_saved() {
@@ -428,7 +479,7 @@ impl AppState {
         let mut g = self.inner.lock();
         match store.inspect(&envelope) {
             CheckpointState::Compatible(checkpoint) => {
-                g.tuning_checkpoint = Some(checkpoint);
+                g.tuning_checkpoint = Some(*checkpoint);
                 g.tuning_checkpoint_compatible = true;
                 g.tuning_incompatible_reason = None;
             }
@@ -492,6 +543,7 @@ impl AppState {
             g.tuning_session_active = false;
             g.tuning_activity = TuningActivity::Preflight;
             g.tuning_last_error = None;
+            g.tuning_terminal_result = None;
         }
 
         if let Err(error) = self.ensure_engine() {
@@ -842,7 +894,17 @@ impl AppState {
         self: &Arc<Self>,
         app: &AppHandle<R>,
     ) -> AppResult<TuningSnapshot> {
-        let (recording, checkpoint, store, engine, options, generation, stage, phrase_id) = {
+        let (
+            recording,
+            checkpoint,
+            store,
+            engine,
+            options,
+            generation,
+            stage,
+            phrase_id,
+            dictionary,
+        ) = {
             let mut g = self.inner.lock();
             if g.tuning_activity != TuningActivity::Recording {
                 return Err(AppError::from("A Tuning Phrase is not recording"));
@@ -875,6 +937,7 @@ impl AppState {
                 g.tuning_attempt_generation,
                 checkpoint.stage(),
                 progress.phrase_id,
+                g.dictionary.clone(),
             )
         };
         let app_bg = app.clone();
@@ -897,7 +960,11 @@ impl AppState {
             match recognition {
                 Ok(recognition) => {
                     let raw_transcript = recognition.transcript;
-                    match store.complete_reading(&checkpoint, &raw_transcript) {
+                    match store.complete_reading_with_dictionary(
+                        &checkpoint,
+                        &raw_transcript,
+                        &dictionary,
+                    ) {
                         Ok(completed) => {
                             drop(raw_transcript);
                             append_phrase_diagnostic(
@@ -1055,6 +1122,107 @@ impl AppState {
         Ok(drop_and_tuning_snapshot(g, self))
     }
 
+    pub fn tuning_review_decision(
+        &self,
+        row_id: &str,
+        decision: ReviewDecision,
+    ) -> AppResult<TuningSnapshot> {
+        let mut g = self.inner.lock();
+        if !g.tuning_session_active || !g.tuning_screen_active {
+            return Err(AppError::from("Resume Tuning before changing Review decisions"));
+        }
+        let checkpoint = g
+            .tuning_checkpoint
+            .clone()
+            .ok_or_else(|| AppError::from("No active Tuning checkpoint"))?;
+        let supporting_count = checkpoint
+            .review()
+            .rows
+            .iter()
+            .find(|row| row.id == row_id)
+            .map(|row| row.supporting_phrase_ids.len())
+            .ok_or_else(|| AppError::from("The Candidate Correction is no longer in Review"))?;
+        let decided = g
+            .tuning_store
+            .record_review_decision(&checkpoint, row_id, decision)
+            .map_err(AppError::from)?;
+        let outcome = match decision {
+            ReviewDecision::Approve => TuningOutcomeCode::Approved,
+            ReviewDecision::Decline => TuningOutcomeCode::Declined,
+            ReviewDecision::KeepExisting => TuningOutcomeCode::KeepExisting,
+            ReviewDecision::VerifyReplacement => TuningOutcomeCode::VerifyReplacement,
+        };
+        append_tuning_diagnostic(
+            &mut g,
+            TuningDiagnosticEvent::new(
+                unix_time_ms(),
+                decided.session_id().clone(),
+                TuningEventKind::CandidateDecision,
+                TuningStage::Review,
+                outcome,
+            )
+            .with_count(TuningCountKind::SupportingPhrases, supporting_count as u64),
+        );
+        g.tuning_checkpoint = Some(decided);
+        g.tuning_last_error = None;
+        Ok(drop_and_tuning_snapshot(g, self))
+    }
+
+    pub fn tuning_continue_review(&self) -> AppResult<TuningSnapshot> {
+        let mut g = self.inner.lock();
+        if !g.tuning_session_active || !g.tuning_screen_active {
+            return Err(AppError::from("Resume Tuning before leaving Review"));
+        }
+        let checkpoint = g
+            .tuning_checkpoint
+            .clone()
+            .ok_or_else(|| AppError::from("No active Tuning checkpoint"))?;
+        let continued = g
+            .tuning_store
+            .continue_review(&checkpoint)
+            .map_err(AppError::from)?;
+        append_tuning_diagnostic(
+            &mut g,
+            TuningDiagnosticEvent::new(
+                unix_time_ms(),
+                continued.session_id().clone(),
+                TuningEventKind::StageCompleted,
+                TuningStage::Review,
+                TuningOutcomeCode::Completed,
+            ),
+        );
+        if continued.stage() == TuningStage::Result {
+            let outcome = match continued.unchanged_result_reason() {
+                Some(UnchangedResultReason::NoSafeCorrectionsFound) => {
+                    TuningOutcomeCode::NoSafeCorrections
+                }
+                Some(UnchangedResultReason::AlreadyCoveredByPersonalDictionary) => {
+                    TuningOutcomeCode::AlreadyCovered
+                }
+                Some(UnchangedResultReason::CandidateCorrectionsFoundButNoneApproved) => {
+                    TuningOutcomeCode::NoneApproved
+                }
+                None => TuningOutcomeCode::Completed,
+            };
+            append_tuning_diagnostic(
+                &mut g,
+                TuningDiagnosticEvent::new(
+                    unix_time_ms(),
+                    continued.session_id().clone(),
+                    TuningEventKind::SessionCompleted,
+                    TuningStage::Result,
+                    outcome,
+                ),
+            );
+            g.tuning_terminal_result = continued.unchanged_result_reason();
+            g.tuning_checkpoint = None;
+        } else {
+            g.tuning_checkpoint = Some(continued);
+        }
+        g.tuning_last_error = None;
+        Ok(drop_and_tuning_snapshot(g, self))
+    }
+
     pub fn tuning_leave(&self) -> TuningSnapshot {
         let mut g = self.inner.lock();
         let was_active = g.tuning_session_active;
@@ -1066,6 +1234,7 @@ impl AppState {
         }
         g.tuning_screen_active = false;
         g.tuning_session_active = false;
+        g.tuning_terminal_result = None;
         if was_active {
             let checkpoint = g.tuning_checkpoint.clone();
             if let Some(checkpoint) = checkpoint {
@@ -2445,7 +2614,7 @@ mod tests {
 
     #[test]
     fn tuning_stage_rail_is_complete_ordered_and_not_navigation() {
-        let rail = tuning_stage_snapshots(Some(TuningStage::Practice));
+        let rail = tuning_stage_snapshots(Some(TuningStage::Practice), false);
 
         assert_eq!(rail.len(), 7);
         assert_eq!(rail[0].id, TuningStage::Ready);
@@ -2506,6 +2675,92 @@ mod tests {
         assert_eq!(review.phrase_id, None);
         assert_eq!(review.phrase_text, None);
         assert_eq!(review.candidate_count, Some(1));
+        assert_eq!(review.review_rows.len(), 1);
+        assert_eq!(review.review_rows[0].from, "quick chip");
+        assert!(!review.review_complete);
+    }
+
+    #[test]
+    fn review_decisions_are_durable_and_no_approval_leaves_dictionary_unchanged() {
+        use std::sync::Barrier;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("eaglescribe-review-state-{nanos}"))
+            .join("checkpoint.json");
+        let store = TuningCheckpointStore::new(path.clone());
+        let started = store
+            .start(CompatibilityEnvelope::current(
+                RecognitionFingerprint::from_stable_id("snapshot-test"),
+            ))
+            .unwrap();
+        let mut checkpoint = store.complete_practice(&started).unwrap();
+        while checkpoint.stage() != TuningStage::Review {
+            let progress = checkpoint.reading_progress().unwrap();
+            let transcript = match progress.phrase_id.as_str() {
+                "T01" => "That quick chip carries heavy blue boxes",
+                "T05" => "She found a good blue book up stairs",
+                _ => progress.phrase_text,
+            };
+            checkpoint = store.complete_reading(&checkpoint, transcript).unwrap();
+        }
+        let state = Arc::new(test_state());
+        let dictionary_before = {
+            let mut g = state.inner.lock();
+            g.tuning_store = store;
+            g.tuning_checkpoint = Some(checkpoint);
+            g.tuning_session_active = true;
+            g.tuning_screen_active = true;
+            g.dictionary.clone()
+        };
+        let row_ids: Vec<_> = state
+            .tuning_snapshot()
+            .review_rows
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        assert_eq!(row_ids.len(), 2);
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = row_ids
+            .into_iter()
+            .map(|row_id| {
+                let state = Arc::clone(&state);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state
+                        .tuning_review_decision(
+                            &row_id,
+                            crate::tuning_session::ReviewDecision::Decline,
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let decided = state.tuning_snapshot();
+        assert!(decided.review_complete);
+        let result = state.tuning_continue_review().unwrap();
+
+        assert_eq!(result.last_durable_stage, Some(TuningStage::Result));
+        assert_eq!(
+            result.unchanged_result_reason,
+            Some(crate::tuning_session::UnchangedResultReason::CandidateCorrectionsFoundButNoneApproved)
+        );
+        assert_eq!(result.stages[5].id, TuningStage::Verify);
+        assert_eq!(result.stages[5].state, TuningStageState::NotNeeded);
+        assert!(!path.exists());
+        let g = state.inner.lock();
+        assert!(g.tuning_checkpoint.is_none());
+        assert_eq!(g.tuning_terminal_result, result.unchanged_result_reason);
+        assert_eq!(g.dictionary.revision, dictionary_before.revision);
+        assert_eq!(g.dictionary.entries, dictionary_before.entries);
     }
 }
 
@@ -2588,6 +2843,7 @@ pub enum TuningStageState {
     Completed,
     Current,
     Remaining,
+    NotNeeded,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2615,6 +2871,12 @@ pub struct TuningSnapshot {
     /// Deliberately absent throughout both reading stages. Review is the first
     /// stage that may reveal whether Candidate Corrections exist.
     pub candidate_count: Option<usize>,
+    pub review_rows: Vec<ReviewRow>,
+    pub already_covered: Vec<AlreadyCoveredRow>,
+    pub review_explanations: Vec<ReviewExplanation>,
+    pub review_complete: bool,
+    pub staged_rule_count: usize,
+    pub unchanged_result_reason: Option<UnchangedResultReason>,
     pub stages: Vec<TuningStageSnapshot>,
 }
 
@@ -2658,8 +2920,11 @@ fn append_phrase_diagnostic(
 }
 
 fn append_inference_diagnostics(g: &mut InnerState, checkpoint: &TuningCheckpoint) {
+    let ambiguous = ambiguous_phrase_ids(checkpoint.inference_results());
     for result in checkpoint.inference_results() {
+        let context_ambiguous = ambiguous.contains(&result.phrase_id);
         let outcome = match result.decision {
+            _ if context_ambiguous => TuningOutcomeCode::Rejected,
             crate::tuning::InferenceDecision::Candidate(_) => TuningOutcomeCode::Proposed,
             crate::tuning::InferenceDecision::Rejected => TuningOutcomeCode::Rejected,
         };
@@ -2671,7 +2936,7 @@ fn append_inference_diagnostics(g: &mut InnerState, checkpoint: &TuningCheckpoin
             outcome,
         );
         for reason in &result.aggregate_reason_codes {
-            event = event.with_reason(inference_reason_code(*reason));
+            event = event.with_reason((*reason).into());
         }
         if let crate::tuning::InferenceDecision::Candidate(candidate) = &result.decision {
             if let Ok(with_probe) = event.clone().with_probe(&candidate.probe_span_id) {
@@ -2684,20 +2949,10 @@ fn append_inference_diagnostics(g: &mut InnerState, checkpoint: &TuningCheckpoin
     }
 }
 
-fn inference_reason_code(reason: crate::tuning::ReasonCode) -> TuningReasonCode {
-    match reason {
-        crate::tuning::ReasonCode::NoMismatch => TuningReasonCode::NoMismatch,
-        crate::tuning::ReasonCode::MissingContext => TuningReasonCode::MissingContext,
-        crate::tuning::ReasonCode::InsertionOrDeletion => TuningReasonCode::InsertionOrDeletion,
-        crate::tuning::ReasonCode::MultipleHunks => TuningReasonCode::MultipleHunks,
-        crate::tuning::ReasonCode::OutsideEligibleSpan => TuningReasonCode::OutsideEligibleSpan,
-        crate::tuning::ReasonCode::SpanMappingFailed => TuningReasonCode::SpanMappingFailed,
-        crate::tuning::ReasonCode::SingleWordSource => TuningReasonCode::SingleWordSource,
-        crate::tuning::ReasonCode::ReadingsDisagree => TuningReasonCode::ReadingsDisagree,
-    }
-}
-
-fn tuning_stage_snapshots(current: Option<TuningStage>) -> Vec<TuningStageSnapshot> {
+fn tuning_stage_snapshots(
+    current: Option<TuningStage>,
+    verify_not_needed: bool,
+) -> Vec<TuningStageSnapshot> {
     const STAGES: [(TuningStage, &str); 7] = [
         (TuningStage::Ready, "Ready"),
         (TuningStage::Practice, "Practice"),
@@ -2710,12 +2965,17 @@ fn tuning_stage_snapshots(current: Option<TuningStage>) -> Vec<TuningStageSnapsh
     STAGES
         .into_iter()
         .map(|(id, label)| {
-            let state = match current {
-                Some(active) if id < active => TuningStageState::Completed,
-                Some(active) if id == active => TuningStageState::Current,
-                Some(_) => TuningStageState::Remaining,
-                None if id == TuningStage::Ready => TuningStageState::Current,
-                None => TuningStageState::Remaining,
+            let (label, state) = if id == TuningStage::Verify && verify_not_needed {
+                ("Verify · Not needed", TuningStageState::NotNeeded)
+            } else {
+                let state = match current {
+                    Some(active) if id < active => TuningStageState::Completed,
+                    Some(active) if id == active => TuningStageState::Current,
+                    Some(_) => TuningStageState::Remaining,
+                    None if id == TuningStage::Ready => TuningStageState::Current,
+                    None => TuningStageState::Remaining,
+                };
+                (label, state)
             };
             TuningStageSnapshot { id, label, state }
         })

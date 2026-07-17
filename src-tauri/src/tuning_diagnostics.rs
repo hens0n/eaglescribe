@@ -238,6 +238,21 @@ impl ReasonCode {
     }
 }
 
+impl From<crate::tuning::ReasonCode> for ReasonCode {
+    fn from(reason: crate::tuning::ReasonCode) -> Self {
+        match reason {
+            crate::tuning::ReasonCode::NoMismatch => Self::NoMismatch,
+            crate::tuning::ReasonCode::ReadingsDisagree => Self::ReadingsDisagree,
+            crate::tuning::ReasonCode::MissingContext => Self::MissingContext,
+            crate::tuning::ReasonCode::MultipleHunks => Self::MultipleHunks,
+            crate::tuning::ReasonCode::InsertionOrDeletion => Self::InsertionOrDeletion,
+            crate::tuning::ReasonCode::SpanMappingFailed => Self::SpanMappingFailed,
+            crate::tuning::ReasonCode::OutsideEligibleSpan => Self::OutsideEligibleSpan,
+            crate::tuning::ReasonCode::SingleWordSource => Self::SingleWordSource,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CountKind {

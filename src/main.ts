@@ -70,6 +70,33 @@ type TuningStage =
   | "result";
 type TuningActivity = "idle" | "preflight" | "recording" | "transcribing";
 type TuningViewMode = "ready" | "resume" | "active" | "incompatible";
+type ReviewDecision =
+  | "approve"
+  | "decline"
+  | "keep_existing"
+  | "verify_replacement";
+
+interface TuningReviewRow {
+  id: string;
+  from: string;
+  to: string;
+  supporting_phrase_ids: string[];
+  kind: "candidate" | "verify_existing" | "conflict";
+  existing_entry: {
+    id: string;
+    version: number;
+    from: string;
+    to: string;
+  } | null;
+  decision: ReviewDecision | null;
+}
+
+interface TuningCoveredRow {
+  from: string;
+  to: string;
+  supporting_phrase_ids: string[];
+  existing_entry_id: string;
+}
 
 interface TuningSnapshot {
   mode: TuningViewMode;
@@ -86,10 +113,20 @@ interface TuningSnapshot {
   phrase_position: number | null;
   phrase_total: number | null;
   candidate_count: number | null;
+  review_rows: TuningReviewRow[];
+  already_covered: TuningCoveredRow[];
+  review_explanations: { meaning: string; count: number }[];
+  review_complete: boolean;
+  staged_rule_count: number;
+  unchanged_result_reason:
+    | "no_safe_corrections_found"
+    | "already_covered_by_personal_dictionary"
+    | "candidate_corrections_found_but_none_approved"
+    | null;
   stages: {
     id: TuningStage;
     label: string;
-    state: "completed" | "current" | "remaining";
+    state: "completed" | "current" | "remaining" | "not_needed";
   }[];
 }
 
@@ -295,6 +332,13 @@ const els = {
     document.querySelector("#tuning-practice-prompt") as HTMLElement,
   tuningPhrasePosition: () =>
     document.querySelector("#tuning-phrase-position") as HTMLElement,
+  tuningReview: () => document.querySelector("#tuning-review") as HTMLElement,
+  tuningReviewRows: () =>
+    document.querySelector("#tuning-review-rows") as HTMLElement,
+  tuningAlreadyCovered: () =>
+    document.querySelector("#tuning-already-covered") as HTMLElement,
+  tuningReviewExplanations: () =>
+    document.querySelector("#tuning-review-explanations") as HTMLElement,
   btnTuningStart: () =>
     document.querySelector("#btn-tuning-start") as HTMLButtonElement,
   btnTuningResume: () =>
@@ -309,6 +353,8 @@ const els = {
     document.querySelector("#btn-tuning-retry-phrase") as HTMLButtonElement,
   btnTuningDoLater: () =>
     document.querySelector("#btn-tuning-do-later") as HTMLButtonElement,
+  btnTuningContinueReview: () =>
+    document.querySelector("#btn-tuning-continue-review") as HTMLButtonElement,
 };
 
 /**
@@ -965,6 +1011,138 @@ function formatTuningStage(stage: TuningStage | null): string {
   }
 }
 
+async function submitTuningReviewDecision(
+  rowId: string,
+  decision: ReviewDecision,
+) {
+  try {
+    applyTuningStatus(
+      await invoke<TuningSnapshot>("tuning_review_decision", {
+        rowId,
+        decision,
+      }),
+    );
+  } catch (error) {
+    console.error(error);
+    alert(String(error));
+    applyTuningStatus(await invoke<TuningSnapshot>("get_tuning_status"));
+  }
+}
+
+function mappingLine(label: string, from: string, to: string): HTMLElement {
+  const line = document.createElement("p");
+  line.className = "tuning-review-mapping";
+  const prefix = document.createElement("span");
+  prefix.textContent = `${label}: `;
+  const source = document.createElement("code");
+  source.textContent = from;
+  const arrow = document.createTextNode(" → ");
+  const target = document.createElement("code");
+  target.textContent = to;
+  line.append(prefix, source, arrow, target);
+  return line;
+}
+
+function renderTuningReview(s: TuningSnapshot) {
+  const rows = els.tuningReviewRows();
+  const covered = els.tuningAlreadyCovered();
+  const explanations = els.tuningReviewExplanations();
+  rows.replaceChildren();
+  covered.replaceChildren();
+  explanations.replaceChildren();
+
+  if (s.review_rows.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "hint tight";
+    empty.textContent = "No actionable Candidate Corrections need a decision.";
+    rows.appendChild(empty);
+  }
+
+  for (const row of s.review_rows) {
+    const card = document.createElement("section");
+    card.className = "tuning-review-row";
+    const heading = document.createElement("h3");
+    heading.textContent =
+      row.kind === "verify_existing"
+        ? "Verify existing rule for this model"
+        : row.kind === "conflict"
+          ? "Personal Dictionary conflict"
+          : "Candidate Correction";
+    card.appendChild(heading);
+    card.appendChild(mappingLine("Recognized → intended", row.from, row.to));
+    const evidence = document.createElement("p");
+    evidence.className = "hint tight";
+    evidence.textContent = `Repeated in both readings · supported by ${row.supporting_phrase_ids.length} Tuning Phrase${row.supporting_phrase_ids.length === 1 ? "" : "s"}`;
+    card.appendChild(evidence);
+    if (row.existing_entry) {
+      card.appendChild(
+        mappingLine(
+          "Existing Personal Dictionary mapping",
+          row.existing_entry.from,
+          row.existing_entry.to,
+        ),
+      );
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "row tuning-review-actions";
+    const choices: { decision: ReviewDecision; label: string }[] =
+      row.kind === "conflict"
+        ? [
+            { decision: "keep_existing", label: "Keep existing" },
+            {
+              decision: "verify_replacement",
+              label: "Verify proposed replacement",
+            },
+          ]
+        : [
+            {
+              decision: "approve",
+              label:
+                row.kind === "verify_existing"
+                  ? "Approve and verify"
+                  : "Approve",
+            },
+            { decision: "decline", label: "Decline" },
+          ];
+    for (const choice of choices) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = choice.decision === row.decision ? "primary" : "secondary";
+      button.textContent = choice.label;
+      button.setAttribute("aria-pressed", String(choice.decision === row.decision));
+      button.addEventListener("click", () => {
+        void submitTuningReviewDecision(row.id, choice.decision);
+      });
+      actions.appendChild(button);
+    }
+    card.appendChild(actions);
+    rows.appendChild(card);
+  }
+
+  for (const item of s.already_covered) {
+    const card = document.createElement("section");
+    card.className = "tuning-review-row covered";
+    const heading = document.createElement("h3");
+    heading.textContent = "Already covered by Personal Dictionary";
+    card.append(heading, mappingLine("Mapping", item.from, item.to));
+    covered.appendChild(card);
+  }
+
+  if (s.review_explanations.length > 0) {
+    const heading = document.createElement("h3");
+    heading.textContent = "Other reading outcomes";
+    explanations.appendChild(heading);
+    const list = document.createElement("ul");
+    for (const explanation of s.review_explanations) {
+      const item = document.createElement("li");
+      item.textContent = `${explanation.meaning}: ${explanation.count}`;
+      list.appendChild(item);
+    }
+    explanations.appendChild(list);
+  }
+}
+
 function applyTuningStatus(s: TuningSnapshot) {
   tuningScreenActive = s.screen_active;
   tuningActivity = s.activity;
@@ -992,6 +1170,8 @@ function applyTuningStatus(s: TuningSnapshot) {
   els.btnTuningReading().hidden = true;
   els.btnTuningRetryPhrase().hidden = true;
   els.btnTuningDoLater().hidden = true;
+  els.btnTuningContinueReview().hidden = true;
+  els.tuningReview().hidden = true;
   els.tuningPracticePrompt().hidden = true;
   els.tuningPhrasePosition().hidden = true;
 
@@ -1034,10 +1214,30 @@ function applyTuningStatus(s: TuningSnapshot) {
     message = "Read naturally. This is the full rotated second pass.";
   } else if (active && s.last_durable_stage === "review") {
     title = "Review";
-    const count = s.candidate_count ?? 0;
-    message = count === 1
-      ? "Both reading passes are complete. 1 Candidate Correction is ready for Review."
-      : `Both reading passes are complete. ${count} Candidate Corrections are ready for Review.`;
+    els.tuningReview().hidden = false;
+    renderTuningReview(s);
+    els.btnTuningContinueReview().hidden = false;
+    els.btnTuningContinueReview().disabled = !s.review_complete;
+    const approved = s.review_rows.some((row) =>
+      row.decision === "approve" || row.decision === "verify_replacement"
+    );
+    els.btnTuningContinueReview().textContent = approved
+      ? "Continue to verification"
+      : "Continue to results";
+    message = s.review_complete
+      ? "Every actionable row has an explicit decision."
+      : "Choose an explicit decision for every actionable row to continue.";
+  } else if (active && s.last_durable_stage === "verify") {
+    title = "Verify";
+    message = `${s.staged_rule_count} approved Correction Rule${s.staged_rule_count === 1 ? " is" : "s are"} ready for the required Verification Pass.`;
+  } else if (active && s.last_durable_stage === "result") {
+    title = "Result";
+    message =
+      s.unchanged_result_reason === "already_covered_by_personal_dictionary"
+        ? "No changes were needed. The Candidate Corrections are already covered by Personal Dictionary."
+        : s.unchanged_result_reason === "candidate_corrections_found_but_none_approved"
+          ? "Personal Dictionary unchanged — Candidate Corrections were found, but none were approved."
+          : "Personal Dictionary unchanged — no safe corrections were found.";
   }
 
   const readingStage =
@@ -1433,6 +1633,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   els.btnTuningDoLater().addEventListener("click", () => {
     void invokeTuning("tuning_defer_phrase");
+  });
+  els.btnTuningContinueReview().addEventListener("click", () => {
+    void invokeTuning("tuning_continue_review");
   });
 
   els.btnSetupDismiss().addEventListener("click", () => {

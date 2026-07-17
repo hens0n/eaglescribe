@@ -104,6 +104,13 @@ struct LegacyDictEntry {
 }
 
 impl Dictionary {
+    pub(crate) fn entry_for_source(&self, source: &str) -> Option<&DictEntry> {
+        let canonical_source = canonical_text(source);
+        self.entries
+            .iter()
+            .find(|entry| canonical_text(&entry.from) == canonical_source)
+    }
+
     /// Load mappings for the running app even when migration persistence fails.
     /// The warning must be surfaced to the user; the readable mappings remain active.
     pub fn load_for_runtime(path: &Path) -> (Self, Option<String>) {
@@ -503,7 +510,7 @@ fn validate_entry<'a>(entry: &'a DictEntry, ids: &mut HashSet<&'a str>) -> AppRe
 }
 
 impl DictEntry {
-    fn is_active_for(&self, fingerprint: Option<&RecognitionFingerprint>) -> bool {
+    pub(crate) fn is_active_for(&self, fingerprint: Option<&RecognitionFingerprint>) -> bool {
         if self.origin == EntryOrigin::Manual
             || self.edit_state == EntryEditState::ModifiedAfterVerification
         {
@@ -514,6 +521,11 @@ impl DictEntry {
                 .iter()
                 .any(|verified| &verified.fingerprint == current)
         })
+    }
+
+    pub(crate) fn has_equivalent_mapping(&self, from: &str, to: &str) -> bool {
+        canonical_text(&self.from) == canonical_text(from)
+            && canonical_text(&self.to) == canonical_text(to)
     }
 }
 
@@ -581,7 +593,7 @@ fn migrate_legacy(legacy: LegacyDictionary) -> Dictionary {
     }
 }
 
-fn canonical_text(value: &str) -> String {
+pub(crate) fn canonical_text(value: &str) -> String {
     value
         .split_whitespace()
         .collect::<Vec<_>>()
