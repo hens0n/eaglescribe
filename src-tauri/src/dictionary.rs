@@ -168,10 +168,11 @@ impl Dictionary {
                 backed_up_primary = true;
             }
         }
-        if !backed_up_primary && !backup_path.is_file() {
+        let needs_initial_backup = !backed_up_primary && !backup_path.is_file();
+        atomic_replace(path, data.as_bytes())?;
+        if needs_initial_backup {
             atomic_replace(&backup_path, data.as_bytes())?;
         }
-        atomic_replace(path, data.as_bytes())?;
         Ok(())
     }
 
@@ -933,6 +934,21 @@ mod tests {
 
         let recovered = Dictionary::load(&path).expect("recover first write");
         assert_eq!(recovered.entries[0].to, "local-first");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_first_write_does_not_recover_uncommitted_mapping() {
+        let path = unique_dictionary_path("failed-first-write");
+        fs::create_dir_all(&path).expect("block primary file creation");
+        let mut dictionary = Dictionary::default();
+        dictionary.upsert("should not", "appear").unwrap();
+
+        assert!(dictionary.save(&path).is_err());
+        let recovered = Dictionary::load(&path).expect("load after failed write");
+
+        assert!(recovered.entries.is_empty());
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

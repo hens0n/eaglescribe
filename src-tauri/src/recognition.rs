@@ -3,7 +3,6 @@
 use crate::audio;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fmt::Write;
 
 const RECOGNITION_FINGERPRINT_VERSION: &str = "recognition-v1";
 /// Bump whenever resampling, silence detection/trimming, or decoder padding changes.
@@ -31,17 +30,14 @@ pub fn recognition_fingerprint(
 ) -> RecognitionFingerprint {
     let descriptor = format!(
         "model_sha256={model_content_sha256};decoder={};preprocessing={PREPROCESSING_BEHAVIOR_VERSION};silence_trim={};backend={}",
-        crate::stt::DECODER_BEHAVIOR_VERSION,
+        crate::stt::decoder_behavior_descriptor(),
         options.silence_trim,
         crate::stt::stt_acceleration(),
     );
-    let digest = Sha256::digest(descriptor.as_bytes());
-    let mut encoded = String::with_capacity(RECOGNITION_FINGERPRINT_VERSION.len() + 1 + 64);
-    encoded.push_str(RECOGNITION_FINGERPRINT_VERSION);
-    encoded.push(':');
-    for byte in digest {
-        let _ = write!(encoded, "{byte:02x}");
-    }
+    let encoded = format!(
+        "{RECOGNITION_FINGERPRINT_VERSION}:{}",
+        hex::encode(Sha256::digest(descriptor.as_bytes()))
+    );
     RecognitionFingerprint(encoded)
 }
 

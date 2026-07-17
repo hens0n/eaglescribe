@@ -2,7 +2,6 @@
 
 use crate::error::{AppError, AppResult};
 use sha2::{Digest, Sha256};
-use std::fmt::Write;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -13,8 +12,62 @@ pub struct WhisperEngine {
     model_content_sha256: String,
 }
 
-/// Bump whenever decoder parameters or transcript cleanup behavior changes.
-pub const DECODER_BEHAVIOR_VERSION: &str = "beam5-patience1-en-clean-v1";
+#[derive(Debug, Clone, Copy)]
+struct DecoderBehavior {
+    beam_size: std::ffi::c_int,
+    patience: f32,
+    language: &'static str,
+    translate: bool,
+    suppress_blank: bool,
+    suppress_non_speech_tokens: bool,
+    no_context: bool,
+    temperature: f32,
+    temperature_increment: f32,
+}
+
+const PRODUCTION_DECODER: DecoderBehavior = DecoderBehavior {
+    beam_size: 5,
+    patience: 1.0,
+    language: "en",
+    translate: false,
+    suppress_blank: true,
+    suppress_non_speech_tokens: true,
+    no_context: true,
+    temperature: 0.0,
+    temperature_increment: 0.2,
+};
+
+const CLEAN_SEGMENT_TAGS: [&str; 10] = [
+    "[BLANK_AUDIO]",
+    "[blank_audio]",
+    "[MUSIC]",
+    "[music]",
+    "[NOISE]",
+    "[noise]",
+    "[Silence]",
+    "[silence]",
+    "(blank)",
+    "(silence)",
+];
+
+/// Exact production decoder/cleanup behavior used by Recognition Fingerprints.
+pub fn decoder_behavior_descriptor() -> String {
+    let behavior = PRODUCTION_DECODER;
+    format!(
+        "beam_size={};patience={};language={};translate={};suppress_blank={};suppress_nst={};no_context={};temperature={};temperature_inc={};threads={};clean_tags={}",
+        behavior.beam_size,
+        behavior.patience,
+        behavior.language,
+        behavior.translate,
+        behavior.suppress_blank,
+        behavior.suppress_non_speech_tokens,
+        behavior.no_context,
+        behavior.temperature,
+        behavior.temperature_increment,
+        num_threads(),
+        CLEAN_SEGMENT_TAGS.join("|"),
+    )
+}
 
 impl WhisperEngine {
     pub fn load(model_path: impl AsRef<Path>) -> AppResult<Self> {
@@ -61,28 +114,7 @@ impl WhisperEngine {
             .create_state()
             .map_err(|e| AppError::from(format!("Whisper state error: {e}")))?;
 
-        // Beam search is slower than greedy but far less likely to emit an early
-        // EOT mid-sentence on base.en — the main cause of "second sentence cut off".
-        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
-            beam_size: 5,
-            patience: 1.0,
-        });
-        params.set_n_threads(num_threads());
-        params.set_language(Some("en"));
-        params.set_print_special(false);
-        params.set_print_progress(false);
-        params.set_print_realtime(false);
-        params.set_print_timestamps(false);
-        params.set_translate(false);
-        params.set_suppress_blank(true);
-        // Keep non-speech token suppression on so music/noise tags are less likely.
-        params.set_suppress_nst(true);
-        // Do not condition on prior text across windows — dictation takes are
-        // independent and prior context can cause loops on short clips.
-        params.set_no_context(true);
-        // Temperature fallbacks (defaults: 0 + 0.2 inc) retry low-quality passes.
-        params.set_temperature(0.0);
-        params.set_temperature_inc(0.2);
+        let params = production_decoder_params();
 
         state
             .full(params, audio)
@@ -124,29 +156,37 @@ fn sha256_file(path: &Path) -> AppResult<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    let mut encoded = String::with_capacity(64);
-    for byte in hasher.finalize() {
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    Ok(encoded)
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn production_decoder_params() -> FullParams<'static, 'static> {
+    let behavior = PRODUCTION_DECODER;
+    // Beam search is slower than greedy but far less likely to emit an early
+    // EOT mid-sentence on base.en — the main cause of "second sentence cut off".
+    let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+        beam_size: behavior.beam_size,
+        patience: behavior.patience,
+    });
+    params.set_n_threads(num_threads());
+    params.set_language(Some(behavior.language));
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_translate(behavior.translate);
+    params.set_suppress_blank(behavior.suppress_blank);
+    params.set_suppress_nst(behavior.suppress_non_speech_tokens);
+    params.set_no_context(behavior.no_context);
+    params.set_temperature(behavior.temperature);
+    params.set_temperature_inc(behavior.temperature_increment);
+    params
 }
 
 /// Strip Whisper hallucination tags and normalize whitespace on one segment.
 fn clean_segment_text(segment: &str) -> String {
     let mut s = segment.trim().to_string();
     // base.en sometimes emits these instead of (or mixed into) real speech.
-    for tag in [
-        "[BLANK_AUDIO]",
-        "[blank_audio]",
-        "[MUSIC]",
-        "[music]",
-        "[NOISE]",
-        "[noise]",
-        "[Silence]",
-        "[silence]",
-        "(blank)",
-        "(silence)",
-    ] {
+    for tag in CLEAN_SEGMENT_TAGS {
         s = s.replace(tag, " ");
     }
     s.split_whitespace().collect::<Vec<_>>().join(" ")

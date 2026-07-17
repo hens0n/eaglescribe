@@ -1052,6 +1052,7 @@ dependencies = [
  "cpal",
  "dirs",
  "enigo",
+ "hex",
  "hound",
  "parking_lot",
  "regex",

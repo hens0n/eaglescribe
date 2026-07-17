@@ -24,6 +24,7 @@ thiserror = "2"
 parking_lot = "0.12"
 cpal = "0.15"
 hound = "3.5"
+hex = "0.4"
 # wayland-data-control: pure Wayland compositors with ext/wlr data-control (falls back to X11).
 arboard = { version = "3", features = ["wayland-data-control"] }
 enigo = "0.3"
