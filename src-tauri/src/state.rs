@@ -1328,17 +1328,7 @@ impl AppState {
         self: &Arc<Self>,
         app: &AppHandle<R>,
     ) -> AppResult<TuningSnapshot> {
-        let (
-            recording,
-            checkpoint,
-            store,
-            engine,
-            options,
-            generation,
-            dictionary,
-            dictionary_path,
-            phrase_id,
-        ) = {
+        let (recording, checkpoint, store, engine, options, generation, dictionary_path, phrase_id) = {
             let mut g = self.inner.lock();
             if g.tuning_activity != TuningActivity::Recording {
                 return Err(AppError::from("Verification is not recording"));
@@ -1373,7 +1363,6 @@ impl AppState {
                 engine,
                 options,
                 g.tuning_attempt_generation,
-                g.dictionary.clone(),
                 g.dictionary_path.clone(),
                 phrase_id,
             )
@@ -1401,6 +1390,11 @@ impl AppState {
             match recognition {
                 Ok(recognition) => {
                     let raw_transcript = recognition.transcript;
+                    // Dictionary edits can complete while Whisper is running.
+                    // Reconcile against the latest in-memory snapshot so
+                    // unrelated keys merge and staged-key changes return to
+                    // Review instead of being overwritten by this attempt.
+                    let dictionary = g.dictionary.clone();
                     match store.complete_verification_and_commit(
                         &checkpoint,
                         &raw_transcript,
@@ -1421,6 +1415,23 @@ impl AppState {
                             );
                             g.tuning_checkpoint = Some(*continued);
                             g.tuning_last_error = None;
+                        }
+                        Ok(VerificationAdvance::ConflictReview(review)) => {
+                            drop(raw_transcript);
+                            append_phrase_diagnostic(
+                                &mut g,
+                                &checkpoint,
+                                TuningEventKind::VerificationAttempt,
+                                TuningStage::Review,
+                                TuningOutcomeCode::StaleRuleReturned,
+                                &phrase_id,
+                                None,
+                            );
+                            g.tuning_checkpoint = Some(*review);
+                            g.tuning_last_error = Some(
+                                "A staged Personal Dictionary key changed. Review that Correction Rule again; verification will restart after the approved set is updated."
+                                    .into(),
+                            );
                         }
                         Ok(VerificationAdvance::Complete(result, committed_dictionary)) => {
                             drop(raw_transcript);

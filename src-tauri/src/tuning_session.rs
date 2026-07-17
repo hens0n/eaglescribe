@@ -171,6 +171,7 @@ pub struct CompletedTuningResult {
 #[derive(Debug, Clone)]
 pub enum VerificationAdvance {
     InProgress(Box<TuningCheckpoint>),
+    ConflictReview(Box<TuningCheckpoint>),
     Complete(CompletedTuningResult, Dictionary),
 }
 
@@ -968,6 +969,9 @@ impl TuningCheckpointStore {
         dictionary_path: &Path,
         verified_at_ms: u64,
     ) -> Result<VerificationAdvance, String> {
+        if let Some(review) = self.refresh_review_for_dictionary_changes(checkpoint, dictionary)? {
+            return Ok(VerificationAdvance::ConflictReview(Box::new(review)));
+        }
         checkpoint
             .verification_definition()
             .ok_or_else(|| "A held-out Verification Pass row must be ready".to_owned())?;
@@ -1087,6 +1091,63 @@ impl TuningCheckpointStore {
         Ok(VerificationAdvance::Complete(result, committed))
     }
 
+    /// Reconcile optimistic per-key identities before accepting another
+    /// Verification Attempt. Unrelated dictionary revisions are intentionally
+    /// ignored; a changed staged key is rebuilt from the current dictionary and
+    /// only that Review decision is cleared. Continuing from the refreshed
+    /// Review creates a new approved set and therefore a fresh Verification
+    /// Pass with no reused attempt state.
+    fn refresh_review_for_dictionary_changes(
+        &self,
+        checkpoint: &TuningCheckpoint,
+        dictionary: &Dictionary,
+    ) -> Result<Option<TuningCheckpoint>, String> {
+        if checkpoint.stage != TuningStage::Verify
+            || checkpoint.pending_commit_verified_at_ms.is_some()
+        {
+            return Ok(None);
+        }
+        let stale_keys = checkpoint
+            .staged_rules
+            .iter()
+            .filter(|rule| !staged_rule_matches_dictionary(rule, dictionary))
+            .map(|rule| canonical_text(&rule.from))
+            .collect::<HashSet<_>>();
+        if stale_keys.is_empty() {
+            return Ok(None);
+        }
+
+        let mut refreshed = build_review(
+            &checkpoint.inference_results,
+            dictionary,
+            &checkpoint.envelope.recognition_fingerprint,
+        );
+        for row in &mut refreshed.rows {
+            let key = canonical_text(&row.from);
+            if stale_keys.contains(&key) {
+                continue;
+            }
+            if let Some(previous) = checkpoint.review.rows.iter().find(|previous| {
+                canonical_text(&previous.from) == key
+                    && canonical_text(&previous.to) == canonical_text(&row.to)
+            }) {
+                row.id = previous.id.clone();
+                row.decision = previous.decision;
+            }
+        }
+
+        let mut candidate = checkpoint.clone();
+        candidate.stage = TuningStage::Review;
+        candidate.interrupted_attempt = false;
+        candidate.review = refreshed;
+        candidate.staged_rules.clear();
+        candidate.verification_queue.clear();
+        candidate.verification_states.clear();
+        candidate.pending_commit_verified_at_ms = None;
+        self.save(&candidate)?;
+        Ok(Some(candidate))
+    }
+
     /// Reconcile the durable transaction marker left by a crash or interrupted
     /// checkpoint cleanup. The dictionary mutation is idempotent, so startup
     /// converges to one committed rule and no unfinished evidence.
@@ -1138,14 +1199,8 @@ impl TuningCheckpointStore {
             let (dictionary_entry_id, changed) = match rule.kind {
                 StagedRuleKind::New => {
                     if let Some(existing) = committed.entry_for_source(&rule.from) {
-                        let already_committed = existing.id == rule.id
-                            && existing.has_equivalent_mapping(&rule.from, &rule.to)
-                            && existing.origin == EntryOrigin::Tuning
-                            && existing.edit_state == EntryEditState::Unmodified
-                            && existing
-                                .verified_fingerprints
-                                .iter()
-                                .any(|stored| stored == &verified);
+                        let already_committed =
+                            is_committed_tuning_rule(existing, rule, &verified.fingerprint);
                         if already_committed {
                             (existing.id.clone(), false)
                         } else {
@@ -1173,10 +1228,7 @@ impl TuningCheckpointStore {
                         entry.id == expected.id
                             && entry.version == expected.version.saturating_add(1)
                             && entry.has_equivalent_mapping(&rule.from, &rule.to)
-                            && entry
-                                .verified_fingerprints
-                                .iter()
-                                .any(|stored| stored == &verified)
+                            && entry.has_verified_fingerprint(&verified.fingerprint)
                     }) {
                         (entry.id.clone(), false)
                     } else {
@@ -1194,7 +1246,9 @@ impl TuningCheckpointStore {
                                 "The staged dictionary mapping changed before commit".into()
                             );
                         }
-                        entry.verified_fingerprints.push(verified.clone());
+                        if !entry.has_verified_fingerprint(&verified.fingerprint) {
+                            entry.verified_fingerprints.push(verified.clone());
+                        }
                         entry.version = entry.version.saturating_add(1);
                         let id = entry.id.clone();
                         committed.revision = committed.revision.saturating_add(1);
@@ -1207,14 +1261,8 @@ impl TuningCheckpointStore {
                         .as_ref()
                         .ok_or_else(|| "The replacement lost its dictionary identity".to_owned())?;
                     if let Some(existing) = committed.entry_for_source(&rule.from) {
-                        let already_committed = existing.id == rule.id
-                            && existing.has_equivalent_mapping(&rule.from, &rule.to)
-                            && existing.origin == EntryOrigin::Tuning
-                            && existing.edit_state == EntryEditState::Unmodified
-                            && existing
-                                .verified_fingerprints
-                                .iter()
-                                .any(|stored| stored == &verified);
+                        let already_committed =
+                            is_committed_tuning_rule(existing, rule, &verified.fingerprint);
                         if already_committed {
                             (existing.id.clone(), false)
                         } else {
@@ -1282,6 +1330,36 @@ impl TuningCheckpointStore {
         }
         Ok(())
     }
+}
+
+fn staged_rule_matches_dictionary(rule: &StagedRule, dictionary: &Dictionary) -> bool {
+    match rule.kind {
+        StagedRuleKind::New => dictionary.entry_for_source(&rule.from).is_none(),
+        StagedRuleKind::Existing | StagedRuleKind::Replacement => {
+            let Some(expected) = rule.existing_entry.as_ref() else {
+                return false;
+            };
+            dictionary
+                .entry_for_source(&rule.from)
+                .is_some_and(|entry| {
+                    entry.id == expected.id
+                        && entry.version == expected.version
+                        && entry.has_equivalent_mapping(&expected.from, &expected.to)
+                })
+        }
+    }
+}
+
+fn is_committed_tuning_rule(
+    entry: &DictEntry,
+    rule: &StagedRule,
+    fingerprint: &RecognitionFingerprint,
+) -> bool {
+    entry.id == rule.id
+        && entry.has_equivalent_mapping(&rule.from, &rule.to)
+        && entry.origin == EntryOrigin::Tuning
+        && entry.edit_state == EntryEditState::Unmodified
+        && entry.has_verified_fingerprint(fingerprint)
 }
 
 fn find_evidence<'a>(
@@ -2014,6 +2092,304 @@ mod tests {
             99
         );
         assert!(!checkpoint_path.exists());
+    }
+
+    #[test]
+    fn successful_reverification_adds_one_fingerprint_to_the_same_entry() {
+        let checkpoint_path = temp_path("reverify-existing");
+        let dictionary_path = checkpoint_path.with_file_name("dictionary.json");
+        let store = TuningCheckpointStore::new(checkpoint_path);
+        let previous = RecognitionFingerprint::from_stable_id("recognition-previous");
+        let current = RecognitionFingerprint::from_stable_id("recognition-current");
+        let dictionary = Dictionary {
+            entries: vec![dictionary_entry(
+                "stable-rule",
+                "quick chip",
+                "quick ship",
+                EntryOrigin::Tuning,
+                vec![VerifiedRecognitionFingerprint {
+                    fingerprint: previous.clone(),
+                    verified_at_ms: 10,
+                }],
+            )],
+            ..Dictionary::default()
+        };
+        let mut checkpoint = store
+            .start(CompatibilityEnvelope::current(current.clone()))
+            .unwrap();
+        checkpoint.stage = TuningStage::Review;
+        checkpoint.inference_results = vec![candidate("T01", "quick chip", "quick ship")];
+        checkpoint.review = build_review(&checkpoint.inference_results, &dictionary, &current);
+        store.save(&checkpoint).unwrap();
+        let row_id = checkpoint.review.rows[0].id.clone();
+        checkpoint = store
+            .record_review_decision(&checkpoint, &row_id, ReviewDecision::Approve)
+            .unwrap();
+        checkpoint = store.continue_review(&checkpoint).unwrap();
+
+        let completed = store
+            .complete_verification_and_commit(
+                &checkpoint,
+                "The heavy blue boxes arrived on a quick chip.",
+                &dictionary,
+                &dictionary_path,
+                42,
+            )
+            .unwrap();
+        let VerificationAdvance::Complete(result, committed) = completed else {
+            panic!("the existing rule should verify")
+        };
+
+        assert_eq!(
+            result.rules[0].dictionary_entry_id.as_deref(),
+            Some("stable-rule")
+        );
+        assert_eq!(committed.entries.len(), 1);
+        let entry = &committed.entries[0];
+        assert_eq!(entry.id, "stable-rule");
+        assert_eq!(entry.version, 2);
+        assert_eq!(entry.verified_fingerprints.len(), 2);
+        assert_eq!(entry.verified_fingerprints[0].fingerprint, previous);
+        assert_eq!(entry.verified_fingerprints[1].fingerprint, current);
+    }
+
+    #[test]
+    fn failed_reverification_preserves_the_mapping_and_earlier_fingerprints() {
+        let checkpoint_path = temp_path("reverify-failure");
+        let dictionary_path = checkpoint_path.with_file_name("dictionary.json");
+        let store = TuningCheckpointStore::new(checkpoint_path);
+        let previous = RecognitionFingerprint::from_stable_id("recognition-previous");
+        let current = RecognitionFingerprint::from_stable_id("recognition-current");
+        let dictionary = Dictionary {
+            entries: vec![dictionary_entry(
+                "stable-rule",
+                "quick chip",
+                "quick ship",
+                EntryOrigin::Tuning,
+                vec![VerifiedRecognitionFingerprint {
+                    fingerprint: previous.clone(),
+                    verified_at_ms: 10,
+                }],
+            )],
+            ..Dictionary::default()
+        };
+        let mut checkpoint = store
+            .start(CompatibilityEnvelope::current(current.clone()))
+            .unwrap();
+        checkpoint.stage = TuningStage::Review;
+        checkpoint.inference_results = vec![candidate("T01", "quick chip", "quick ship")];
+        checkpoint.review = build_review(&checkpoint.inference_results, &dictionary, &current);
+        store.save(&checkpoint).unwrap();
+        let row_id = checkpoint.review.rows[0].id.clone();
+        checkpoint = store
+            .record_review_decision(&checkpoint, &row_id, ReviewDecision::Approve)
+            .unwrap();
+        checkpoint = store.continue_review(&checkpoint).unwrap();
+
+        let completed = store
+            .complete_verification_and_commit(
+                &checkpoint,
+                "The heavy blue boxes arrived on a quick ship.",
+                &dictionary,
+                &dictionary_path,
+                42,
+            )
+            .unwrap();
+        let VerificationAdvance::InProgress(retry) = completed else {
+            panic!("the first non-exercise should retry")
+        };
+        let completed = store
+            .complete_verification_and_commit(
+                &retry,
+                "The heavy blue boxes arrived on a quick ship.",
+                &dictionary,
+                &dictionary_path,
+                43,
+            )
+            .unwrap();
+        let VerificationAdvance::Complete(result, committed) = completed else {
+            panic!("the second non-exercise should roll back")
+        };
+
+        assert_eq!(
+            result.rules[0].outcome,
+            VerificationRuleOutcome::CouldNotVerify
+        );
+        assert_eq!(committed.entries, dictionary.entries);
+        assert_eq!(committed.entries[0].verified_fingerprints.len(), 1);
+        assert_eq!(
+            committed.entries[0].verified_fingerprints[0].fingerprint,
+            previous
+        );
+        assert!(!committed.entries[0].is_active_for(Some(&current)));
+    }
+
+    #[test]
+    fn unrelated_concurrent_dictionary_edits_merge_into_the_final_commit() {
+        let checkpoint_path = temp_path("merge-unrelated-edit");
+        let dictionary_path = checkpoint_path.with_file_name("dictionary.json");
+        let store = TuningCheckpointStore::new(checkpoint_path);
+        let fingerprint = RecognitionFingerprint::from_stable_id("recognition-current");
+        let checkpoint = approved_checkpoint(
+            &store,
+            &fingerprint,
+            vec![candidate("T01", "quick chip", "quick ship")],
+        );
+        let mut concurrently_edited = Dictionary::default();
+        concurrently_edited
+            .upsert("eagle scribe", "EagleScribe")
+            .unwrap();
+
+        let completed = store
+            .complete_verification_and_commit(
+                &checkpoint,
+                "The heavy blue boxes arrived on a quick chip.",
+                &concurrently_edited,
+                &dictionary_path,
+                42,
+            )
+            .unwrap();
+        let VerificationAdvance::Complete(_, committed) = completed else {
+            panic!("verification should complete")
+        };
+
+        assert_eq!(committed.entries.len(), 2);
+        assert!(committed.entry_for_source("eagle scribe").is_some());
+        assert!(committed.entry_for_source("quick chip").is_some());
+    }
+
+    #[test]
+    fn a_changed_staged_key_returns_only_that_rule_to_review_and_restarts_verification() {
+        let checkpoint_path = temp_path("staged-key-conflict");
+        let dictionary_path = checkpoint_path.with_file_name("dictionary.json");
+        let store = TuningCheckpointStore::new(checkpoint_path);
+        let fingerprint = RecognitionFingerprint::from_stable_id("recognition-current");
+        let checkpoint = approved_checkpoint(
+            &store,
+            &fingerprint,
+            vec![
+                candidate("T01", "quick chip", "quick ship"),
+                candidate_for_probe("T05", "T05-P02", "up stairs", "upstairs"),
+            ],
+        );
+        let first = store
+            .complete_verification_and_commit(
+                &checkpoint,
+                "The heavy blue boxes arrived on a quick chip.",
+                &Dictionary::default(),
+                &dictionary_path,
+                40,
+            )
+            .unwrap();
+        let VerificationAdvance::InProgress(second_row) = first else {
+            panic!("the second held-out row remains")
+        };
+        let mut changed = Dictionary::default();
+        changed.upsert("up stairs", "up the stairs").unwrap();
+
+        let conflict = store
+            .complete_verification_and_commit(
+                &second_row,
+                "Up stairs, the good blue book remains on the desk.",
+                &changed,
+                &dictionary_path,
+                41,
+            )
+            .unwrap();
+        let VerificationAdvance::ConflictReview(review) = conflict else {
+            panic!("the changed staged key must return to Review")
+        };
+
+        assert_eq!(review.stage(), TuningStage::Review);
+        assert_eq!(review.review.rows.len(), 2);
+        let unchanged = review
+            .review
+            .rows
+            .iter()
+            .find(|row| row.from == "quick chip")
+            .unwrap();
+        assert_eq!(unchanged.decision, Some(ReviewDecision::Approve));
+        let changed_row = review
+            .review
+            .rows
+            .iter()
+            .find(|row| row.from == "up stairs")
+            .unwrap();
+        assert_eq!(changed_row.kind, ReviewRowKind::Conflict);
+        assert_eq!(changed_row.decision, None);
+        assert_eq!(
+            changed_row.existing_entry.as_ref().unwrap().to,
+            "up the stairs"
+        );
+
+        let reviewed = store
+            .record_review_decision(&review, &changed_row.id, ReviewDecision::VerifyReplacement)
+            .unwrap();
+        let restarted = store.continue_review(&reviewed).unwrap();
+        assert_eq!(restarted.stage(), TuningStage::Verify);
+        assert_eq!(restarted.verification_phrase_id(), Some("T01"));
+        assert_eq!(restarted.verification_progress().unwrap().position, 1);
+        assert_eq!(restarted.staged_rules().len(), 2);
+    }
+
+    #[test]
+    fn a_kept_replacement_atomically_swaps_only_the_conflicting_entry() {
+        let checkpoint_path = temp_path("atomic-replacement");
+        let dictionary_path = checkpoint_path.with_file_name("dictionary.json");
+        let store = TuningCheckpointStore::new(checkpoint_path);
+        let fingerprint = RecognitionFingerprint::from_stable_id("recognition-current");
+        let mut dictionary = Dictionary::default();
+        dictionary.upsert("quick chip", "quick clip").unwrap();
+        dictionary.upsert("eagle scribe", "EagleScribe").unwrap();
+        dictionary.save(&dictionary_path).unwrap();
+        let replaced_id = dictionary
+            .entry_for_source("quick chip")
+            .unwrap()
+            .id
+            .clone();
+        let unrelated_id = dictionary
+            .entry_for_source("eagle scribe")
+            .unwrap()
+            .id
+            .clone();
+        let mut checkpoint = store
+            .start(CompatibilityEnvelope::current(fingerprint.clone()))
+            .unwrap();
+        checkpoint.stage = TuningStage::Review;
+        checkpoint.inference_results = vec![candidate("T01", "quick chip", "quick ship")];
+        checkpoint.review = build_review(&checkpoint.inference_results, &dictionary, &fingerprint);
+        store.save(&checkpoint).unwrap();
+        let row_id = checkpoint.review.rows[0].id.clone();
+        checkpoint = store
+            .record_review_decision(&checkpoint, &row_id, ReviewDecision::VerifyReplacement)
+            .unwrap();
+        checkpoint = store.continue_review(&checkpoint).unwrap();
+
+        let completed = store
+            .complete_verification_and_commit(
+                &checkpoint,
+                "The heavy blue boxes arrived on a quick chip.",
+                &dictionary,
+                &dictionary_path,
+                42,
+            )
+            .unwrap();
+        let VerificationAdvance::Complete(_, committed) = completed else {
+            panic!("the replacement should verify")
+        };
+        let persisted = Dictionary::load(&dictionary_path).unwrap();
+
+        for snapshot in [&committed, &persisted] {
+            assert_eq!(snapshot.entries.len(), 2);
+            let replacement = snapshot.entry_for_source("quick chip").unwrap();
+            assert_ne!(replacement.id, replaced_id);
+            assert_eq!(replacement.to, "quick ship");
+            assert_eq!(replacement.origin, EntryOrigin::Tuning);
+            assert_eq!(
+                snapshot.entry_for_source("eagle scribe").unwrap().id,
+                unrelated_id
+            );
+        }
     }
 
     #[test]
