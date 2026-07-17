@@ -1,12 +1,20 @@
 //! On-device speech-to-text via whisper.cpp (`whisper-rs`).
 
 use crate::error::{AppError, AppResult};
+use sha2::{Digest, Sha256};
+use std::fmt::Write;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 pub struct WhisperEngine {
     ctx: WhisperContext,
+    model_content_sha256: String,
 }
+
+/// Bump whenever decoder parameters or transcript cleanup behavior changes.
+pub const DECODER_BEHAVIOR_VERSION: &str = "beam5-patience1-en-clean-v1";
 
 impl WhisperEngine {
     pub fn load(model_path: impl AsRef<Path>) -> AppResult<Self> {
@@ -18,6 +26,8 @@ impl WhisperEngine {
             )));
         }
 
+        let model_content_sha256 = sha256_file(model_path)?;
+
         let ctx = WhisperContext::new_with_params(
             model_path
                 .to_str()
@@ -26,7 +36,14 @@ impl WhisperEngine {
         )
         .map_err(|e| AppError::from(format!("Failed to load Whisper model: {e}")))?;
 
-        Ok(Self { ctx })
+        Ok(Self {
+            ctx,
+            model_content_sha256,
+        })
+    }
+
+    pub fn model_content_sha256(&self) -> &str {
+        &self.model_content_sha256
     }
 
     /// Transcribe mono f32 PCM at 16 kHz.
@@ -91,6 +108,27 @@ impl WhisperEngine {
 
         Ok(text)
     }
+}
+
+fn sha256_file(path: &Path) -> AppResult<String> {
+    let mut file = File::open(path)
+        .map_err(|error| AppError::from(format!("Read Whisper model failed: {error}")))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| AppError::from(format!("Read Whisper model failed: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let mut encoded = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    Ok(encoded)
 }
 
 /// Strip Whisper hallucination tags and normalize whitespace on one segment.
@@ -178,6 +216,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_content_hash_uses_file_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "eaglescribe-model-hash-{}-{}.bin",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, b"abc").expect("write model fixture");
+        let digest = sha256_file(&path).expect("hash model fixture");
+        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
     fn stt_acceleration_is_known_label() {
         let a = stt_acceleration();
         assert!(
@@ -193,7 +247,10 @@ mod tests {
             clean_segment_text("hello [BLANK_AUDIO] world"),
             "hello world"
         );
-        assert_eq!(clean_segment_text("  dictation is working.  "), "dictation is working.");
+        assert_eq!(
+            clean_segment_text("  dictation is working.  "),
+            "dictation is working."
+        );
     }
 
     #[test]

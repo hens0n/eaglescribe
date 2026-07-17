@@ -310,27 +310,23 @@ fn dictionary_remove(
 
 #[tauri::command]
 fn dictionary_edit(
-    entry_id: String,
-    expected_version: u64,
+    identity: dictionary::DictionaryEntryIdentity,
     from: String,
     to: String,
     state: tauri::State<'_, SharedState>,
 ) -> AppResult<StatusSnapshot> {
     state
         .inner()
-        .dictionary_edit(&entry_id, expected_version, &from, &to)?;
+        .dictionary_edit(&identity, &from, &to)?;
     Ok(state.inner().snapshot())
 }
 
 #[tauri::command]
 fn dictionary_remove_entry(
-    entry_id: String,
-    expected_version: u64,
+    identity: dictionary::DictionaryEntryIdentity,
     state: tauri::State<'_, SharedState>,
 ) -> AppResult<StatusSnapshot> {
-    state
-        .inner()
-        .dictionary_remove_entry(&entry_id, expected_version)?;
+    state.inner().dictionary_remove_entry(&identity)?;
     Ok(state.inner().snapshot())
 }
 

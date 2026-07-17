@@ -1,13 +1,16 @@
 use crate::audio::{self, RecordingSession};
-use crate::dictionary::{self, DictEntry, Dictionary, MigrationConflict};
+use crate::dictionary::{
+    self, DictEntry, Dictionary, DictionaryEntryIdentity, MigrationConflict,
+};
 use crate::error::{AppError, AppResult};
 use crate::history::{self, HistoryBook, HistoryEntry};
 use crate::hotkey;
 use crate::llm;
 use crate::polish::{self, PolishMode};
 use crate::recognition::{
-    recognize_resampled, resample_capture, CapturedAudio, PreprocessingReport,
-    RecognitionErrorKind, RecognitionOptions, SilenceTrimReport,
+    recognition_fingerprint, recognize_resampled, resample_capture, CapturedAudio,
+    PreprocessingReport, RecognitionErrorKind, RecognitionFingerprint, RecognitionOptions,
+    SilenceTrimReport,
 };
 use crate::settings::{self, AppSettings, HotkeyMode};
 use crate::snippets::{self, Snippet, SnippetBook};
@@ -66,6 +69,7 @@ struct InnerState {
     settings: AppSettings,
     dictionary_path: PathBuf,
     dictionary: Dictionary,
+    dictionary_storage_error: Option<String>,
     snippets_path: PathBuf,
     snippets: SnippetBook,
     history_path: PathBuf,
@@ -97,7 +101,8 @@ impl AppState {
         let settings = AppSettings::load_or_default(&settings_path);
 
         let dictionary_path = dictionary::default_dictionary_path();
-        let dictionary = Dictionary::load_or_default(&dictionary_path);
+        let (dictionary, dictionary_storage_error) =
+            Dictionary::load_for_runtime(&dictionary_path);
         let entry_count = dictionary.entries.len();
 
         let snippets_path = snippets::default_snippets_path();
@@ -128,6 +133,7 @@ impl AppState {
                 settings,
                 dictionary_path: dictionary_path.clone(),
                 dictionary,
+                dictionary_storage_error: dictionary_storage_error.clone(),
                 snippets_path: snippets_path.clone(),
                 snippets,
                 history_path: history_path.clone(),
@@ -160,6 +166,9 @@ impl AppState {
                         dictionary_path.display(),
                         entry_count
                     ));
+                    if let Some(error) = dictionary_storage_error {
+                        log.push(error);
+                    }
                     log.push(format!(
                         "Snippets: {} ({} cues)",
                         snippets_path.display(),
@@ -234,6 +243,15 @@ impl AppState {
             dictionary: g.dictionary.list(),
             dictionary_revision: g.dictionary.revision,
             dictionary_conflicts: g.dictionary.migration_conflicts.clone(),
+            dictionary_error: g.dictionary_storage_error.clone(),
+            recognition_fingerprint: g.engine.as_ref().map(|engine| {
+                recognition_fingerprint(
+                    engine.model_content_sha256(),
+                    RecognitionOptions {
+                        silence_trim: g.settings.silence_trim,
+                    },
+                )
+            }),
             snippets_path: g.snippets_path.display().to_string(),
             snippets: g.snippets.list(),
             history_path: g.history_path.display().to_string(),
@@ -481,10 +499,7 @@ impl AppState {
 
     pub fn dictionary_add(&self, from: &str, to: &str) -> AppResult<()> {
         let mut g = self.inner.lock();
-        let mut next = g.dictionary.clone();
-        next.upsert(from, to)?;
-        next.save(&g.dictionary_path)?;
-        g.dictionary = next;
+        Self::persist_dictionary_update(&mut g, |dictionary| dictionary.upsert(from, to))?;
         g.log
             .push(format!("Dictionary: {:?} → {:?}", from.trim(), to.trim()));
         Ok(())
@@ -492,31 +507,30 @@ impl AppState {
 
     pub fn dictionary_remove(&self, from: &str) -> AppResult<()> {
         let mut g = self.inner.lock();
-        let mut next = g.dictionary.clone();
-        if !next.remove(from) {
-            return Err(AppError::from(format!(
-                "No dictionary entry for {:?}",
-                from.trim()
-            )));
-        }
-        next.save(&g.dictionary_path)?;
-        g.dictionary = next;
+        Self::persist_dictionary_update(&mut g, |dictionary| {
+            if dictionary.remove(from) {
+                Ok(())
+            } else {
+                Err(AppError::from(format!(
+                    "No dictionary entry for {:?}",
+                    from.trim()
+                )))
+            }
+        })?;
         g.log.push(format!("Dictionary removed: {:?}", from.trim()));
         Ok(())
     }
 
     pub fn dictionary_edit(
         &self,
-        entry_id: &str,
-        expected_version: u64,
+        identity: &DictionaryEntryIdentity,
         from: &str,
         to: &str,
     ) -> AppResult<()> {
         let mut g = self.inner.lock();
-        let mut next = g.dictionary.clone();
-        next.edit_entry(entry_id, expected_version, from, to)?;
-        next.save(&g.dictionary_path)?;
-        g.dictionary = next;
+        Self::persist_dictionary_update(&mut g, |dictionary| {
+            dictionary.edit_entry(identity, from, to)
+        })?;
         g.log
             .push(format!("Dictionary edited: {:?} → {:?}", from, to));
         Ok(())
@@ -524,16 +538,14 @@ impl AppState {
 
     pub fn dictionary_remove_entry(
         &self,
-        entry_id: &str,
-        expected_version: u64,
+        identity: &DictionaryEntryIdentity,
     ) -> AppResult<()> {
         let mut g = self.inner.lock();
-        let mut next = g.dictionary.clone();
-        next.remove_entry(entry_id, expected_version)?;
-        next.save(&g.dictionary_path)?;
-        g.dictionary = next;
+        Self::persist_dictionary_update(&mut g, |dictionary| {
+            dictionary.remove_entry(identity)
+        })?;
         g.log
-            .push(format!("Dictionary entry removed: {entry_id}"));
+            .push(format!("Dictionary entry removed: {}", identity.id));
         Ok(())
     }
 
@@ -543,13 +555,27 @@ impl AppState {
         selected_entry_id: &str,
     ) -> AppResult<()> {
         let mut g = self.inner.lock();
-        let mut next = g.dictionary.clone();
-        next.resolve_migration_conflict(conflict_id, selected_entry_id)?;
-        next.save(&g.dictionary_path)?;
-        g.dictionary = next;
+        Self::persist_dictionary_update(&mut g, |dictionary| {
+            dictionary.resolve_migration_conflict(conflict_id, selected_entry_id)
+        })?;
         g.log
             .push("Dictionary migration conflict resolved explicitly.".into());
         Ok(())
+    }
+
+    fn persist_dictionary_update<T>(
+        state: &mut InnerState,
+        update: impl FnOnce(&mut Dictionary) -> AppResult<T>,
+    ) -> AppResult<T> {
+        let mut next = state.dictionary.clone();
+        let result = update(&mut next)?;
+        if let Err(error) = next.save(&state.dictionary_path) {
+            state.dictionary_storage_error = Some(format!("Dictionary storage error: {error}"));
+            return Err(error);
+        }
+        state.dictionary = next;
+        state.dictionary_storage_error = None;
+        Ok(result)
     }
 
     pub fn snippet_add(&self, cue: &str, expansion: &str) -> AppResult<()> {
@@ -863,11 +889,10 @@ impl AppState {
                 .ok_or_else(|| AppError::from("Engine not loaded"))?
         };
 
-        let recognition = recognize_resampled(
-            resampled,
-            RecognitionOptions { silence_trim },
-            engine.as_ref(),
-        );
+        let recognition_options = RecognitionOptions { silence_trim };
+        let fingerprint =
+            recognition_fingerprint(engine.model_content_sha256(), recognition_options);
+        let recognition = recognize_resampled(resampled, recognition_options, engine.as_ref());
         if let Err(error) = &recognition {
             if let Some(preprocessing) = error.preprocessing() {
                 self.log_preprocessing(preprocessing);
@@ -918,7 +943,8 @@ impl AppState {
             self.push_log("Polish: no changes (or verbatim mode)");
         }
 
-        let after_dict = dictionary.apply(&polished.polished);
+        let after_dict =
+            dictionary.apply_for_fingerprint(&polished.polished, Some(&fingerprint));
         if after_dict != polished.polished {
             self.push_log(format!(
                 "Dictionary: {} → {}",
@@ -1549,6 +1575,8 @@ pub struct StatusSnapshot {
     pub dictionary: Vec<DictEntry>,
     pub dictionary_revision: u64,
     pub dictionary_conflicts: Vec<MigrationConflict>,
+    pub dictionary_error: Option<String>,
+    pub recognition_fingerprint: Option<RecognitionFingerprint>,
     pub snippets_path: String,
     pub snippets: Vec<Snippet>,
     pub history_path: String,

@@ -1,6 +1,49 @@
 //! Shared local raw-recognition pipeline for dictation and Tuning.
 
 use crate::audio;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fmt::Write;
+
+const RECOGNITION_FINGERPRINT_VERSION: &str = "recognition-v1";
+/// Bump whenever resampling, silence detection/trimming, or decoder padding changes.
+const PREPROCESSING_BEHAVIOR_VERSION: &str = "linear-16k-trim-v1-tail-400ms";
+
+/// Stable identity of model content plus decoder and audio-preprocessing behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RecognitionFingerprint(String);
+
+impl RecognitionFingerprint {
+    pub fn from_stable_id(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Compute the identity that gates unmodified Tuning-origin Correction Rules.
+pub fn recognition_fingerprint(
+    model_content_sha256: &str,
+    options: RecognitionOptions,
+) -> RecognitionFingerprint {
+    let descriptor = format!(
+        "model_sha256={model_content_sha256};decoder={};preprocessing={PREPROCESSING_BEHAVIOR_VERSION};silence_trim={};backend={}",
+        crate::stt::DECODER_BEHAVIOR_VERSION,
+        options.silence_trim,
+        crate::stt::stt_acceleration(),
+    );
+    let digest = Sha256::digest(descriptor.as_bytes());
+    let mut encoded = String::with_capacity(RECOGNITION_FINGERPRINT_VERSION.len() + 1 + 64);
+    encoded.push_str(RECOGNITION_FINGERPRINT_VERSION);
+    encoded.push(':');
+    for byte in digest {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    RecognitionFingerprint(encoded)
+}
 
 /// Stage that owns a raw-recognition failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +324,21 @@ mod tests {
     struct RecordingTranscriber {
         received: RefCell<Vec<f32>>,
         result: Result<String, String>,
+    }
+
+    #[test]
+    fn recognition_fingerprint_tracks_model_and_preprocessing_behavior() {
+        let trimmed = RecognitionOptions { silence_trim: true };
+        let untrimmed = RecognitionOptions {
+            silence_trim: false,
+        };
+
+        let first = recognition_fingerprint("model-content-a", trimmed);
+
+        assert_eq!(first, recognition_fingerprint("model-content-a", trimmed));
+        assert_ne!(first, recognition_fingerprint("model-content-b", trimmed));
+        assert_ne!(first, recognition_fingerprint("model-content-a", untrimmed));
+        assert!(first.as_str().starts_with("recognition-v1:"));
     }
 
     impl RawTranscriber for RecordingTranscriber {

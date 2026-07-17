@@ -69,6 +69,8 @@ interface StatusSnapshot {
   dictionary: DictEntry[];
   dictionary_revision: number;
   dictionary_conflicts: DictionaryMigrationConflict[];
+  dictionary_error: string | null;
+  recognition_fingerprint: string | null;
   snippets_path: string;
   snippets: Snippet[];
   history_path: string;
@@ -180,6 +182,7 @@ const els = {
   dictTo: () => document.querySelector("#dict-to") as HTMLInputElement,
   dictList: () => document.querySelector("#dict-list") as HTMLUListElement,
   dictPath: () => document.querySelector("#dict-path") as HTMLElement,
+  dictError: () => document.querySelector("#dict-error") as HTMLElement,
   btnDictAdd: () => document.querySelector("#btn-dict-add") as HTMLButtonElement,
   snipCue: () => document.querySelector("#snip-cue") as HTMLInputElement,
   snipExpansion: () =>
@@ -462,8 +465,13 @@ function renderDictionary(
   entries: DictEntry[],
   conflicts: DictionaryMigrationConflict[],
   path: string,
+  currentFingerprint: string | null,
+  storageError: string | null,
 ) {
   els.dictPath().textContent = path || "—";
+  const error = els.dictError();
+  error.hidden = !storageError;
+  error.textContent = storageError ?? "";
   const list = els.dictList();
   list.innerHTML = "";
   if (!entries.length && !conflicts.length) {
@@ -515,9 +523,13 @@ function renderDictionary(
       entry.origin === "tuning"
         ? entry.edit_state === "modified_after_verification"
           ? "Tuning · explicitly edited"
-          : entry.verified_fingerprints.length
-            ? `Tuning · scoped to ${entry.verified_fingerprints.length} verified model${entry.verified_fingerprints.length === 1 ? "" : "s"}`
-            : "Tuning · needs verification"
+          : currentFingerprint === null
+            ? "Tuning · load the model to determine current status"
+            : entry.verified_fingerprints.some(
+                  (verified) => verified.fingerprint === currentFingerprint,
+                )
+              ? "Tuning · active for current Recognition Fingerprint"
+              : "Tuning · needs verification for current Recognition Fingerprint"
         : "Manual";
     text.innerHTML = `<code>${escapeHtml(entry.from)}</code> → <strong>${escapeHtml(entry.to)}</strong><span class="dict-meta">${escapeHtml(lifecycle)}</span>`;
 
@@ -532,8 +544,7 @@ function renderDictionary(
       if (to === null) return;
       try {
         const s = await invoke<StatusSnapshot>("dictionary_edit", {
-          entryId: entry.id,
-          expectedVersion: entry.version,
+          identity: { id: entry.id, version: entry.version },
           from,
           to,
         });
@@ -550,8 +561,7 @@ function renderDictionary(
     remove.addEventListener("click", async () => {
       try {
         const s = await invoke<StatusSnapshot>("dictionary_remove_entry", {
-          entryId: entry.id,
-          expectedVersion: entry.version,
+          identity: { id: entry.id, version: entry.version },
         });
         applyStatus(s);
       } catch (e) {
@@ -956,6 +966,8 @@ function applyStatus(s: StatusSnapshot) {
     s.dictionary ?? [],
     s.dictionary_conflicts ?? [],
     s.dictionary_path ?? "",
+    s.recognition_fingerprint ?? null,
+    s.dictionary_error ?? null,
   );
   renderSnippets(s.snippets ?? [], s.snippets_path ?? "");
   renderHistory(

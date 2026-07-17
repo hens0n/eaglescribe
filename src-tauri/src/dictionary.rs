@@ -4,6 +4,7 @@
 //! with case-insensitive whole-word (or multi-word phrase) matching.
 
 use crate::error::{AppError, AppResult};
+use crate::recognition::RecognitionFingerprint;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -30,7 +31,7 @@ pub enum EntryEditState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedRecognitionFingerprint {
-    pub fingerprint: String,
+    pub fingerprint: RecognitionFingerprint,
     pub verified_at_ms: u64,
 }
 
@@ -40,6 +41,12 @@ pub struct MigrationConflict {
     pub canonical_from: String,
     /// Exact legacy mappings retained for explicit user selection.
     pub choices: Vec<DictEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DictionaryEntryIdentity {
+    pub id: String,
+    pub version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,8 +98,16 @@ struct LegacyDictEntry {
 }
 
 impl Dictionary {
-    pub fn load_or_default(path: &Path) -> Self {
-        Self::load(path).unwrap_or_default()
+    /// Load mappings for the running app even when migration persistence fails.
+    /// The warning must be surfaced to the user; the readable mappings remain active.
+    pub fn load_for_runtime(path: &Path) -> (Self, Option<String>) {
+        match Self::load(path) {
+            Ok(dictionary) => (dictionary, None),
+            Err(error) => (
+                Self::read_without_persisting(path).unwrap_or_default(),
+                Some(format!("Dictionary storage error: {error}")),
+            ),
+        }
     }
 
     pub fn load(path: &Path) -> AppResult<Self> {
@@ -140,6 +155,8 @@ impl Dictionary {
         }
         let data = serde_json::to_string_pretty(self)
             .map_err(|e| AppError::from(format!("Serialize dictionary failed: {e}")))?;
+        let backup_path = dictionary_backup_path(path);
+        let mut backed_up_primary = false;
         if path.is_file() {
             let previous = fs::read(path)
                 .map_err(|e| AppError::from(format!("Read dictionary backup failed: {e}")))?;
@@ -147,11 +164,28 @@ impl Dictionary {
                 .ok()
                 .is_some_and(|text| parse_dictionary(text).is_ok());
             if previous_is_recoverable {
-                atomic_replace(&dictionary_backup_path(path), &previous)?;
+                atomic_replace(&backup_path, &previous)?;
+                backed_up_primary = true;
             }
+        }
+        if !backed_up_primary && !backup_path.is_file() {
+            atomic_replace(&backup_path, data.as_bytes())?;
         }
         atomic_replace(path, data.as_bytes())?;
         Ok(())
+    }
+
+    fn read_without_persisting(path: &Path) -> AppResult<Self> {
+        let primary = fs::read_to_string(path)
+            .map_err(|e| AppError::from(format!("Read dictionary failed: {e}")))?;
+        match parse_dictionary(&primary) {
+            Ok((dictionary, _)) => Ok(dictionary),
+            Err(primary_error) => {
+                let backup =
+                    fs::read_to_string(dictionary_backup_path(path)).map_err(|_| primary_error)?;
+                parse_dictionary(&backup).map(|(dictionary, _)| dictionary)
+            }
+        }
     }
 
     fn validate(&self) -> AppResult<()> {
@@ -283,8 +317,7 @@ impl Dictionary {
 
     pub fn edit_entry(
         &mut self,
-        entry_id: &str,
-        expected_version: u64,
+        identity: &DictionaryEntryIdentity,
         from: &str,
         to: &str,
     ) -> AppResult<()> {
@@ -296,13 +329,13 @@ impl Dictionary {
         let entry_index = self
             .entries
             .iter()
-            .position(|entry| entry.id == entry_id)
+            .position(|entry| entry.id == identity.id)
             .ok_or_else(|| AppError::from("Dictionary entry no longer exists"))?;
         let entry = &self.entries[entry_index];
-        if entry.version != expected_version {
+        if entry.version != identity.version {
             return Err(AppError::from(format!(
-                "Dictionary entry changed concurrently (expected version {expected_version}, found {})",
-                entry.version
+                "Dictionary entry changed concurrently (expected version {}, found {})",
+                identity.version, entry.version
             )));
         }
         let canonical_from = canonical_text(&from);
@@ -329,17 +362,17 @@ impl Dictionary {
         Ok(())
     }
 
-    pub fn remove_entry(&mut self, entry_id: &str, expected_version: u64) -> AppResult<()> {
+    pub fn remove_entry(&mut self, identity: &DictionaryEntryIdentity) -> AppResult<()> {
         let entry_index = self
             .entries
             .iter()
-            .position(|entry| entry.id == entry_id)
+            .position(|entry| entry.id == identity.id)
             .ok_or_else(|| AppError::from("Dictionary entry no longer exists"))?;
         let entry = &self.entries[entry_index];
-        if entry.version != expected_version {
+        if entry.version != identity.version {
             return Err(AppError::from(format!(
-                "Dictionary entry changed concurrently (expected version {expected_version}, found {})",
-                entry.version
+                "Dictionary entry changed concurrently (expected version {}, found {})",
+                identity.version, entry.version
             )));
         }
         self.entries.remove(entry_index);
@@ -360,13 +393,12 @@ impl Dictionary {
         removed
     }
 
-    /// Apply all entries to `text`. Longer `from` phrases run first.
-    pub fn apply(&self, text: &str) -> String {
-        self.apply_for_fingerprint(text, None)
-    }
-
     /// Apply entries active under the current Recognition Fingerprint.
-    pub fn apply_for_fingerprint(&self, text: &str, fingerprint: Option<&str>) -> String {
+    pub fn apply_for_fingerprint(
+        &self,
+        text: &str,
+        fingerprint: Option<&RecognitionFingerprint>,
+    ) -> String {
         if self.entries.is_empty() || text.is_empty() {
             return text.to_string();
         }
@@ -430,11 +462,25 @@ fn validate_entry<'a>(entry: &'a DictEntry, ids: &mut HashSet<&'a str>) -> AppRe
             "Manual or explicitly edited dictionary entries cannot retain Tuning verification",
         ));
     }
+    let mut verified_fingerprints = HashSet::new();
+    for verified in &entry.verified_fingerprints {
+        let fingerprint = verified.fingerprint.as_str();
+        if fingerprint.trim().is_empty() {
+            return Err(AppError::from(
+                "Verified Recognition Fingerprint identities must not be empty",
+            ));
+        }
+        if !verified_fingerprints.insert(fingerprint) {
+            return Err(AppError::from(
+                "Verified Recognition Fingerprint identities must be unique per entry",
+            ));
+        }
+    }
     Ok(())
 }
 
 impl DictEntry {
-    fn is_active_for(&self, fingerprint: Option<&str>) -> bool {
+    fn is_active_for(&self, fingerprint: Option<&RecognitionFingerprint>) -> bool {
         if self.origin == EntryOrigin::Manual
             || self.edit_state == EntryEditState::ModifiedAfterVerification
         {
@@ -443,7 +489,7 @@ impl DictEntry {
         fingerprint.is_some_and(|current| {
             self.verified_fingerprints
                 .iter()
-                .any(|verified| verified.fingerprint == current)
+                .any(|verified| &verified.fingerprint == current)
         })
     }
 }
@@ -749,7 +795,14 @@ mod tests {
         assert_eq!(dictionary.entries[0].version, 2);
         assert_eq!(dictionary.revision, 2);
         assert!(dictionary
-            .edit_entry(&id, 1, "café noir", "Stale Brand")
+            .edit_entry(
+                &DictionaryEntryIdentity {
+                    id: id.clone(),
+                    version: 1,
+                },
+                "café noir",
+                "Stale Brand",
+            )
             .is_err());
         assert_eq!(dictionary.entries[0].to, "New Brand");
 
@@ -766,19 +819,33 @@ mod tests {
             .id
             .clone();
         assert!(dictionary
-            .edit_entry(&phrase_id, 1, "CAFÉ NOIR", "collision")
+            .edit_entry(
+                &DictionaryEntryIdentity {
+                    id: phrase_id,
+                    version: 1,
+                },
+                "CAFÉ NOIR",
+                "collision",
+            )
             .is_err());
 
         dictionary
-            .remove_entry(&id, 2)
+            .remove_entry(&DictionaryEntryIdentity {
+                id: id.clone(),
+                version: 2,
+            })
             .expect("remove current entry");
         assert!(dictionary.entries.iter().all(|entry| entry.id != id));
-        assert!(dictionary.remove_entry(&id, 2).is_err());
+        assert!(dictionary
+            .remove_entry(&DictionaryEntryIdentity { id, version: 2 })
+            .is_err());
     }
 
     #[test]
     fn tuning_rule_scope_clears_after_explicit_edit() {
         let mut dictionary = Dictionary::default();
+        let model_a = RecognitionFingerprint::from_stable_id("model-a");
+        let model_b = RecognitionFingerprint::from_stable_id("model-b");
         dictionary.entries.push(DictEntry {
             id: "tuning-rule-1".into(),
             from: "eagle scribe".into(),
@@ -786,23 +853,30 @@ mod tests {
             origin: EntryOrigin::Tuning,
             edit_state: EntryEditState::Unmodified,
             verified_fingerprints: vec![VerifiedRecognitionFingerprint {
-                fingerprint: "model-a".into(),
+                fingerprint: model_a.clone(),
                 verified_at_ms: 123,
             }],
             version: 1,
         });
 
         assert_eq!(
-            dictionary.apply_for_fingerprint("use eagle scribe", Some("model-a")),
+            dictionary.apply_for_fingerprint("use eagle scribe", Some(&model_a)),
             "use EagleScribe"
         );
         assert_eq!(
-            dictionary.apply_for_fingerprint("use eagle scribe", Some("model-b")),
+            dictionary.apply_for_fingerprint("use eagle scribe", Some(&model_b)),
             "use eagle scribe"
         );
 
         dictionary
-            .edit_entry("tuning-rule-1", 1, "eagle scribe", "Eagle Scribe")
+            .edit_entry(
+                &DictionaryEntryIdentity {
+                    id: "tuning-rule-1".into(),
+                    version: 1,
+                },
+                "eagle scribe",
+                "Eagle Scribe",
+            )
             .expect("explicit user edit");
         let edited = &dictionary.entries[0];
         assert_eq!(edited.id, "tuning-rule-1");
@@ -810,7 +884,10 @@ mod tests {
         assert_eq!(edited.edit_state, EntryEditState::ModifiedAfterVerification);
         assert!(edited.verified_fingerprints.is_empty());
         assert_eq!(edited.version, 2);
-        assert_eq!(dictionary.apply("use eagle scribe"), "use Eagle Scribe");
+        assert_eq!(
+            dictionary.apply_for_fingerprint("use eagle scribe", None),
+            "use Eagle Scribe"
+        );
     }
 
     #[test]
@@ -841,6 +918,45 @@ mod tests {
         let recovered_again = Dictionary::load(&path).expect("backup remains recoverable");
         assert_eq!(recovered_again.entries[0].id, stable_id);
         assert_eq!(recovered_again.entries[0].to, "EagleScribe");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn first_dictionary_write_has_a_recoverable_backup() {
+        let path = unique_dictionary_path("first-write-backup");
+        let mut dictionary = Dictionary::default();
+        dictionary.upsert("local first", "local-first").unwrap();
+
+        dictionary.save(&path).expect("save new dictionary");
+        fs::write(&path, "{ interrupted").expect("corrupt primary");
+
+        let recovered = Dictionary::load(&path).expect("recover first write");
+        assert_eq!(recovered.entries[0].to, "local-first");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn runtime_load_keeps_legacy_mappings_when_migration_cannot_persist() {
+        let path = unique_dictionary_path("migration-write-failure");
+        fs::create_dir_all(path.parent().unwrap()).expect("create test directory");
+        fs::write(
+            &path,
+            r#"{"entries":[{"from":"eagle scribe","to":"EagleScribe"}]}"#,
+        )
+        .expect("write legacy dictionary");
+        fs::create_dir(dictionary_backup_path(&path)).expect("block backup file creation");
+
+        let (dictionary, warning) = Dictionary::load_for_runtime(&path);
+
+        assert_eq!(
+            dictionary.apply_for_fingerprint("use eagle scribe", None),
+            "use EagleScribe"
+        );
+        assert!(warning
+            .as_deref()
+            .is_some_and(|message| message.contains("Replace dictionary failed")));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -880,10 +996,13 @@ mod tests {
         let mut d = Dictionary::default();
         d.upsert("eagle scribe", "EagleScribe").unwrap();
         assert_eq!(
-            d.apply("I love eagle scribe so much"),
+            d.apply_for_fingerprint("I love eagle scribe so much", None),
             "I love EagleScribe so much"
         );
-        assert_eq!(d.apply("EAGLE SCRIBE rocks"), "EAGLESCRIBE rocks");
+        assert_eq!(
+            d.apply_for_fingerprint("EAGLE SCRIBE rocks", None),
+            "EAGLESCRIBE rocks"
+        );
     }
 
     #[test]
@@ -891,7 +1010,10 @@ mod tests {
         let mut d = Dictionary::default();
         d.upsert("type", "TYPE").unwrap();
         d.upsert("eagle scribe", "EagleScribe").unwrap();
-        assert_eq!(d.apply("use eagle scribe please"), "use EagleScribe please");
+        assert_eq!(
+            d.apply_for_fingerprint("use eagle scribe please", None),
+            "use EagleScribe please"
+        );
     }
 
     #[test]
@@ -910,6 +1032,9 @@ mod tests {
     fn word_boundaries() {
         let mut d = Dictionary::default();
         d.upsert("cat", "feline").unwrap();
-        assert_eq!(d.apply("the cat scattered"), "the feline scattered");
+        assert_eq!(
+            d.apply_for_fingerprint("the cat scattered", None),
+            "the feline scattered"
+        );
     }
 }
