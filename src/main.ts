@@ -106,6 +106,19 @@ interface TuningSnapshot {
   interrupted_attempt: boolean;
   incompatible_reason: string | null;
   error: string | null;
+  storage_blocked: boolean;
+  requires_destructive_confirmation: boolean;
+  recovery_receipt: {
+    details_available: boolean;
+    durable_stage: TuningStage | null;
+    completed_readings: number | null;
+    review_decisions: number | null;
+    approvals_preserved: number | null;
+    verification_attempts: number | null;
+    interrupted_work: boolean | null;
+    incompatible: boolean;
+    diagnostics_complete: boolean;
+  } | null;
   practice_prompt: string;
   reading_pass: "first" | "second" | null;
   phrase_id: string | null;
@@ -343,6 +356,8 @@ const els = {
     document.querySelector("#tuning-ready-copy") as HTMLElement,
   tuningMessage: () =>
     document.querySelector("#tuning-message") as HTMLElement,
+  tuningRecoveryReceipt: () =>
+    document.querySelector("#tuning-recovery-receipt") as HTMLElement,
   tuningError: () => document.querySelector("#tuning-error") as HTMLElement,
   tuningPracticePrompt: () =>
     document.querySelector("#tuning-practice-prompt") as HTMLElement,
@@ -374,6 +389,12 @@ const els = {
     document.querySelector("#btn-tuning-continue-review") as HTMLButtonElement,
   btnTuningVerification: () =>
     document.querySelector("#btn-tuning-verification") as HTMLButtonElement,
+  btnTuningCancelAttempt: () =>
+    document.querySelector("#btn-tuning-cancel-attempt") as HTMLButtonElement,
+  btnTuningRetrySave: () =>
+    document.querySelector("#btn-tuning-retry-save") as HTMLButtonElement,
+  btnTuningCancel: () =>
+    document.querySelector("#btn-tuning-cancel") as HTMLButtonElement,
 };
 
 /**
@@ -385,6 +406,7 @@ let setupForcedOpen = false;
 let onboardingDismissed = false;
 /** Host OS from status for macOS vs Linux checklist bodies. */
 let hostOs: string = "other";
+let tuningRequiresDestructiveConfirmation = false;
 /**
  * When the user dismisses failure-time help, hide until permissions_help changes
  * (or clears). Does not depend on onboarding_dismissed.
@@ -1165,6 +1187,7 @@ function renderTuningReview(s: TuningSnapshot) {
 function applyTuningStatus(s: TuningSnapshot) {
   tuningScreenActive = s.screen_active;
   tuningActivity = s.activity;
+  tuningRequiresDestructiveConfirmation = s.requires_destructive_confirmation;
   const rail = els.tuningStageRail();
   rail.innerHTML = "";
   for (const stage of s.stages) {
@@ -1191,11 +1214,34 @@ function applyTuningStatus(s: TuningSnapshot) {
   els.btnTuningDoLater().hidden = true;
   els.btnTuningContinueReview().hidden = true;
   els.btnTuningVerification().hidden = true;
+  els.btnTuningCancelAttempt().hidden = true;
+  els.btnTuningRetrySave().hidden = true;
+  els.btnTuningCancel().hidden = !(
+    resume ||
+    incompatible ||
+    (active && s.last_durable_stage !== "result")
+  );
   els.tuningReview().hidden = true;
   els.tuningResult().hidden = true;
   els.tuningResult().replaceChildren();
   els.tuningPracticePrompt().hidden = true;
   els.tuningPhrasePosition().hidden = true;
+  const receipt = els.tuningRecoveryReceipt();
+  receipt.hidden = !s.recovery_receipt;
+  if (s.recovery_receipt) {
+    const recovered = s.recovery_receipt;
+    receipt.textContent = recovered.details_available
+      ? `Recovery receipt — durable stage: ${formatTuningStage(recovered.durable_stage)}; ${recovered.completed_readings ?? 0} completed readings; ${recovered.review_decisions ?? 0} Review decisions (${recovered.approvals_preserved ?? 0} approvals preserved); ${recovered.verification_attempts ?? 0} Verification Attempts. ${
+          recovered.interrupted_work
+            ? "Interrupted work must be repeated."
+            : "No interrupted work is pending."
+        } ${
+          recovered.incompatible
+            ? "The Recognition Fingerprint or a behavior contract changed; explicit Start over is required."
+            : "The Recognition Fingerprint and behavior contracts match."
+        } Diagnostics: ${recovered.diagnostics_complete ? "complete" : "partial"}.`
+      : `Recovery receipt — the saved checkpoint is unreadable, so its durable stage, progress, approvals, and interrupted work cannot be reported. Start over requires confirmation because scored evidence may be present. Committed Personal Dictionary entries remain unchanged. Diagnostics: ${recovered.diagnostics_complete ? "complete" : "partial"}.`;
+  }
 
   let title = "Ready";
   let message = "Before any scored evidence, preflight loads the model, opens the microphone, computes the Recognition Fingerprint, and proves the checkpoint can be saved atomically.";
@@ -1342,7 +1388,6 @@ function applyTuningStatus(s: TuningSnapshot) {
   }
 
   els.tuningTitle().textContent = title;
-  els.tuningMessage().textContent = message;
   const error = els.tuningError();
   error.hidden = !s.error;
   error.textContent = s.error ?? "";
@@ -1357,6 +1402,22 @@ function applyTuningStatus(s: TuningSnapshot) {
     s.activity === "transcribing" ||
     (s.activity === "idle" && !s.interrupted_attempt);
   els.btnTuningDoLater().disabled = busy;
+  els.btnTuningCancelAttempt().hidden = !(
+    active &&
+    (s.activity === "recording" || s.activity === "transcribing")
+  );
+  els.btnTuningRetrySave().hidden = !s.storage_blocked;
+  if (s.storage_blocked) {
+    message = "Storage failure stopped Tuning at the last acknowledged checkpoint. Retry Save or Cancel Tuning; no pending work has been counted.";
+    els.btnTuningStartOver().disabled = true;
+    els.btnTuningPractice().disabled = true;
+    els.btnTuningReading().disabled = true;
+    els.btnTuningRetryPhrase().disabled = true;
+    els.btnTuningDoLater().disabled = true;
+    els.btnTuningContinueReview().disabled = true;
+    els.btnTuningVerification().disabled = true;
+  }
+  els.tuningMessage().textContent = message;
 
   // The Tuning screen owns microphone/model operations. Hotkeys are also
   // rejected by Rust, while these controls make the in-window rule visible.
@@ -1671,9 +1732,12 @@ async function openMacPrivacy(pane: "microphone" | "accessibility", label: strin
 window.addEventListener("DOMContentLoaded", async () => {
   setupTabs();
 
-  const invokeTuning = async (command: string) => {
+  const invokeTuning = async (
+    command: string,
+    args: Record<string, unknown> = {},
+  ) => {
     try {
-      applyTuningStatus(await invoke<TuningSnapshot>(command));
+      applyTuningStatus(await invoke<TuningSnapshot>(command, args));
     } catch (e) {
       console.error(e);
       alert(String(e));
@@ -1688,7 +1752,12 @@ window.addEventListener("DOMContentLoaded", async () => {
     void invokeTuning("tuning_resume");
   });
   els.btnTuningStartOver().addEventListener("click", () => {
-    void invokeTuning("tuning_start_over");
+    const confirmed =
+      !tuningRequiresDestructiveConfirmation ||
+      confirm(
+        "Start over will delete all unfinished Tuning evidence, Review decisions, approvals, staged rules, and Verification progress. Committed Personal Dictionary entries remain unchanged. Start over?",
+      );
+    if (confirmed) void invokeTuning("tuning_start_over", { confirmed: true });
   });
   els.btnTuningPractice().addEventListener("click", () => {
     void invokeTuning(
@@ -1719,6 +1788,20 @@ window.addEventListener("DOMContentLoaded", async () => {
         ? "tuning_stop_verification"
         : "tuning_start_verification",
     );
+  });
+  els.btnTuningCancelAttempt().addEventListener("click", () => {
+    void invokeTuning("tuning_cancel_attempt");
+  });
+  els.btnTuningRetrySave().addEventListener("click", () => {
+    void invokeTuning("tuning_retry_save");
+  });
+  els.btnTuningCancel().addEventListener("click", () => {
+    const confirmed =
+      !tuningRequiresDestructiveConfirmation ||
+      confirm(
+        "Cancel Tuning will delete all unfinished Tuning evidence, Review decisions, approvals, staged rules, and Verification progress. Committed Personal Dictionary entries remain unchanged. Cancel Tuning?",
+      );
+    if (confirmed) void invokeTuning("tuning_cancel", { confirmed: true });
   });
 
   els.btnSetupDismiss().addEventListener("click", () => {

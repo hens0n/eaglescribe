@@ -58,17 +58,41 @@ fn tuning_resume(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapsh
 
 #[tauri::command]
 fn tuning_start(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
-    state.inner().tuning_start(false)
+    state.inner().tuning_start()
 }
 
 #[tauri::command]
-fn tuning_start_over(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
-    state.inner().tuning_start(true)
+fn tuning_start_over(
+    confirmed: bool,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_start_over(confirmed)
 }
 
 #[tauri::command]
-fn tuning_start_practice(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
-    state.inner().tuning_start_practice()
+fn tuning_cancel_attempt(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_cancel_attempt()
+}
+
+#[tauri::command]
+fn tuning_cancel(
+    confirmed: bool,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_cancel(confirmed)
+}
+
+#[tauri::command]
+fn tuning_retry_save(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_retry_save()
+}
+
+#[tauri::command]
+fn tuning_start_practice(
+    app: AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_start_practice(&app)
 }
 
 #[tauri::command]
@@ -80,8 +104,11 @@ fn tuning_stop_practice(
 }
 
 #[tauri::command]
-fn tuning_start_reading(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
-    state.inner().tuning_start_reading()
+fn tuning_start_reading(
+    app: AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_start_reading(&app)
 }
 
 #[tauri::command]
@@ -117,8 +144,11 @@ fn tuning_continue_review(state: tauri::State<'_, SharedState>) -> AppResult<Tun
 }
 
 #[tauri::command]
-fn tuning_start_verification(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
-    state.inner().tuning_start_verification()
+fn tuning_start_verification(
+    app: AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_start_verification(&app)
 }
 
 #[tauri::command]
@@ -1161,6 +1191,9 @@ pub fn run() {
             tuning_resume,
             tuning_start,
             tuning_start_over,
+            tuning_cancel_attempt,
+            tuning_cancel,
+            tuning_retry_save,
             tuning_start_practice,
             tuning_stop_practice,
             tuning_start_reading,
@@ -1211,6 +1244,7 @@ pub fn run() {
         })
         .setup(|app| {
             let state = Arc::clone(app.state::<SharedState>().inner());
+            state.start_tuning_sleep_watchdog(app.handle());
 
             // Menu-bar-only (hide Dock) applies only at launch from settings.json.
             #[cfg(target_os = "macos")]
