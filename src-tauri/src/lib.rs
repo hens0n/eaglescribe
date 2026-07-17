@@ -79,6 +79,29 @@ fn tuning_stop_practice(
 }
 
 #[tauri::command]
+fn tuning_start_reading(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_start_reading()
+}
+
+#[tauri::command]
+fn tuning_stop_reading(
+    app: AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_stop_reading(&app)
+}
+
+#[tauri::command]
+fn tuning_retry_phrase(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_retry_phrase()
+}
+
+#[tauri::command]
+fn tuning_defer_phrase(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_defer_phrase()
+}
+
+#[tauri::command]
 fn tuning_leave(state: tauri::State<'_, SharedState>) -> TuningSnapshot {
     state.inner().tuning_leave()
 }
@@ -1114,6 +1137,10 @@ pub fn run() {
             tuning_start_over,
             tuning_start_practice,
             tuning_stop_practice,
+            tuning_start_reading,
+            tuning_stop_reading,
+            tuning_retry_phrase,
+            tuning_defer_phrase,
             tuning_leave,
             set_model_path,
             set_polish_mode,

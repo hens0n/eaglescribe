@@ -80,6 +80,12 @@ interface TuningSnapshot {
   incompatible_reason: string | null;
   error: string | null;
   practice_prompt: string;
+  reading_pass: "first" | "second" | null;
+  phrase_id: string | null;
+  phrase_text: string | null;
+  phrase_position: number | null;
+  phrase_total: number | null;
+  candidate_count: number | null;
   stages: {
     id: TuningStage;
     label: string;
@@ -287,6 +293,8 @@ const els = {
   tuningError: () => document.querySelector("#tuning-error") as HTMLElement,
   tuningPracticePrompt: () =>
     document.querySelector("#tuning-practice-prompt") as HTMLElement,
+  tuningPhrasePosition: () =>
+    document.querySelector("#tuning-phrase-position") as HTMLElement,
   btnTuningStart: () =>
     document.querySelector("#btn-tuning-start") as HTMLButtonElement,
   btnTuningResume: () =>
@@ -295,6 +303,12 @@ const els = {
     document.querySelector("#btn-tuning-start-over") as HTMLButtonElement,
   btnTuningPractice: () =>
     document.querySelector("#btn-tuning-practice") as HTMLButtonElement,
+  btnTuningReading: () =>
+    document.querySelector("#btn-tuning-reading") as HTMLButtonElement,
+  btnTuningRetryPhrase: () =>
+    document.querySelector("#btn-tuning-retry-phrase") as HTMLButtonElement,
+  btnTuningDoLater: () =>
+    document.querySelector("#btn-tuning-do-later") as HTMLButtonElement,
 };
 
 /**
@@ -975,7 +989,11 @@ function applyTuningStatus(s: TuningSnapshot) {
   els.btnTuningResume().hidden = !resume;
   els.btnTuningStartOver().hidden = !(resume || incompatible || active);
   els.btnTuningPractice().hidden = true;
+  els.btnTuningReading().hidden = true;
+  els.btnTuningRetryPhrase().hidden = true;
+  els.btnTuningDoLater().hidden = true;
   els.tuningPracticePrompt().hidden = true;
+  els.tuningPhrasePosition().hidden = true;
 
   let title = "Ready";
   let message = "Before any scored evidence, preflight loads the model, opens the microphone, computes the Recognition Fingerprint, and proves the checkpoint can be saved atomically.";
@@ -1009,9 +1027,43 @@ function applyTuningStatus(s: TuningSnapshot) {
       els.btnTuningPractice().textContent = "Start Practice";
     }
   } else if (active && s.last_durable_stage === "first_reading") {
-    title = "Practice complete";
-    message =
-      "Practice was saved successfully. First reading is now the current durable stage.";
+    title = "First reading";
+    message = "Read naturally. This is the first full pass.";
+  } else if (active && s.last_durable_stage === "second_reading") {
+    title = "Second reading";
+    message = "Read naturally. This is the full rotated second pass.";
+  } else if (active && s.last_durable_stage === "review") {
+    title = "Review";
+    const count = s.candidate_count ?? 0;
+    message = count === 1
+      ? "Both reading passes are complete. 1 Candidate Correction is ready for Review."
+      : `Both reading passes are complete. ${count} Candidate Corrections are ready for Review.`;
+  }
+
+  const readingStage =
+    active &&
+    (s.last_durable_stage === "first_reading" ||
+      s.last_durable_stage === "second_reading");
+  if (readingStage && s.phrase_text) {
+    els.tuningPracticePrompt().hidden = false;
+    els.tuningPracticePrompt().textContent = s.phrase_text;
+    els.tuningPhrasePosition().hidden = false;
+    els.tuningPhrasePosition().textContent = `Phrase ${s.phrase_position ?? 1} of ${s.phrase_total ?? 10}`;
+    els.btnTuningReading().hidden = false;
+    els.btnTuningRetryPhrase().hidden = false;
+    els.btnTuningDoLater().hidden = false;
+    if (s.activity === "recording") {
+      message = "Read naturally, then stop when you finish the phrase.";
+      els.btnTuningReading().textContent = "Stop & save reading";
+    } else if (s.activity === "transcribing") {
+      message = "Transcribing and saving this reading locally…";
+      els.btnTuningReading().textContent = "Saving…";
+    } else {
+      els.btnTuningReading().textContent = "Start reading";
+      if (s.interrupted_attempt) {
+        message = "The prior attempt did not count. Read naturally and try this phrase again.";
+      }
+    }
   }
 
   els.tuningTitle().textContent = title;
@@ -1023,6 +1075,12 @@ function applyTuningStatus(s: TuningSnapshot) {
   els.btnTuningResume().disabled = busy;
   els.btnTuningStartOver().disabled = busy;
   els.btnTuningPractice().disabled = busy && s.activity !== "recording";
+  els.btnTuningReading().disabled = busy && s.activity !== "recording";
+  els.btnTuningRetryPhrase().disabled =
+    s.activity === "preflight" ||
+    s.activity === "transcribing" ||
+    (s.activity === "idle" && !s.interrupted_attempt);
+  els.btnTuningDoLater().disabled = busy;
 
   // The Tuning screen owns microphone/model operations. Hotkeys are also
   // rejected by Rust, while these controls make the in-window rule visible.
@@ -1362,6 +1420,19 @@ window.addEventListener("DOMContentLoaded", async () => {
         ? "tuning_stop_practice"
         : "tuning_start_practice",
     );
+  });
+  els.btnTuningReading().addEventListener("click", () => {
+    void invokeTuning(
+      tuningActivity === "recording"
+        ? "tuning_stop_reading"
+        : "tuning_start_reading",
+    );
+  });
+  els.btnTuningRetryPhrase().addEventListener("click", () => {
+    void invokeTuning("tuning_retry_phrase");
+  });
+  els.btnTuningDoLater().addEventListener("click", () => {
+    void invokeTuning("tuning_defer_phrase");
   });
 
   els.btnSetupDismiss().addEventListener("click", () => {

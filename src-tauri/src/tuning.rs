@@ -466,6 +466,54 @@ pub struct InferenceResult {
     pub aggregate_reason_codes: Vec<ReasonCode>,
 }
 
+/// Minimum derived evidence allowed in an unfinished Tuning checkpoint.
+/// Rejected readings retain only reason codes; qualifying readings retain the
+/// stable probe and normalized signature needed for cross-pass agreement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadingEvidence {
+    pub probe_span_id: Option<String>,
+    pub normalized_source: Option<String>,
+    pub normalized_target: Option<String>,
+    pub reason_codes: Vec<ReasonCode>,
+}
+
+impl ReadingEvidence {
+    fn from_result(result: &ReadingResult) -> Self {
+        let qualifies = result.reason_codes.is_empty();
+        Self {
+            probe_span_id: qualifies.then(|| result.probe_span_id.clone()).flatten(),
+            normalized_source: qualifies
+                .then(|| result.normalized_source.clone())
+                .flatten(),
+            normalized_target: qualifies
+                .then(|| result.normalized_target.clone())
+                .flatten(),
+            reason_codes: result.reason_codes.clone(),
+        }
+    }
+
+    fn qualifying_mapping(&self) -> Option<(&str, &str, &str)> {
+        if !self.reason_codes.is_empty() {
+            return None;
+        }
+        Some((
+            self.probe_span_id.as_deref()?,
+            self.normalized_source.as_deref()?,
+            self.normalized_target.as_deref()?,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionInferenceResult {
+    pub phrase_id: String,
+    pub decision: InferenceDecision,
+    pub reading_reason_codes: [Vec<ReasonCode>; 2],
+    pub aggregate_reason_codes: Vec<ReasonCode>,
+}
+
 /// Infer one inactive Candidate Correction from two separated raw readings.
 ///
 /// This is a pure, deterministic operation: it performs no I/O and retains no
@@ -475,13 +523,53 @@ pub fn infer_candidate_correction(
     first_raw_reading: &str,
     second_raw_reading: &str,
 ) -> InferenceResult {
-    let expected = normalize_tokens(phrase.text);
-    let first = align_reading(phrase, &expected, first_raw_reading);
-    let second = align_reading(phrase, &expected, second_raw_reading);
-    let reading_results = [first, second];
+    let first = derive_reading_result(phrase, first_raw_reading);
+    let second = derive_reading_result(phrase, second_raw_reading);
+    infer_candidate_correction_from_readings(phrase, first, second)
+}
 
-    let first_mapping = qualifying_mapping(&reading_results[0]);
-    let second_mapping = qualifying_mapping(&reading_results[1]);
+/// Reduce one raw reading to the minimum resumable inference evidence. Callers
+/// must drop the complete transcript after this returns and persist only this
+/// derived result.
+pub fn derive_reading_result(phrase: &TuningPhrase, raw_reading: &str) -> ReadingResult {
+    align_reading(phrase, &normalize_tokens(phrase.text), raw_reading)
+}
+
+pub fn derive_reading_evidence(phrase: &TuningPhrase, raw_reading: &str) -> ReadingEvidence {
+    ReadingEvidence::from_result(&derive_reading_result(phrase, raw_reading))
+}
+
+/// Combine two separated, already-derived readings without needing either raw
+/// transcript again.
+pub fn infer_candidate_correction_from_readings(
+    phrase: &TuningPhrase,
+    first: ReadingResult,
+    second: ReadingResult,
+) -> InferenceResult {
+    let reading_results = [first, second];
+    let first_evidence = ReadingEvidence::from_result(&reading_results[0]);
+    let second_evidence = ReadingEvidence::from_result(&reading_results[1]);
+    let session = infer_candidate_correction_from_evidence(
+        phrase.id,
+        &first_evidence,
+        &second_evidence,
+    );
+
+    InferenceResult {
+        phrase_id: phrase.id.to_owned(),
+        decision: session.decision,
+        reading_results,
+        aggregate_reason_codes: session.aggregate_reason_codes,
+    }
+}
+
+pub fn infer_candidate_correction_from_evidence(
+    phrase_id: &str,
+    first: &ReadingEvidence,
+    second: &ReadingEvidence,
+) -> SessionInferenceResult {
+    let first_mapping = first.qualifying_mapping();
+    let second_mapping = second.qualifying_mapping();
     let (decision, aggregate_reason_codes) = match (first_mapping, second_mapping) {
         (Some(first), Some(second)) if first == second => (
             InferenceDecision::Candidate(CandidateCorrection {
@@ -492,40 +580,23 @@ pub fn infer_candidate_correction(
             }),
             Vec::new(),
         ),
-        (Some(_), Some(_)) => (
-            InferenceDecision::Rejected,
-            vec![ReasonCode::ReadingsDisagree],
-        ),
+        (Some(_), Some(_)) => (InferenceDecision::Rejected, vec![ReasonCode::ReadingsDisagree]),
         _ => {
             let mut reasons = Vec::new();
-            for reading in &reading_results {
-                for reason in &reading.reason_codes {
-                    if !reasons.contains(reason) {
-                        reasons.push(*reason);
-                    }
+            for reason in first.reason_codes.iter().chain(&second.reason_codes) {
+                if !reasons.contains(reason) {
+                    reasons.push(*reason);
                 }
             }
             (InferenceDecision::Rejected, reasons)
         }
     };
-
-    InferenceResult {
-        phrase_id: phrase.id.to_owned(),
+    SessionInferenceResult {
+        phrase_id: phrase_id.to_owned(),
         decision,
-        reading_results,
+        reading_reason_codes: [first.reason_codes.clone(), second.reason_codes.clone()],
         aggregate_reason_codes,
     }
-}
-
-fn qualifying_mapping(reading: &ReadingResult) -> Option<(&str, &str, &str)> {
-    if !reading.reason_codes.is_empty() {
-        return None;
-    }
-    Some((
-        reading.probe_span_id.as_deref()?,
-        reading.normalized_source.as_deref()?,
-        reading.normalized_target.as_deref()?,
-    ))
 }
 
 fn align_reading(phrase: &TuningPhrase, expected: &[String], raw_reading: &str) -> ReadingResult {
