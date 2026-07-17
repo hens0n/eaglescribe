@@ -560,11 +560,13 @@ impl DictEntry {
         {
             return true;
         }
-        fingerprint.is_some_and(|current| {
-            self.verified_fingerprints
-                .iter()
-                .any(|verified| &verified.fingerprint == current)
-        })
+        fingerprint.is_some_and(|current| self.has_verified_fingerprint(current))
+    }
+
+    pub(crate) fn has_verified_fingerprint(&self, fingerprint: &RecognitionFingerprint) -> bool {
+        self.verified_fingerprints
+            .iter()
+            .any(|verified| &verified.fingerprint == fingerprint)
     }
 
     pub(crate) fn has_equivalent_mapping(&self, from: &str, to: &str) -> bool {
@@ -1002,6 +1004,11 @@ mod tests {
             dictionary.apply_for_fingerprint("use eagle scribe", Some(&model_b)),
             "use eagle scribe"
         );
+        assert_eq!(
+            dictionary.apply_for_fingerprint("use eagle scribe", Some(&model_a)),
+            "use EagleScribe",
+            "returning to a verified Recognition Fingerprint reactivates the rule"
+        );
 
         dictionary
             .edit_entry(
@@ -1023,6 +1030,42 @@ mod tests {
             dictionary.apply_for_fingerprint("use eagle scribe", None),
             "use Eagle Scribe"
         );
+    }
+
+    #[test]
+    fn editing_only_the_source_of_a_tuning_rule_makes_it_globally_active() {
+        let mut dictionary = Dictionary::default();
+        let fingerprint = RecognitionFingerprint::from_stable_id("model-a");
+        dictionary.entries.push(DictEntry {
+            id: "tuning-rule-1".into(),
+            from: "eagle scribe".into(),
+            to: "EagleScribe".into(),
+            origin: EntryOrigin::Tuning,
+            edit_state: EntryEditState::Unmodified,
+            verified_fingerprints: vec![VerifiedRecognitionFingerprint {
+                fingerprint,
+                verified_at_ms: 123,
+            }],
+            version: 1,
+        });
+
+        dictionary
+            .edit_entry(
+                &DictionaryEntryIdentity {
+                    id: "tuning-rule-1".into(),
+                    version: 1,
+                },
+                "the eagle scribe",
+                "EagleScribe",
+            )
+            .expect("explicit source edit");
+
+        let edited = &dictionary.entries[0];
+        assert_eq!(edited.id, "tuning-rule-1");
+        assert_eq!(edited.origin, EntryOrigin::Tuning);
+        assert_eq!(edited.edit_state, EntryEditState::ModifiedAfterVerification);
+        assert!(edited.verified_fingerprints.is_empty());
+        assert!(edited.is_active_for(None));
     }
 
     #[test]

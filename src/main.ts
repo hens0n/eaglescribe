@@ -663,7 +663,7 @@ function renderDictionary(
                   (verified) => verified.fingerprint === currentFingerprint,
                 )
               ? "Tuning · active for current Recognition Fingerprint"
-              : "Tuning · needs verification for current Recognition Fingerprint"
+              : "Tuning · Needs verification for this model"
         : "Manual";
     text.innerHTML = `<code>${escapeHtml(entry.from)}</code> → <strong>${escapeHtml(entry.to)}</strong><span class="dict-meta">${escapeHtml(lifecycle)}</span>`;
 
