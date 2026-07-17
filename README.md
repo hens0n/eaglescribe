@@ -261,6 +261,33 @@ scripts/             # model download helper
 .github/workflows/   # release CI (macOS Metal + Linux)
 ```
 
+## Required pull-request gate
+
+Every pull request must pass the platform-independent **Tuning CI** matrix on
+both `macos-14` and `ubuntu-22.04`. The two required checks are named
+`Tuning semantics (macOS)` and `Tuning semantics (Linux)`.
+
+Both rows run the production corpus, normalizer, Candidate Correction inference,
+Personal Dictionary matcher and overlay, Verification Pass scorer, durable
+Tuning Session orchestration, recovery, and content-free diagnostics fixtures.
+The full-session fixtures cover zero candidates, successful approval and
+verification, partial success with an individual rollback, and all rules rolled
+back. Privacy sentinels and an explicit unsafe-candidate rejection are assertions,
+not updateable output snapshots, so refreshing expected output cannot bless a
+Candidate Correction that production inference rejected.
+
+The required commands are:
+
+```bash
+npm run build
+cargo check --manifest-path src-tauri/Cargo.toml --all-targets --locked
+cargo test --manifest-path src-tauri/Cargo.toml --all-targets --locked
+```
+
+These deterministic checks do not load Whisper or require microphone hardware;
+their behavior must be identical on both operating systems. Shipped-platform
+audio replay and release microphone smokes are separate hardware/model gates.
+
 ## Polish (smart cleanup)
 
 After STT, **smart** mode (default) runs offline rules:

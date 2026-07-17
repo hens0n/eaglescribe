@@ -16,6 +16,9 @@ pub mod tuning;
 pub mod tuning_diagnostics;
 pub mod tuning_session;
 
+#[cfg(test)]
+mod tuning_ci;
+
 use error::{AppError, AppResult};
 use hotkey::{
     detect_linux_session, hotkey_registration_failure_log, parse_shortcut, HotkeyRegisterReport,
