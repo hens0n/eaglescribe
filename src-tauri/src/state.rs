@@ -5,6 +5,10 @@ use crate::history::{self, HistoryBook, HistoryEntry};
 use crate::hotkey;
 use crate::llm;
 use crate::polish::{self, PolishMode};
+use crate::recognition::{
+    recognize_resampled, resample_capture, CapturedAudio, RecognitionErrorKind,
+    RecognitionOptions, SilenceTrimReport,
+};
 use crate::settings::{self, AppSettings, HotkeyMode};
 use crate::snippets::{self, Snippet, SnippetBook};
 use crate::stt::{self, WhisperEngine};
@@ -729,24 +733,33 @@ impl AppState {
             std::thread::sleep(std::time::Duration::from_millis(post_roll));
         }
 
-        let (samples, rate) = match session.stop() {
-            Ok(v) => v,
-            Err(e) => {
-                self.fail_status(app, DictationStatus::Error, e.to_string());
-                return Err(e);
+        let capture = match CapturedAudio::from_capture(session.stop()) {
+            Ok(capture) => capture,
+            Err(error) => {
+                self.fail_status(app, DictationStatus::Error, error.to_string());
+                return Err(AppError::from(error.to_string()));
             }
         };
 
-        let mut audio = crate::audio::resample_to_16k(&samples, rate);
-        let duration_s = audio.len() as f32 / 16_000.0;
-        let peak = crate::audio::peak_abs(&audio);
+        let resampled = match resample_capture(capture) {
+            Ok(resampled) => resampled,
+            Err(error) => {
+                self.fail_status(app, DictationStatus::Error, error.to_string());
+                return Err(AppError::from(error.to_string()));
+            }
+        };
+        // Keep the ordinary-dictation dogfood dump outside the reusable path.
+        // Tuning callers use `recognize_raw` directly and never persist audio.
+        let duration_s = resampled.samples().len() as f32 / 16_000.0;
+        let peak = crate::audio::peak_abs(resampled.samples());
         self.push_log(format!(
             "Captured {duration_s:.1}s audio ({} samples @ 16 kHz, peak={peak:.4}, device rate={rate})",
-            audio.len()
+            resampled.samples().len(),
+            rate = resampled.input_sample_rate(),
         ));
         // Overwrite last-take dump so we can re-run STT offline if text looks cut off.
         let capture_path = crate::audio::default_last_capture_path();
-        match crate::audio::write_wav_16k_mono(&capture_path, &audio) {
+        match crate::audio::write_wav_16k_mono(&capture_path, resampled.samples()) {
             Ok(()) => self.push_log(format!(
                 "Saved last capture ({duration_s:.1}s) → {}",
                 capture_path.display()
@@ -754,61 +767,10 @@ impl AppState {
             Err(e) => self.push_log(format!("Could not save last capture wav: {e}")),
         };
 
-        // Near-zero peak almost always means macOS denied the mic (or wrong
-        // device) and still delivered a stream of silence — not "no speech".
-        if peak < crate::audio::SILENT_CAPTURE_PEAK {
-            let err = format!(
-                "No audio captured — check microphone permissions (peak={peak:.4}). System Settings → Privacy & Security → Microphone → enable EagleScribe."
-            );
-            self.push_log(err.clone());
-            self.fail_status(app, DictationStatus::Error, err.clone());
-            return Err(AppError::from(err));
-        }
-
-        // Optional leading/trailing silence trim (dictation + Command Mode).
-        // Applies current setting at stop time; mid-utterance pauses untouched.
         let silence_trim = {
             let g = self.inner.lock();
             g.settings.silence_trim
         };
-        if silence_trim {
-            match crate::audio::trim_silence_16k(&audio) {
-                crate::audio::TrimOutcome::Ok(trimmed) => {
-                    self.push_log(format!(
-                        "Silence trim: {:.1}s → {:.1}s (removed head {}ms, tail {}ms, threshold={:.4})",
-                        trimmed.original_ms as f32 / 1000.0,
-                        trimmed.trimmed_ms as f32 / 1000.0,
-                        trimmed.head_ms,
-                        trimmed.tail_ms,
-                        crate::audio::speech_rms_threshold(&audio)
-                    ));
-                    audio = trimmed.samples;
-                }
-                crate::audio::TrimOutcome::BelowFloor {
-                    original_ms,
-                    remaining_ms,
-                } => {
-                    // Quiet but non-silent takes: skip trim and still run Whisper
-                    // so soft speech / quiet mics are not hard-failed at the gate.
-                    // (Spec intent: normal speech must not die in the fail path.)
-                    self.push_log(format!(
-                        "Silence trim found no speech frames ({original_ms}ms → {remaining_ms}ms, peak={peak:.4}, threshold={:.4}) — keeping full buffer for STT",
-                        crate::audio::speech_rms_threshold(&audio)
-                    ));
-                }
-            }
-        }
-
-        // Trailing silence so Whisper does not clip the last words / second
-        // sentence when the buffer ends immediately after speech.
-        let pre_pad_samples = audio.len();
-        audio = crate::audio::pad_for_whisper_16k(&audio);
-        if audio.len() > pre_pad_samples {
-            self.push_log(format!(
-                "STT pad: +{}ms trailing silence for decoder",
-                crate::audio::WHISPER_TAIL_PAD_MS
-            ));
-        }
 
         // Clone Arc so Whisper runs without holding the state mutex.
         // Holding the mutex during STT deadlocks with main-thread paste/hotkeys.
@@ -819,24 +781,55 @@ impl AppState {
                 .ok_or_else(|| AppError::from("Engine not loaded"))?
         };
 
-        let raw = match engine.transcribe_16k_mono(&audio) {
-            Ok(t) => t,
-            Err(e) => {
-                self.fail_status(app, DictationStatus::Error, e.to_string());
-                return Err(e);
+        let recognition = match recognize_resampled(
+            resampled,
+            RecognitionOptions { silence_trim },
+            engine.as_ref(),
+        ) {
+            Ok(recognition) => recognition,
+            Err(error) if error.kind() == RecognitionErrorKind::EmptyTranscript => {
+                {
+                    let mut g = self.inner.lock();
+                    g.status = DictationStatus::Idle;
+                    g.last_error = Some("Empty transcript (try speaking longer)".into());
+                    g.log.push("Empty transcript.".into());
+                }
+                let _ = app.emit("dictation-status", self.snapshot());
+                return Err(AppError::from(error.to_string()));
+            }
+            Err(error) => {
+                self.fail_status(app, DictationStatus::Error, error.to_string());
+                return Err(AppError::from(error.to_string()));
             }
         };
 
-        if raw.trim().is_empty() {
-            {
-                let mut g = self.inner.lock();
-                g.status = DictationStatus::Idle;
-                g.last_error = Some("Empty transcript (try speaking longer)".into());
-                g.log.push("Empty transcript.".into());
-            }
-            let _ = app.emit("dictation-status", self.snapshot());
-            return Err(AppError::from("Empty transcript"));
+        match recognition.preprocessing.silence_trim {
+            SilenceTrimReport::Disabled => {}
+            SilenceTrimReport::Applied {
+                original_ms,
+                trimmed_ms,
+                head_ms,
+                tail_ms,
+                threshold,
+            } => self.push_log(format!(
+                "Silence trim: {:.1}s → {:.1}s (removed head {head_ms}ms, tail {tail_ms}ms, threshold={threshold:.4})",
+                original_ms as f32 / 1000.0,
+                trimmed_ms as f32 / 1000.0,
+            )),
+            SilenceTrimReport::KeptFullBuffer {
+                original_ms,
+                remaining_ms,
+                threshold,
+            } => self.push_log(format!(
+                "Silence trim found no speech frames ({original_ms}ms → {remaining_ms}ms, peak={peak:.4}, threshold={threshold:.4}) — keeping full buffer for STT"
+            )),
         }
+        self.push_log(format!(
+            "STT pad: +{}ms trailing silence for decoder",
+            recognition.preprocessing.decoder_tail_padding_ms
+        ));
+
+        let raw = recognition.transcript;
 
         if kind == SessionKind::Command {
             return self.finish_command_mode(app, &raw, command_selection.unwrap_or_default());

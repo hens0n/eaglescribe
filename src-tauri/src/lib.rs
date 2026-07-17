@@ -7,6 +7,7 @@ mod inject;
 mod llm;
 mod permissions_help;
 mod polish;
+pub mod recognition;
 mod settings;
 mod snippets;
 mod state;
