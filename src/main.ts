@@ -118,6 +118,14 @@ interface TuningSnapshot {
   review_explanations: { meaning: string; count: number }[];
   review_complete: boolean;
   staged_rule_count: number;
+  verification_id: string | null;
+  verification_text: string | null;
+  result_rules: {
+    from: string;
+    to: string;
+    outcome: "kept";
+    dictionary_entry_id: string;
+  }[];
   unchanged_result_reason:
     | "no_safe_corrections_found"
     | "already_covered_by_personal_dictionary"
@@ -333,6 +341,7 @@ const els = {
   tuningPhrasePosition: () =>
     document.querySelector("#tuning-phrase-position") as HTMLElement,
   tuningReview: () => document.querySelector("#tuning-review") as HTMLElement,
+  tuningResult: () => document.querySelector("#tuning-result") as HTMLElement,
   tuningReviewRows: () =>
     document.querySelector("#tuning-review-rows") as HTMLElement,
   tuningAlreadyCovered: () =>
@@ -355,6 +364,8 @@ const els = {
     document.querySelector("#btn-tuning-do-later") as HTMLButtonElement,
   btnTuningContinueReview: () =>
     document.querySelector("#btn-tuning-continue-review") as HTMLButtonElement,
+  btnTuningVerification: () =>
+    document.querySelector("#btn-tuning-verification") as HTMLButtonElement,
 };
 
 /**
@@ -1171,7 +1182,10 @@ function applyTuningStatus(s: TuningSnapshot) {
   els.btnTuningRetryPhrase().hidden = true;
   els.btnTuningDoLater().hidden = true;
   els.btnTuningContinueReview().hidden = true;
+  els.btnTuningVerification().hidden = true;
   els.tuningReview().hidden = true;
+  els.tuningResult().hidden = true;
+  els.tuningResult().replaceChildren();
   els.tuningPracticePrompt().hidden = true;
   els.tuningPhrasePosition().hidden = true;
 
@@ -1229,15 +1243,43 @@ function applyTuningStatus(s: TuningSnapshot) {
       : "Choose an explicit decision for every actionable row to continue.";
   } else if (active && s.last_durable_stage === "verify") {
     title = "Verify";
-    message = `${s.staged_rule_count} approved Correction Rule${s.staged_rule_count === 1 ? " is" : "s are"} ready for the required Verification Pass.`;
+    els.tuningPracticePrompt().hidden = false;
+    els.tuningPracticePrompt().textContent = s.verification_text ?? "";
+    els.tuningPhrasePosition().hidden = false;
+    els.tuningPhrasePosition().textContent = `Held-out phrase ${s.verification_id ?? ""}`;
+    els.btnTuningVerification().hidden = false;
+    if (s.activity === "recording") {
+      message = "Read the different held-out phrase naturally, then stop.";
+      els.btnTuningVerification().textContent = "Stop & verify rule";
+    } else if (s.activity === "transcribing") {
+      message = "Transcribing locally and verifying through the Tuning-only dictionary overlay…";
+      els.btnTuningVerification().textContent = "Verifying…";
+    } else {
+      message = "Read this distinct held-out phrase to verify the approved Correction Rule before it becomes active.";
+      els.btnTuningVerification().textContent = "Start verification";
+    }
   } else if (active && s.last_durable_stage === "result") {
     title = "Result";
-    message =
-      s.unchanged_result_reason === "already_covered_by_personal_dictionary"
-        ? "No changes were needed. The Candidate Corrections are already covered by Personal Dictionary."
-        : s.unchanged_result_reason === "candidate_corrections_found_but_none_approved"
-          ? "Personal Dictionary unchanged — Candidate Corrections were found, but none were approved."
-          : "Personal Dictionary unchanged — no safe corrections were found.";
+    if (s.result_rules.length > 0) {
+      message = "The verified Correction Rule was kept in Personal Dictionary.";
+      const result = els.tuningResult();
+      result.hidden = false;
+      for (const rule of s.result_rules) {
+        const row = document.createElement("section");
+        row.className = "tuning-review-row";
+        const heading = document.createElement("h3");
+        heading.textContent = "Kept";
+        row.append(heading, mappingLine("Correction Rule", rule.from, rule.to));
+        result.appendChild(row);
+      }
+    } else {
+      message =
+        s.unchanged_result_reason === "already_covered_by_personal_dictionary"
+          ? "No changes were needed. The Candidate Corrections are already covered by Personal Dictionary."
+          : s.unchanged_result_reason === "candidate_corrections_found_but_none_approved"
+            ? "Personal Dictionary unchanged — Candidate Corrections were found, but none were approved."
+            : "Personal Dictionary unchanged — no safe corrections were found.";
+    }
   }
 
   const readingStage =
@@ -1276,6 +1318,7 @@ function applyTuningStatus(s: TuningSnapshot) {
   els.btnTuningStartOver().disabled = busy;
   els.btnTuningPractice().disabled = busy && s.activity !== "recording";
   els.btnTuningReading().disabled = busy && s.activity !== "recording";
+  els.btnTuningVerification().disabled = busy && s.activity !== "recording";
   els.btnTuningRetryPhrase().disabled =
     s.activity === "preflight" ||
     s.activity === "transcribing" ||
@@ -1636,6 +1679,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   els.btnTuningContinueReview().addEventListener("click", () => {
     void invokeTuning("tuning_continue_review");
+  });
+  els.btnTuningVerification().addEventListener("click", () => {
+    void invokeTuning(
+      tuningActivity === "recording"
+        ? "tuning_stop_verification"
+        : "tuning_start_verification",
+    );
   });
 
   els.btnSetupDismiss().addEventListener("click", () => {

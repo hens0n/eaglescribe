@@ -55,6 +55,12 @@ pub struct DictionaryEntryIdentity {
     pub version: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuningOverlayApplication {
+    pub pre_overlay: String,
+    pub post_overlay: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DictEntry {
     /// Stable identity used by paused Tuning Sessions and concurrent editors.
@@ -429,30 +435,60 @@ impl Dictionary {
         text: &str,
         fingerprint: Option<&RecognitionFingerprint>,
     ) -> String {
-        if self.entries.is_empty() || text.is_empty() {
-            return text.to_string();
-        }
-
-        let mut ordered: Vec<_> = self
+        let entries = self
             .entries
             .iter()
             .filter(|entry| entry.is_active_for(fingerprint))
-            .cloned()
-            .collect();
-        ordered.sort_by(|a, b| {
-            b.from
-                .chars()
-                .count()
-                .cmp(&a.from.chars().count())
-                .then_with(|| a.from.cmp(&b.from))
-        });
-
-        let mut out = text.to_string();
-        for entry in &ordered {
-            out = replace_phrase(&out, &entry.from, &entry.to);
-        }
-        out
+            .map(|entry| (entry.from.as_str(), entry.to.as_str()))
+            .collect::<Vec<_>>();
+        apply_ordered_mappings(text, &entries)
     }
+
+    /// Apply the ordinary active dictionary first, then an ephemeral Tuning
+    /// overlay through the same matcher and ordering. Overlay keys shadow an
+    /// ordinary entry with the same canonical source without mutating the
+    /// Personal Dictionary used by ordinary dictation.
+    pub fn apply_tuning_overlay(
+        &self,
+        text: &str,
+        fingerprint: Option<&RecognitionFingerprint>,
+        overlay: &[(&str, &str)],
+    ) -> TuningOverlayApplication {
+        let shadowed = overlay
+            .iter()
+            .map(|(from, _)| canonical_text(from))
+            .collect::<HashSet<_>>();
+        let base = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.is_active_for(fingerprint) && !shadowed.contains(&canonical_text(&entry.from))
+            })
+            .map(|entry| (entry.from.as_str(), entry.to.as_str()))
+            .collect::<Vec<_>>();
+        let pre_overlay = apply_ordered_mappings(text, &base);
+        let post_overlay = apply_ordered_mappings(&pre_overlay, overlay);
+        TuningOverlayApplication {
+            pre_overlay,
+            post_overlay,
+        }
+    }
+}
+
+fn apply_ordered_mappings(text: &str, mappings: &[(&str, &str)]) -> String {
+    let mut ordered = mappings.to_vec();
+    ordered.sort_by(|(left_from, _), (right_from, _)| {
+        right_from
+            .chars()
+            .count()
+            .cmp(&left_from.chars().count())
+            .then_with(|| left_from.cmp(right_from))
+    });
+    ordered
+        .into_iter()
+        .fold(text.to_owned(), |out, (from, to)| {
+            replace_phrase(&out, from, to)
+        })
 }
 
 fn parse_dictionary(data: &str) -> AppResult<(Dictionary, bool)> {
@@ -754,6 +790,26 @@ mod tests {
         std::env::temp_dir()
             .join(format!("eaglescribe-dictionary-{label}-{nanos}"))
             .join("dictionary.json")
+    }
+
+    #[test]
+    fn tuning_overlay_uses_production_order_without_activating_staged_rules() {
+        let fingerprint = RecognitionFingerprint::from_stable_id("recognition-current");
+        let dictionary = Dictionary::default();
+
+        assert_eq!(
+            dictionary.apply_for_fingerprint("a quick chip", Some(&fingerprint)),
+            "a quick chip"
+        );
+
+        let applied = dictionary.apply_tuning_overlay(
+            "a quick chip",
+            Some(&fingerprint),
+            &[("quick chip", "quick ship")],
+        );
+        assert_eq!(applied.pre_overlay, "a quick chip");
+        assert_eq!(applied.post_overlay, "a quick ship");
+        assert!(dictionary.entries.is_empty());
     }
 
     #[test]

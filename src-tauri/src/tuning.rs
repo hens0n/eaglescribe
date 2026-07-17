@@ -410,6 +410,115 @@ fn normalize_tokens(text: &str) -> Vec<String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum VerificationAttemptOutcome {
+    Success,
+    NotExercised,
+    TargetNotCorrected,
+    HarmfulChange,
+}
+
+/// Score one Correction Rule against the pre-overlay text shared by all
+/// verification checks. Recognition differences outside the tagged span are
+/// deliberately ignored; the overlay itself must change exactly the intended
+/// trigger to the expected target and nothing else.
+pub fn score_verification_attempt(
+    phrase: &TuningPhrase,
+    probe_span_id: &str,
+    from: &str,
+    to: &str,
+    pre_overlay: &str,
+    post_overlay: &str,
+) -> VerificationAttemptOutcome {
+    let Some(probe) = phrase
+        .eligible_spans
+        .iter()
+        .find(|probe| probe.id == probe_span_id)
+    else {
+        return VerificationAttemptOutcome::TargetNotCorrected;
+    };
+    let expected = normalize_tokens(phrase.verification_text);
+    let target = normalize_tokens(to);
+    let probe_target = normalize_tokens(probe.text);
+    if target.is_empty() || target != probe_target {
+        return VerificationAttemptOutcome::TargetNotCorrected;
+    }
+    let Some(expected_span) = unique_token_occurrence(&expected, &target) else {
+        return VerificationAttemptOutcome::TargetNotCorrected;
+    };
+
+    let before = normalize_tokens(pre_overlay);
+    let source = normalize_tokens(from);
+    let occurrences = token_occurrences(&before, &source);
+    if occurrences.is_empty() {
+        return VerificationAttemptOutcome::NotExercised;
+    }
+
+    let expected_prefix = &expected[..expected_span.start];
+    let expected_suffix = &expected[expected_span.end..];
+    let mut trigger_template = expected.clone();
+    trigger_template.splice(expected_span, source.clone());
+    let unconstrained_distance = edit_distance(&trigger_template, &before);
+    let mut ranked = occurrences
+        .into_iter()
+        .filter_map(|range| {
+            let distance = edit_distance(expected_prefix, &before[..range.start])
+                + edit_distance(expected_suffix, &before[range.end..]);
+            (distance == unconstrained_distance).then_some((distance, range))
+        })
+        .collect::<Vec<_>>();
+    if ranked.is_empty() {
+        return VerificationAttemptOutcome::HarmfulChange;
+    }
+    ranked.sort_by_key(|(distance, range)| (*distance, range.start));
+    if ranked.len() > 1 && ranked[0].0 == ranked[1].0 {
+        return VerificationAttemptOutcome::HarmfulChange;
+    }
+    let intended = ranked.remove(0).1;
+    let mut expected_after = before.clone();
+    expected_after.splice(intended, target);
+    let after = normalize_tokens(post_overlay);
+    if after == expected_after {
+        VerificationAttemptOutcome::Success
+    } else if after == before {
+        VerificationAttemptOutcome::TargetNotCorrected
+    } else {
+        VerificationAttemptOutcome::HarmfulChange
+    }
+}
+
+fn token_occurrences(haystack: &[String], needle: &[String]) -> Vec<Range<usize>> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(start, window)| (window == needle).then_some(start..start + needle.len()))
+        .collect()
+}
+
+fn unique_token_occurrence(haystack: &[String], needle: &[String]) -> Option<Range<usize>> {
+    let mut occurrences = token_occurrences(haystack, needle).into_iter();
+    let occurrence = occurrences.next()?;
+    occurrences.next().is_none().then_some(occurrence)
+}
+
+fn edit_distance(left: &[String], right: &[String]) -> usize {
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (left_index, left_token) in left.iter().enumerate() {
+        let mut current = vec![left_index + 1; right.len() + 1];
+        for (right_index, right_token) in right.iter().enumerate() {
+            current[right_index + 1] = (current[right_index] + 1)
+                .min(previous[right_index + 1] + 1)
+                .min(previous[right_index] + usize::from(left_token != right_token));
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReasonCode {
     NoMismatch,
     MissingContext,
@@ -549,11 +658,8 @@ pub fn infer_candidate_correction_from_readings(
     let reading_results = [first, second];
     let first_evidence = ReadingEvidence::from_result(&reading_results[0]);
     let second_evidence = ReadingEvidence::from_result(&reading_results[1]);
-    let session = infer_candidate_correction_from_evidence(
-        phrase.id,
-        &first_evidence,
-        &second_evidence,
-    );
+    let session =
+        infer_candidate_correction_from_evidence(phrase.id, &first_evidence, &second_evidence);
 
     InferenceResult {
         phrase_id: phrase.id.to_owned(),
@@ -580,7 +686,10 @@ pub fn infer_candidate_correction_from_evidence(
             }),
             Vec::new(),
         ),
-        (Some(_), Some(_)) => (InferenceDecision::Rejected, vec![ReasonCode::ReadingsDisagree]),
+        (Some(_), Some(_)) => (
+            InferenceDecision::Rejected,
+            vec![ReasonCode::ReadingsDisagree],
+        ),
         _ => {
             let mut reasons = Vec::new();
             for reason in first.reason_codes.iter().chain(&second.reason_codes) {
@@ -697,6 +806,48 @@ mod tests {
 
     const CMUDICT_REVISION: &str = "74790861f652b15e4ac49015a90074ad62a27690";
     const CMUDICT_TUNING_SUBSET: &str = include_str!("../testdata/cmudict-tuning-74790861.dict");
+
+    #[test]
+    fn verification_scores_only_the_intended_tagged_span() {
+        let phrase = builtin_corpus().phrase("T01").unwrap();
+
+        assert_eq!(
+            score_verification_attempt(
+                phrase,
+                "T01-P01",
+                "quick chip",
+                "quick ship",
+                "The heavy blue crates arrived on a quick chip",
+                "The heavy blue crates arrived on a quick ship",
+            ),
+            VerificationAttemptOutcome::Success,
+        );
+
+        assert_eq!(
+            score_verification_attempt(
+                phrase,
+                "T01-P01",
+                "quick chip",
+                "quick ship",
+                "Quick chip carried the heavy blue boxes on a quick chip",
+                "Quick ship carried the heavy blue boxes on a quick ship",
+            ),
+            VerificationAttemptOutcome::HarmfulChange,
+        );
+
+        assert_eq!(
+            score_verification_attempt(
+                phrase,
+                "T01-P01",
+                "quick chip",
+                "quick ship",
+                "Quick chip arrived before the heavy blue boxes on a fast boat",
+                "Quick ship arrived before the heavy blue boxes on a fast boat",
+            ),
+            VerificationAttemptOutcome::HarmfulChange,
+            "a trigger away from the tagged span must not manufacture success",
+        );
+    }
 
     fn infer(phrase_id: &str, first: &str, second: &str) -> InferenceResult {
         let phrase = builtin_corpus().phrase(phrase_id).expect("fixture phrase");
