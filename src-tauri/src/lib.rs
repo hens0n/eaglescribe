@@ -12,6 +12,7 @@ mod settings;
 mod snippets;
 mod state;
 pub mod stt;
+pub mod tuning;
 
 use error::{AppError, AppResult};
 use hotkey::{
