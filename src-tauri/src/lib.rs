@@ -28,13 +28,13 @@ use state::{AppState, SharedState, StatusSnapshot, TuningSnapshot};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use stt::resolve_model_path;
-use tuning_session::ReviewDecision;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, RunEvent, WindowEvent,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use tuning_session::ReviewDecision;
 
 #[tauri::command]
 fn get_status(state: tauri::State<'_, SharedState>) -> StatusSnapshot {
@@ -114,6 +114,19 @@ fn tuning_review_decision(
 #[tauri::command]
 fn tuning_continue_review(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
     state.inner().tuning_continue_review()
+}
+
+#[tauri::command]
+fn tuning_start_verification(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_start_verification()
+}
+
+#[tauri::command]
+fn tuning_stop_verification(
+    app: AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_stop_verification(&app)
 }
 
 #[tauri::command]
@@ -399,9 +412,7 @@ fn dictionary_edit(
     to: String,
     state: tauri::State<'_, SharedState>,
 ) -> AppResult<StatusSnapshot> {
-    state
-        .inner()
-        .dictionary_edit(&identity, &from, &to)?;
+    state.inner().dictionary_edit(&identity, &from, &to)?;
     Ok(state.inner().snapshot())
 }
 
@@ -1158,6 +1169,8 @@ pub fn run() {
             tuning_defer_phrase,
             tuning_review_decision,
             tuning_continue_review,
+            tuning_start_verification,
+            tuning_stop_verification,
             tuning_leave,
             set_model_path,
             set_polish_mode,
@@ -1664,8 +1677,7 @@ mod tray_restore_tests {
             "Escape callback must schedule_disarm, not sync unregister"
         );
         assert!(
-            !arm
-                .replace("schedule_disarm_escape_cancel", "SCHEDULED")
+            !arm.replace("schedule_disarm_escape_cancel", "SCHEDULED")
                 .contains("disarm_escape_cancel"),
             "Escape callback must not call disarm_escape_cancel synchronously"
         );
