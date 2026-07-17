@@ -132,7 +132,10 @@ impl Dictionary {
             return Ok(Self::default());
         }
         match parse_dictionary(&data) {
-            Ok((dictionary, false)) => Ok(dictionary),
+            Ok((dictionary, false)) => {
+                reconcile_prepared_backup(path, &data);
+                Ok(dictionary)
+            }
             Ok((dictionary, true)) => {
                 dictionary.save(path)?;
                 Ok(dictionary)
@@ -612,6 +615,21 @@ fn read_recovery_backup(path: &Path) -> Option<String> {
         .or_else(|| fs::read_to_string(dictionary_committed_backup_path(path)).ok())
 }
 
+fn reconcile_prepared_backup(path: &Path, primary_data: &str) {
+    let prepared = dictionary_prepared_backup_path(path);
+    let Ok(prepared_data) = fs::read_to_string(&prepared) else {
+        return;
+    };
+    if prepared_data != primary_data {
+        let _ = fs::remove_file(prepared);
+        return;
+    }
+    let committed = dictionary_committed_backup_path(path);
+    if fs::rename(&prepared, &committed).is_ok() {
+        let _ = fs::rename(committed, dictionary_backup_path(path));
+    }
+}
+
 fn atomic_replace(path: &Path, data: &[u8]) -> AppResult<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
@@ -1009,6 +1027,26 @@ mod tests {
             recovered.entries[0].to, "mapping",
             "successful write must remain committed and recoverable"
         );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn startup_reconciles_prepared_backup_after_primary_commit_crash() {
+        let path = unique_dictionary_path("prepared-backup-reconciliation");
+        fs::create_dir_all(path.parent().unwrap()).expect("create test directory");
+        let mut dictionary = Dictionary::default();
+        dictionary.upsert("survives", "restart").unwrap();
+        let data = serde_json::to_string_pretty(&dictionary).unwrap();
+        fs::write(&path, &data).expect("simulate committed primary");
+        fs::write(dictionary_prepared_backup_path(&path), &data)
+            .expect("simulate pre-marker crash");
+
+        Dictionary::load(&path).expect("reconcile prepared backup");
+        fs::remove_file(&path).expect("lose primary after reconciliation");
+        let recovered = Dictionary::load(&path).expect("recover reconciled backup");
+
+        assert_eq!(recovered.entries[0].to, "restart");
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
