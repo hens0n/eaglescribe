@@ -19,7 +19,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 4;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -168,6 +168,37 @@ pub struct CompletedTuningResult {
     pub rules: Vec<VerificationRuleResult>,
 }
 
+/// Content-free facts shown when an unfinished Tuning Session is recovered.
+/// Counts describe only the last acknowledged durable checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoveryReceipt {
+    pub details_available: bool,
+    pub durable_stage: Option<TuningStage>,
+    pub completed_readings: Option<usize>,
+    pub review_decisions: Option<usize>,
+    pub approvals_preserved: Option<usize>,
+    pub verification_attempts: Option<u32>,
+    pub interrupted_work: Option<bool>,
+    pub incompatible: bool,
+    pub diagnostics_complete: bool,
+}
+
+impl RecoveryReceipt {
+    pub fn unavailable(diagnostics_complete: bool) -> Self {
+        Self {
+            details_available: false,
+            durable_stage: None,
+            completed_readings: None,
+            review_decisions: None,
+            approvals_preserved: None,
+            verification_attempts: None,
+            interrupted_work: None,
+            incompatible: true,
+            diagnostics_complete,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum VerificationAdvance {
     InProgress(Box<TuningCheckpoint>),
@@ -262,6 +293,8 @@ pub struct TuningCheckpoint {
     /// pre-commit Verification Pass.
     #[serde(default)]
     pending_commit_verified_at_ms: Option<u64>,
+    #[serde(default)]
+    verification_attempt_count: u32,
 }
 
 impl TuningCheckpoint {
@@ -387,6 +420,52 @@ impl TuningCheckpoint {
     pub fn review_complete(&self) -> bool {
         self.stage == TuningStage::Review
             && self.review.rows.iter().all(|row| row.decision.is_some())
+    }
+
+    pub fn requires_destructive_confirmation(&self) -> bool {
+        self.stage >= TuningStage::Review
+            || !self.reading_evidence.is_empty()
+            || self.review.rows.iter().any(|row| row.decision.is_some())
+            || self.verification_attempt_count > 0
+    }
+
+    pub fn recovery_receipt(
+        &self,
+        incompatible: bool,
+        diagnostics_complete: bool,
+    ) -> RecoveryReceipt {
+        RecoveryReceipt {
+            details_available: true,
+            durable_stage: Some(self.stage),
+            completed_readings: Some(if self.stage >= TuningStage::Review {
+                builtin_corpus().phrases.len() * 2
+            } else {
+                self.reading_evidence.len()
+            }),
+            review_decisions: Some(
+                self.review
+                    .rows
+                    .iter()
+                    .filter(|row| row.decision.is_some())
+                    .count(),
+            ),
+            approvals_preserved: Some(
+                self.review
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        matches!(
+                            row.decision,
+                            Some(ReviewDecision::Approve | ReviewDecision::VerifyReplacement)
+                        )
+                    })
+                    .count(),
+            ),
+            verification_attempts: Some(self.verification_attempt_count),
+            interrupted_work: Some(self.interrupted_attempt),
+            incompatible,
+            diagnostics_complete,
+        }
     }
     fn with_interrupted_attempt(&self) -> Self {
         let mut candidate = self.clone();
@@ -693,6 +772,7 @@ impl TuningCheckpointStore {
             verification_states: BTreeMap::new(),
             unchanged_result_reason: None,
             pending_commit_verified_at_ms: None,
+            verification_attempt_count: 0,
         };
         self.save(&checkpoint)?;
         Ok(checkpoint)
@@ -777,6 +857,65 @@ impl TuningCheckpointStore {
         candidate.interrupted_attempt = false;
         self.save(&candidate)?;
         Ok(candidate)
+    }
+
+    /// Cancel an in-flight recording/transcription without changing any
+    /// acknowledged Practice, reading, Review, or Verification progress.
+    pub fn discard_in_flight_attempt(
+        &self,
+        checkpoint: &TuningCheckpoint,
+    ) -> Result<TuningCheckpoint, String> {
+        if !checkpoint.interrupted_attempt {
+            return Ok(checkpoint.clone());
+        }
+        let mut candidate = checkpoint.clone();
+        candidate.interrupted_attempt = false;
+        self.save(&candidate)?;
+        Ok(candidate)
+    }
+
+    /// Retry persistence after a storage failure. This writes only the
+    /// acknowledged in-memory checkpoint; it never manufactures progress.
+    pub fn retry_save(&self, checkpoint: &TuningCheckpoint) -> Result<(), String> {
+        self.save(checkpoint)
+    }
+
+    /// Atomically end an unfinished session. Scored progress requires an
+    /// explicit confirmation supplied by the user-facing command.
+    pub fn cancel(&self, checkpoint: &TuningCheckpoint, confirmed: bool) -> Result<(), String> {
+        if checkpoint.requires_destructive_confirmation() && !confirmed {
+            return Err(
+                "Confirmation is required because unfinished Tuning evidence will be deleted; committed Personal Dictionary entries remain unchanged."
+                    .into(),
+            );
+        }
+        self.delete_checkpoint(checkpoint)
+    }
+
+    /// Delete a checkpoint whose schema/content cannot be interpreted. Safety
+    /// assumes it may contain scored progress, so confirmation is mandatory.
+    pub fn cancel_unreadable(&self, confirmed: bool) -> Result<(), String> {
+        if !confirmed {
+            return Err(
+                "Confirmation is required because the unreadable checkpoint may contain scored Tuning evidence; committed Personal Dictionary entries remain unchanged."
+                    .into(),
+            );
+        }
+        let original = fs::read(&self.path).map_err(|error| {
+            format!("Read unreadable Tuning checkpoint for cleanup failed: {error}")
+        })?;
+        fs::remove_file(&self.path)
+            .map_err(|error| format!("Delete unreadable Tuning checkpoint failed: {error}"))?;
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        if let Ok(directory) = fs::File::open(parent) {
+            if let Err(error) = directory.sync_all() {
+                let _ = atomic_replace(&self.path, &original);
+                return Err(format!(
+                    "Sync unreadable Tuning checkpoint deletion failed: {error}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn record_review_decision(
@@ -997,6 +1136,8 @@ impl TuningCheckpointStore {
         let mut candidate = checkpoint.clone();
         candidate.verification_queue.remove(0);
         candidate.interrupted_attempt = false;
+        candidate.verification_attempt_count =
+            candidate.verification_attempt_count.saturating_add(1);
         let mut retry_row = false;
         for rule in approved_rules {
             let state = candidate
@@ -1144,6 +1285,7 @@ impl TuningCheckpointStore {
         candidate.verification_queue.clear();
         candidate.verification_states.clear();
         candidate.pending_commit_verified_at_ms = None;
+        candidate.verification_attempt_count = 0;
         self.save(&candidate)?;
         Ok(Some(candidate))
     }
@@ -1583,6 +1725,100 @@ mod tests {
         assert!(interrupted.interrupted_attempt());
         assert_eq!(interrupted.stage(), TuningStage::Practice);
         assert_eq!(reloaded, CheckpointState::Compatible(Box::new(interrupted)));
+    }
+
+    #[test]
+    fn recovery_receipt_reports_only_durable_progress_and_preserved_approvals() {
+        let path = temp_path("recovery-receipt");
+        let store = TuningCheckpointStore::new(path);
+        let started = store.start(envelope("recognition-a")).unwrap();
+        let mut checkpoint = store.complete_practice(&started).unwrap();
+        checkpoint = store
+            .complete_reading(&checkpoint, builtin_corpus().phrase("T01").unwrap().text)
+            .unwrap();
+        let interrupted = store.begin_attempt(&checkpoint).unwrap();
+
+        let receipt = interrupted.recovery_receipt(false, true);
+
+        assert!(receipt.details_available);
+        assert_eq!(receipt.durable_stage, Some(TuningStage::FirstReading));
+        assert_eq!(receipt.completed_readings, Some(1));
+        assert_eq!(receipt.review_decisions, Some(0));
+        assert_eq!(receipt.approvals_preserved, Some(0));
+        assert_eq!(receipt.verification_attempts, Some(0));
+        assert_eq!(receipt.interrupted_work, Some(true));
+        assert!(!receipt.incompatible);
+        assert!(receipt.diagnostics_complete);
+    }
+
+    #[test]
+    fn destructive_cleanup_requires_confirmation_only_after_scored_progress() {
+        let practice_path = temp_path("cancel-practice");
+        let practice_store = TuningCheckpointStore::new(practice_path.clone());
+        let practice = practice_store.start(envelope("recognition-a")).unwrap();
+        assert!(!practice.requires_destructive_confirmation());
+        practice_store.cancel(&practice, false).unwrap();
+        assert!(!practice_path.exists());
+
+        let scored_path = temp_path("cancel-scored");
+        let scored_store = TuningCheckpointStore::new(scored_path.clone());
+        let started = scored_store.start(envelope("recognition-a")).unwrap();
+        let checkpoint = scored_store.complete_practice(&started).unwrap();
+        let scored = scored_store
+            .complete_reading(&checkpoint, builtin_corpus().phrase("T01").unwrap().text)
+            .unwrap();
+        assert!(scored.requires_destructive_confirmation());
+        assert!(scored_store.cancel(&scored, false).is_err());
+        assert!(scored_path.exists());
+        scored_store.cancel(&scored, true).unwrap();
+        assert!(!scored_path.exists());
+    }
+
+    #[test]
+    fn cleanup_failure_never_reports_a_cancelled_session() {
+        let path = temp_path("cancel-storage-failure");
+        let store = TuningCheckpointStore::new(path.clone());
+        let checkpoint = store.start(envelope("recognition-a")).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        let error = store.cancel(&checkpoint, true).unwrap_err();
+
+        assert!(error.contains("Delete completed Tuning checkpoint failed"));
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn unreadable_checkpoint_cleanup_is_conservative_and_confirmed() {
+        let path = temp_path("cancel-unreadable");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, br#"{"unknown_schema":true}"#).unwrap();
+        let store = TuningCheckpointStore::new(path.clone());
+
+        assert!(store.load_saved().is_err());
+        assert!(store.cancel_unreadable(false).is_err());
+        assert!(path.exists());
+        store.cancel_unreadable(true).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cancel_attempt_and_retry_save_never_advance_durable_progress() {
+        let path = temp_path("cancel-attempt-retry-save");
+        let store = TuningCheckpointStore::new(path.clone());
+        let started = store.start(envelope("recognition-a")).unwrap();
+        let reading = store.complete_practice(&started).unwrap();
+        let interrupted = store.begin_attempt(&reading).unwrap();
+
+        let cancelled = store.discard_in_flight_attempt(&interrupted).unwrap();
+        assert!(!cancelled.interrupted_attempt());
+        assert_eq!(cancelled.reading_progress(), reading.reading_progress());
+
+        store.retry_save(&cancelled).unwrap();
+        assert_eq!(
+            store.inspect(&envelope("recognition-a")),
+            CheckpointState::Compatible(Box::new(cancelled))
+        );
     }
 
     #[test]

@@ -162,6 +162,7 @@ pub struct RecordingSession {
     pub device_label: String,
     /// Preferred name when it could not be opened (structured; not string-sniffed).
     pub preferred_unavailable: Option<String>,
+    stream_failed: Arc<AtomicBool>,
     join: Option<JoinHandle<AppResult<()>>>,
 }
 
@@ -174,6 +175,7 @@ impl RecordingSession {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let samples = Arc::new(Mutex::new(Vec::<f32>::new()));
         let sample_rate = Arc::new(Mutex::new(0u32));
+        let stream_failed = Arc::new(AtomicBool::new(false));
         // Structured open result — published after open_input_device, before sample rate.
         let open_info_shared = Arc::new(Mutex::new(None::<MicOpenInfo>));
 
@@ -185,6 +187,7 @@ impl RecordingSession {
         let samples_t = Arc::clone(&samples);
         let sample_rate_t = Arc::clone(&sample_rate);
         let open_info_t = Arc::clone(&open_info_shared);
+        let stream_failed_t = Arc::clone(&stream_failed);
 
         let join = thread::Builder::new()
             .name("eaglescribe-mic".into())
@@ -195,6 +198,7 @@ impl RecordingSession {
                     sample_rate_t,
                     open_info_t,
                     preferred_t,
+                    stream_failed_t,
                 )
             })
             .map_err(|e| AppError::from(format!("Failed to spawn mic thread: {e}")))?;
@@ -239,8 +243,13 @@ impl RecordingSession {
             sample_rate,
             device_label: open_info.device_label,
             preferred_unavailable: open_info.preferred_unavailable,
+            stream_failed,
             join: Some(join),
         })
+    }
+
+    pub fn failure_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stream_failed)
     }
 
     /// Stop capture and return mono samples at the device sample rate.
@@ -362,6 +371,7 @@ fn run_capture(
     sample_rate_out: Arc<Mutex<u32>>,
     open_info_out: Arc<Mutex<Option<MicOpenInfo>>>,
     preferred_name: Option<String>,
+    stream_failed: Arc<AtomicBool>,
 ) -> AppResult<()> {
     let host = cpal::default_host();
     let (device, info) = open_input_device(&host, preferred_name.as_deref())?;
@@ -381,17 +391,31 @@ fn run_capture(
 
     let stop_cb = Arc::clone(&stop_flag);
     let samples_cb = Arc::clone(&samples);
-
     let stream = match sample_format {
-        SampleFormat::F32 => {
-            build_stream::<f32>(&device, &stream_config, channels, samples_cb, stop_cb)?
-        }
-        SampleFormat::I16 => {
-            build_stream::<i16>(&device, &stream_config, channels, samples_cb, stop_cb)?
-        }
-        SampleFormat::U16 => {
-            build_stream::<u16>(&device, &stream_config, channels, samples_cb, stop_cb)?
-        }
+        SampleFormat::F32 => build_stream::<f32>(
+            &device,
+            &stream_config,
+            channels,
+            samples_cb,
+            stop_cb,
+            Arc::clone(&stream_failed),
+        )?,
+        SampleFormat::I16 => build_stream::<i16>(
+            &device,
+            &stream_config,
+            channels,
+            samples_cb,
+            stop_cb,
+            Arc::clone(&stream_failed),
+        )?,
+        SampleFormat::U16 => build_stream::<u16>(
+            &device,
+            &stream_config,
+            channels,
+            samples_cb,
+            stop_cb,
+            Arc::clone(&stream_failed),
+        )?,
         other => {
             return Err(AppError::from(format!(
                 "Unsupported sample format: {other:?}"
@@ -403,12 +427,26 @@ fn run_capture(
         .play()
         .map_err(|e| AppError::from(format!("Failed to start mic stream: {e}")))?;
 
-    while !stop_flag.load(Ordering::SeqCst) {
+    loop {
+        if stream_failed.load(Ordering::SeqCst) {
+            drop(stream);
+            return Err(AppError::from(
+                "Microphone input device was lost during recording",
+            ));
+        }
+        if stop_flag.load(Ordering::SeqCst) {
+            break;
+        }
         thread::sleep(Duration::from_millis(20));
     }
 
     // Drop stream on this thread.
     drop(stream);
+    if stream_failed.load(Ordering::SeqCst) {
+        return Err(AppError::from(
+            "Microphone input device was lost during recording",
+        ));
+    }
     Ok(())
 }
 
@@ -418,12 +456,16 @@ fn build_stream<T>(
     channels: usize,
     samples: Arc<Mutex<Vec<f32>>>,
     stop_flag: Arc<AtomicBool>,
+    stream_failed: Arc<AtomicBool>,
 ) -> AppResult<cpal::Stream>
 where
     T: Sample + cpal::SizedSample + Send + 'static,
     f32: FromSample<T>,
 {
-    let err_fn = |err| eprintln!("[eaglescribe] audio stream error: {err}");
+    let err_fn = move |err| {
+        stream_failed.store(true, Ordering::SeqCst);
+        eprintln!("[eaglescribe] audio stream error: {err}");
+    };
 
     device
         .build_input_stream(
