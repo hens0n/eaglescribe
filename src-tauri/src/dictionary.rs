@@ -118,7 +118,7 @@ impl Dictionary {
 
     pub fn load(path: &Path) -> AppResult<Self> {
         if !path.is_file() {
-            if let Some(backup) = read_recovery_backup(path, false) {
+            if let Some(backup) = read_recovery_backup(path) {
                 return parse_dictionary(&backup).map(|(dictionary, _)| dictionary);
             }
             return Ok(Self::default());
@@ -126,7 +126,7 @@ impl Dictionary {
         let data = fs::read_to_string(path)
             .map_err(|e| AppError::from(format!("Read dictionary failed: {e}")))?;
         if data.trim().is_empty() {
-            if let Some(backup) = read_recovery_backup(path, true) {
+            if let Some(backup) = read_recovery_backup(path) {
                 return parse_dictionary(&backup).map(|(dictionary, _)| dictionary);
             }
             return Ok(Self::default());
@@ -138,7 +138,7 @@ impl Dictionary {
                 Ok(dictionary)
             }
             Err(primary_error) => {
-                let Some(backup) = read_recovery_backup(path, true) else {
+                let Some(backup) = read_recovery_backup(path) else {
                     return Err(primary_error);
                 };
                 parse_dictionary(&backup)
@@ -173,17 +173,29 @@ impl Dictionary {
                 backed_up_primary = true;
             }
         }
-        let needs_initial_backup = !backed_up_primary && !backup_path.is_file();
+        let backup_is_recoverable = fs::read_to_string(&backup_path)
+            .ok()
+            .is_some_and(|text| parse_dictionary(&text).is_ok());
+        let needs_initial_backup = !backed_up_primary && !backup_is_recoverable;
         if needs_initial_backup {
-            let pending_backup = dictionary_pending_backup_path(path);
-            atomic_replace(&pending_backup, data.as_bytes())?;
+            let prepared_backup = dictionary_prepared_backup_path(path);
+            let committed_backup = dictionary_committed_backup_path(path);
+            atomic_replace(&prepared_backup, data.as_bytes())?;
             if let Err(error) = atomic_replace(path, data.as_bytes()) {
-                let _ = fs::remove_file(pending_backup);
+                let _ = fs::remove_file(prepared_backup);
                 return Err(error);
             }
-            // The primary rename is the commit point. A failed promotion leaves
-            // the synced provisional file as the recovery source for that commit.
-            let _ = fs::rename(pending_backup, backup_path);
+            // This rename is the durable commit marker for the prepared recovery
+            // copy. If it fails, roll back the first primary before reporting failure.
+            if let Err(error) = fs::rename(&prepared_backup, &committed_backup) {
+                let _ = fs::remove_file(path);
+                return Err(AppError::from(format!(
+                    "Commit dictionary backup failed: {error}"
+                )));
+            }
+            // Canonical promotion is best-effort: the committed name remains an
+            // authoritative recovery source if the destination is unavailable.
+            let _ = fs::rename(committed_backup, backup_path);
             return Ok(());
         }
         atomic_replace(path, data.as_bytes())?;
@@ -196,7 +208,7 @@ impl Dictionary {
         match parse_dictionary(&primary) {
             Ok((dictionary, _)) => Ok(dictionary),
             Err(primary_error) => {
-                let backup = read_recovery_backup(path, true).ok_or(primary_error)?;
+                let backup = read_recovery_backup(path).ok_or(primary_error)?;
                 parse_dictionary(&backup).map(|(dictionary, _)| dictionary)
             }
         }
@@ -582,20 +594,22 @@ pub fn dictionary_backup_path(path: &Path) -> PathBuf {
     PathBuf::from(backup)
 }
 
-fn dictionary_pending_backup_path(path: &Path) -> PathBuf {
-    let mut pending = path.as_os_str().to_os_string();
-    pending.push(".bak.pending");
-    PathBuf::from(pending)
+fn dictionary_prepared_backup_path(path: &Path) -> PathBuf {
+    let mut prepared = path.as_os_str().to_os_string();
+    prepared.push(".bak.prepared");
+    PathBuf::from(prepared)
 }
 
-fn read_recovery_backup(path: &Path, include_pending: bool) -> Option<String> {
+fn dictionary_committed_backup_path(path: &Path) -> PathBuf {
+    let mut committed = path.as_os_str().to_os_string();
+    committed.push(".bak.committed");
+    PathBuf::from(committed)
+}
+
+fn read_recovery_backup(path: &Path) -> Option<String> {
     fs::read_to_string(dictionary_backup_path(path))
         .ok()
-        .or_else(|| {
-            include_pending
-                .then(|| fs::read_to_string(dictionary_pending_backup_path(path)).ok())
-                .flatten()
-        })
+        .or_else(|| fs::read_to_string(dictionary_committed_backup_path(path)).ok())
 }
 
 fn atomic_replace(path: &Path, data: &[u8]) -> AppResult<()> {
@@ -988,7 +1002,7 @@ mod tests {
         dictionary.upsert("committed", "mapping").unwrap();
 
         dictionary.save(&path).expect("primary commit succeeds");
-        fs::write(&path, "{ interrupted").expect("corrupt primary");
+        fs::remove_file(&path).expect("lose primary after commit");
         let recovered = Dictionary::load(&path).expect("recover provisional backup");
 
         assert_eq!(
