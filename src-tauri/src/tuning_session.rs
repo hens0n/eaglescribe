@@ -1,19 +1,119 @@
-//! Durable state for the guided Tuning Session through its required Practice stage.
+//! Durable state for guided Tuning through Candidate Correction Review.
 
+use crate::dictionary::{canonical_text, DictEntry, Dictionary, EntryEditState, EntryOrigin};
 use crate::recognition::RecognitionFingerprint;
 use crate::tuning::{
     builtin_corpus, derive_reading_evidence, infer_candidate_correction_from_evidence,
     ReadingEvidence, SessionInferenceResult,
 };
-use crate::tuning_diagnostics::{SessionId, TuningStage};
+use crate::tuning_diagnostics::{ReasonCode as DiagnosticReasonCode, SessionId, TuningStage};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRowKind {
+    Candidate,
+    VerifyExisting,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewDecision {
+    Approve,
+    Decline,
+    KeepExisting,
+    VerifyReplacement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExistingDictionaryEntry {
+    pub id: String,
+    pub version: u64,
+    pub from: String,
+    pub to: String,
+}
+
+impl From<&DictEntry> for ExistingDictionaryEntry {
+    fn from(entry: &DictEntry) -> Self {
+        Self {
+            id: entry.id.clone(),
+            version: entry.version,
+            from: entry.from.clone(),
+            to: entry.to.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewRow {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub supporting_phrase_ids: Vec<String>,
+    pub kind: ReviewRowKind,
+    pub existing_entry: Option<ExistingDictionaryEntry>,
+    pub decision: Option<ReviewDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlreadyCoveredRow {
+    pub from: String,
+    pub to: String,
+    pub supporting_phrase_ids: Vec<String>,
+    pub existing_entry_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReviewExplanation {
+    pub meaning: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewState {
+    pub rows: Vec<ReviewRow>,
+    pub already_covered: Vec<AlreadyCoveredRow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagedRuleKind {
+    New,
+    Existing,
+    Replacement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagedRule {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub supporting_phrase_ids: Vec<String>,
+    pub kind: StagedRuleKind,
+    pub existing_entry: Option<ExistingDictionaryEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnchangedResultReason {
+    NoSafeCorrectionsFound,
+    AlreadyCoveredByPersonalDictionary,
+    CandidateCorrectionsFoundButNoneApproved,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +174,12 @@ pub struct TuningCheckpoint {
     reading_queue: Vec<String>,
     reading_evidence: Vec<StoredReadingEvidence>,
     inference_results: Vec<SessionInferenceResult>,
+    #[serde(default)]
+    review: ReviewState,
+    #[serde(default)]
+    staged_rules: Vec<StagedRule>,
+    #[serde(default)]
+    unchanged_result_reason: Option<UnchangedResultReason>,
 }
 
 impl TuningCheckpoint {
@@ -123,6 +229,27 @@ impl TuningCheckpoint {
             })
             .count()
     }
+
+    pub fn review(&self) -> &ReviewState {
+        &self.review
+    }
+
+    pub fn staged_rules(&self) -> &[StagedRule] {
+        &self.staged_rules
+    }
+
+    pub fn unchanged_result_reason(&self) -> Option<UnchangedResultReason> {
+        self.unchanged_result_reason
+    }
+
+    pub fn review_complete(&self) -> bool {
+        self.stage == TuningStage::Review
+            && self
+                .review
+                .rows
+                .iter()
+                .all(|row| row.decision.is_some())
+    }
     fn with_interrupted_attempt(&self) -> Self {
         let mut candidate = self.clone();
         candidate.interrupted_attempt = true;
@@ -142,10 +269,165 @@ impl TuningCheckpoint {
     }
 }
 
+struct CandidateGroup {
+    from: String,
+    to: String,
+    canonical_from: String,
+    canonical_to: String,
+    supporting_phrase_ids: Vec<String>,
+}
+
+fn candidate_groups(inference_results: &[SessionInferenceResult]) -> Vec<CandidateGroup> {
+    let mut groups: Vec<CandidateGroup> = Vec::new();
+    for result in inference_results {
+        let crate::tuning::InferenceDecision::Candidate(candidate) = &result.decision else {
+            continue;
+        };
+        let canonical_from = canonical_text(&candidate.from);
+        let canonical_to = canonical_text(&candidate.to);
+        if let Some(group) = groups.iter_mut().find(|group| {
+            group.canonical_from == canonical_from && group.canonical_to == canonical_to
+        }) {
+            if !group.supporting_phrase_ids.contains(&result.phrase_id) {
+                group.supporting_phrase_ids.push(result.phrase_id.clone());
+            }
+        } else {
+            groups.push(CandidateGroup {
+                from: candidate.from.clone(),
+                to: candidate.to.clone(),
+                canonical_from,
+                canonical_to,
+                supporting_phrase_ids: vec![result.phrase_id.clone()],
+            });
+        }
+    }
+    groups
+}
+
+fn ambiguous_sources(groups: &[CandidateGroup]) -> HashSet<String> {
+    groups
+        .iter()
+        .filter_map(|group| {
+            let distinct_targets = groups
+                .iter()
+                .filter(|other| other.canonical_from == group.canonical_from)
+                .map(|other| other.canonical_to.as_str())
+                .collect::<HashSet<_>>();
+            (distinct_targets.len() > 1).then(|| group.canonical_from.clone())
+        })
+        .collect()
+}
+
+pub fn ambiguous_phrase_ids(inference_results: &[SessionInferenceResult]) -> Vec<String> {
+    let groups = candidate_groups(inference_results);
+    let ambiguous = ambiguous_sources(&groups);
+    groups
+        .iter()
+        .filter(|group| ambiguous.contains(&group.canonical_from))
+        .flat_map(|group| group.supporting_phrase_ids.iter().cloned())
+        .collect()
+}
+
+pub fn review_explanations(
+    inference_results: &[SessionInferenceResult],
+) -> Vec<ReviewExplanation> {
+    let mut explanation_counts = BTreeMap::<String, usize>::new();
+    for result in inference_results {
+        if !matches!(result.decision, crate::tuning::InferenceDecision::Rejected) {
+            continue;
+        }
+        let mut meanings = HashSet::new();
+        for reason in &result.aggregate_reason_codes {
+            meanings.insert(
+                DiagnosticReasonCode::from(*reason).user_facing_meaning(),
+            );
+        }
+        for meaning in meanings {
+            *explanation_counts.entry(meaning.to_owned()).or_default() += 1;
+        }
+    }
+    let ambiguous_count = ambiguous_phrase_ids(inference_results).len();
+    if ambiguous_count > 0 {
+        *explanation_counts
+            .entry(
+                DiagnosticReasonCode::OutsideEligibleSpan
+                    .user_facing_meaning()
+                    .to_owned(),
+            )
+            .or_default() += ambiguous_count;
+    }
+    explanation_counts
+        .into_iter()
+        .map(|(meaning, count)| ReviewExplanation { meaning, count })
+        .collect()
+}
+
+pub fn build_review(
+    inference_results: &[SessionInferenceResult],
+    dictionary: &Dictionary,
+    fingerprint: &RecognitionFingerprint,
+) -> ReviewState {
+    let groups = candidate_groups(inference_results);
+    let ambiguous_sources = ambiguous_sources(&groups);
+    let mut review = ReviewState::default();
+
+    for group in groups
+        .into_iter()
+        .filter(|group| !ambiguous_sources.contains(&group.canonical_from))
+    {
+        let existing = dictionary.entry_for_source(&group.from);
+        if let Some(existing) = existing {
+            if existing.has_equivalent_mapping(&group.from, &group.to) {
+                if existing.is_active_for(Some(fingerprint)) {
+                    review.already_covered.push(AlreadyCoveredRow {
+                        from: existing.from.clone(),
+                        to: existing.to.clone(),
+                        supporting_phrase_ids: group.supporting_phrase_ids,
+                        existing_entry_id: existing.id.clone(),
+                    });
+                    continue;
+                }
+                debug_assert_eq!(existing.origin, EntryOrigin::Tuning);
+                debug_assert_eq!(existing.edit_state, EntryEditState::Unmodified);
+                review.rows.push(ReviewRow {
+                    id: Uuid::new_v4().to_string(),
+                    from: group.from,
+                    to: group.to,
+                    supporting_phrase_ids: group.supporting_phrase_ids,
+                    kind: ReviewRowKind::VerifyExisting,
+                    existing_entry: Some(existing.into()),
+                    decision: None,
+                });
+                continue;
+            }
+            review.rows.push(ReviewRow {
+                id: Uuid::new_v4().to_string(),
+                from: group.from,
+                to: group.to,
+                supporting_phrase_ids: group.supporting_phrase_ids,
+                kind: ReviewRowKind::Conflict,
+                existing_entry: Some(existing.into()),
+                decision: None,
+            });
+            continue;
+        }
+        review.rows.push(ReviewRow {
+            id: Uuid::new_v4().to_string(),
+            from: group.from,
+            to: group.to,
+            supporting_phrase_ids: group.supporting_phrase_ids,
+            kind: ReviewRowKind::Candidate,
+            existing_entry: None,
+            decision: None,
+        });
+    }
+    review
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckpointState {
     None,
-    Compatible(TuningCheckpoint),
+    Compatible(Box<TuningCheckpoint>),
     Incompatible { reason: String },
 }
 
@@ -188,6 +470,9 @@ impl TuningCheckpointStore {
             reading_queue: Vec::new(),
             reading_evidence: Vec::new(),
             inference_results: Vec::new(),
+            review: ReviewState::default(),
+            staged_rules: Vec::new(),
+            unchanged_result_reason: None,
         };
         self.save(&checkpoint)?;
         Ok(checkpoint)
@@ -211,7 +496,7 @@ impl TuningCheckpointStore {
                     .into(),
             };
         }
-        CheckpointState::Compatible(checkpoint)
+        CheckpointState::Compatible(Box::new(checkpoint))
     }
 
     /// Persist that an attempt began before microphone capture starts. On a
@@ -274,6 +559,100 @@ impl TuningCheckpointStore {
         Ok(candidate)
     }
 
+    pub fn record_review_decision(
+        &self,
+        checkpoint: &TuningCheckpoint,
+        row_id: &str,
+        decision: ReviewDecision,
+    ) -> Result<TuningCheckpoint, String> {
+        if checkpoint.stage != TuningStage::Review {
+            return Err("Review is not the current durable Tuning stage".into());
+        }
+        let mut candidate = checkpoint.clone();
+        let row = candidate
+            .review
+            .rows
+            .iter_mut()
+            .find(|row| row.id == row_id)
+            .ok_or_else(|| "The Candidate Correction is no longer in Review".to_owned())?;
+        let valid = matches!(
+            (row.kind, decision),
+            (
+                ReviewRowKind::Candidate | ReviewRowKind::VerifyExisting,
+                ReviewDecision::Approve | ReviewDecision::Decline
+            ) | (
+                ReviewRowKind::Conflict,
+                ReviewDecision::KeepExisting | ReviewDecision::VerifyReplacement
+            )
+        );
+        if !valid {
+            return Err("That decision is not valid for this Review row".into());
+        }
+        row.decision = Some(decision);
+        self.save(&candidate)?;
+        Ok(candidate)
+    }
+
+    pub fn continue_review(
+        &self,
+        checkpoint: &TuningCheckpoint,
+    ) -> Result<TuningCheckpoint, String> {
+        if checkpoint.stage != TuningStage::Review {
+            return Err("Review is not the current durable Tuning stage".into());
+        }
+        if !checkpoint.review_complete() {
+            return Err("Every Candidate Correction needs an explicit Review decision".into());
+        }
+
+        let mut candidate = checkpoint.clone();
+        candidate.staged_rules = candidate
+            .review
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let kind = match (row.kind, row.decision) {
+                    (ReviewRowKind::Candidate, Some(ReviewDecision::Approve)) => {
+                        StagedRuleKind::New
+                    }
+                    (ReviewRowKind::VerifyExisting, Some(ReviewDecision::Approve)) => {
+                        StagedRuleKind::Existing
+                    }
+                    (ReviewRowKind::Conflict, Some(ReviewDecision::VerifyReplacement)) => {
+                        StagedRuleKind::Replacement
+                    }
+                    _ => return None,
+                };
+                Some(StagedRule {
+                    id: Uuid::new_v4().to_string(),
+                    from: row.from.clone(),
+                    to: row.to.clone(),
+                    supporting_phrase_ids: row.supporting_phrase_ids.clone(),
+                    kind,
+                    existing_entry: row.existing_entry.clone(),
+                })
+            })
+            .collect();
+
+        if candidate.staged_rules.is_empty() {
+            candidate.stage = TuningStage::Result;
+            candidate.unchanged_result_reason = Some(if !candidate.review.rows.is_empty() {
+                UnchangedResultReason::CandidateCorrectionsFoundButNoneApproved
+            } else if !candidate.review.already_covered.is_empty() {
+                UnchangedResultReason::AlreadyCoveredByPersonalDictionary
+            } else {
+                UnchangedResultReason::NoSafeCorrectionsFound
+            });
+            candidate.inference_results.clear();
+            candidate.review = ReviewState::default();
+            self.delete_checkpoint(checkpoint)?;
+        } else {
+            candidate.stage = TuningStage::Verify;
+            candidate.unchanged_result_reason = None;
+            self.save(&candidate)?;
+        }
+        Ok(candidate)
+    }
+
     /// Derive evidence from one successful local transcript, then atomically
     /// save that evidence and the resulting pass progress. The raw transcript
     /// is never placed in the checkpoint.
@@ -281,6 +660,19 @@ impl TuningCheckpointStore {
         &self,
         checkpoint: &TuningCheckpoint,
         raw_transcript: &str,
+    ) -> Result<TuningCheckpoint, String> {
+        self.complete_reading_with_dictionary(
+            checkpoint,
+            raw_transcript,
+            &Dictionary::default(),
+        )
+    }
+
+    pub fn complete_reading_with_dictionary(
+        &self,
+        checkpoint: &TuningCheckpoint,
+        raw_transcript: &str,
+        dictionary: &Dictionary,
     ) -> Result<TuningCheckpoint, String> {
         let pass = match checkpoint.stage {
             TuningStage::FirstReading => ReadingPass::First,
@@ -332,6 +724,11 @@ impl TuningCheckpointStore {
                         })
                         .collect::<Result<Vec<_>, String>>()?;
                     candidate.reading_evidence.clear();
+                    candidate.review = build_review(
+                        &candidate.inference_results,
+                        dictionary,
+                        &candidate.envelope.recognition_fingerprint,
+                    );
                     candidate.stage = TuningStage::Review;
                 }
             }
@@ -345,6 +742,21 @@ impl TuningCheckpointStore {
         let bytes = serde_json::to_vec_pretty(checkpoint)
             .map_err(|error| format!("Serialize Tuning checkpoint failed: {error}"))?;
         atomic_replace(&self.path, &bytes)
+    }
+
+    fn delete_checkpoint(&self, resumable: &TuningCheckpoint) -> Result<(), String> {
+        fs::remove_file(&self.path)
+            .map_err(|error| format!("Delete completed Tuning checkpoint failed: {error}"))?;
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        if let Ok(directory) = fs::File::open(parent) {
+            if let Err(error) = directory.sync_all() {
+                let _ = self.save(resumable);
+                return Err(format!(
+                    "Sync completed Tuning checkpoint deletion failed: {error}"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -414,6 +826,10 @@ fn atomic_replace(path: &Path, data: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dictionary::{
+        DictEntry, Dictionary, EntryEditState, EntryOrigin, VerifiedRecognitionFingerprint,
+    };
+    use crate::tuning::{CandidateCorrection, CandidateState, InferenceDecision};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(label: &str) -> PathBuf {
@@ -430,6 +846,38 @@ mod tests {
         CompatibilityEnvelope::current(RecognitionFingerprint::from_stable_id(id))
     }
 
+    fn candidate(phrase_id: &str, from: &str, to: &str) -> SessionInferenceResult {
+        SessionInferenceResult {
+            phrase_id: phrase_id.into(),
+            decision: InferenceDecision::Candidate(CandidateCorrection {
+                probe_span_id: format!("{phrase_id}-P01"),
+                from: from.into(),
+                to: to.into(),
+                state: CandidateState::Inactive,
+            }),
+            reading_reason_codes: [Vec::new(), Vec::new()],
+            aggregate_reason_codes: Vec::new(),
+        }
+    }
+
+    fn dictionary_entry(
+        id: &str,
+        from: &str,
+        to: &str,
+        origin: EntryOrigin,
+        verified_fingerprints: Vec<VerifiedRecognitionFingerprint>,
+    ) -> DictEntry {
+        DictEntry {
+            id: id.into(),
+            from: from.into(),
+            to: to.into(),
+            origin,
+            edit_state: EntryEditState::Unmodified,
+            verified_fingerprints,
+            version: 1,
+        }
+    }
+
     #[test]
     fn starting_a_session_atomically_persists_practice_as_the_durable_stage() {
         let path = temp_path("start");
@@ -442,7 +890,7 @@ mod tests {
         assert!(path.is_file());
         assert_eq!(
             store.inspect(&envelope("recognition-a")),
-            CheckpointState::Compatible(started)
+            CheckpointState::Compatible(Box::new(started))
         );
     }
 
@@ -482,7 +930,7 @@ mod tests {
 
         assert!(interrupted.interrupted_attempt());
         assert_eq!(interrupted.stage(), TuningStage::Practice);
-        assert_eq!(reloaded, CheckpointState::Compatible(interrupted));
+        assert_eq!(reloaded, CheckpointState::Compatible(Box::new(interrupted)));
     }
 
     #[test]
@@ -498,7 +946,7 @@ mod tests {
         assert!(!completed.interrupted_attempt());
         assert_eq!(
             store.inspect(&envelope("recognition-a")),
-            CheckpointState::Compatible(completed)
+            CheckpointState::Compatible(Box::new(completed))
         );
     }
 
@@ -647,5 +1095,240 @@ mod tests {
         assert_eq!(candidates[0].from, "quick chip");
         assert_eq!(candidates[0].to, "quick ship");
         assert_eq!(candidates[0].state, crate::tuning::CandidateState::Inactive);
+    }
+
+    #[test]
+    fn review_coalesces_equivalent_candidates_and_rejects_ambiguous_sources() {
+        let fingerprint = RecognitionFingerprint::from_stable_id("recognition-a");
+        let inference = vec![
+            candidate("T01", "Quick   Chip", "Quick Ship"),
+            candidate("T02", "quick chip", "quick ship"),
+            candidate("T03", "up stairs", "upstairs"),
+            candidate("T04", "UP STAIRS", "up the stairs"),
+        ];
+
+        let review = build_review(&inference, &Dictionary::default(), &fingerprint);
+
+        assert_eq!(review.rows.len(), 1);
+        assert_eq!(review.rows[0].from, "Quick   Chip");
+        assert_eq!(review.rows[0].to, "Quick Ship");
+        assert_eq!(review.rows[0].supporting_phrase_ids, ["T01", "T02"]);
+        assert_eq!(review.rows[0].kind, ReviewRowKind::Candidate);
+        assert_eq!(review.rows[0].decision, None);
+        assert_eq!(ambiguous_phrase_ids(&inference), ["T03", "T04"]);
+        assert!(review_explanations(&inference)
+            .iter()
+            .any(|explanation| explanation.meaning == "Too broad to apply safely"));
+    }
+
+    #[test]
+    fn review_classifies_covered_inactive_and_conflicting_dictionary_entries() {
+        let current = RecognitionFingerprint::from_stable_id("recognition-current");
+        let previous = RecognitionFingerprint::from_stable_id("recognition-previous");
+        let mut modified_tuning = dictionary_entry(
+            "modified",
+            "judge shoes",
+            "judge chose",
+            EntryOrigin::Tuning,
+            vec![],
+        );
+        modified_tuning.edit_state = EntryEditState::ModifiedAfterVerification;
+        let dictionary = Dictionary {
+            entries: vec![
+                dictionary_entry("manual", "quick chip", "quick ship", EntryOrigin::Manual, vec![]),
+                dictionary_entry(
+                    "active",
+                    "late crane",
+                    "late train",
+                    EntryOrigin::Tuning,
+                    vec![VerifiedRecognitionFingerprint {
+                        fingerprint: current.clone(),
+                        verified_at_ms: 20,
+                    }],
+                ),
+                modified_tuning,
+                dictionary_entry(
+                    "inactive",
+                    "up stairs",
+                    "upstairs",
+                    EntryOrigin::Tuning,
+                    vec![VerifiedRecognitionFingerprint {
+                        fingerprint: previous,
+                        verified_at_ms: 10,
+                    }],
+                ),
+                dictionary_entry("conflict", "brown socks", "brown box", EntryOrigin::Manual, vec![]),
+            ],
+            ..Dictionary::default()
+        };
+        let inference = vec![
+            candidate("T01", "QUICK CHIP", "QUICK SHIP"),
+            candidate("T09", "late crane", "late train"),
+            candidate("T10", "judge shoes", "judge chose"),
+            candidate("T05", "up stairs", "upstairs"),
+            candidate("T08", "brown socks", "brown fox"),
+        ];
+
+        let review = build_review(&inference, &dictionary, &current);
+
+        assert_eq!(review.already_covered.len(), 3);
+        assert_eq!(review.already_covered[0].existing_entry_id, "manual");
+        assert_eq!(review.already_covered[1].existing_entry_id, "active");
+        assert_eq!(review.already_covered[2].existing_entry_id, "modified");
+        assert_eq!(review.rows.len(), 2);
+        assert_eq!(review.rows[0].kind, ReviewRowKind::VerifyExisting);
+        assert_eq!(review.rows[0].existing_entry.as_ref().unwrap().id, "inactive");
+        assert_eq!(review.rows[1].kind, ReviewRowKind::Conflict);
+        assert_eq!(review.rows[1].existing_entry.as_ref().unwrap().to, "brown box");
+    }
+
+    #[test]
+    fn every_actionable_review_row_requires_a_valid_explicit_decision() {
+        let path = temp_path("review-decisions");
+        let store = TuningCheckpointStore::new(path);
+        let current = RecognitionFingerprint::from_stable_id("recognition-current");
+        let previous = RecognitionFingerprint::from_stable_id("recognition-previous");
+        let dictionary = Dictionary {
+            entries: vec![
+                dictionary_entry(
+                    "inactive",
+                    "up stairs",
+                    "upstairs",
+                    EntryOrigin::Tuning,
+                    vec![VerifiedRecognitionFingerprint {
+                        fingerprint: previous,
+                        verified_at_ms: 10,
+                    }],
+                ),
+                dictionary_entry("conflict", "brown socks", "brown box", EntryOrigin::Manual, vec![]),
+            ],
+            ..Dictionary::default()
+        };
+        let inference = vec![
+            candidate("T01", "quick chip", "quick ship"),
+            candidate("T05", "up stairs", "upstairs"),
+            candidate("T08", "brown socks", "brown fox"),
+        ];
+        let mut checkpoint = store.start(CompatibilityEnvelope::current(current.clone())).unwrap();
+        checkpoint.stage = TuningStage::Review;
+        checkpoint.inference_results = inference.clone();
+        checkpoint.review = build_review(&inference, &dictionary, &current);
+        store.save(&checkpoint).unwrap();
+
+        assert!(!checkpoint.review_complete());
+        assert!(store.continue_review(&checkpoint).is_err());
+        let candidate_id = checkpoint.review.rows[0].id.clone();
+        assert!(store
+            .record_review_decision(&checkpoint, &candidate_id, ReviewDecision::KeepExisting)
+            .is_err());
+
+        for (index, decision) in [
+            ReviewDecision::Approve,
+            ReviewDecision::Approve,
+            ReviewDecision::VerifyReplacement,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row_id = checkpoint.review.rows[index].id.clone();
+            checkpoint = store
+                .record_review_decision(&checkpoint, &row_id, decision)
+                .unwrap();
+        }
+
+        assert!(checkpoint.review_complete());
+        let continued = store.continue_review(&checkpoint).unwrap();
+        assert_eq!(continued.stage(), TuningStage::Verify);
+        assert_eq!(continued.staged_rules().len(), 3);
+        assert_eq!(continued.staged_rules()[0].kind, StagedRuleKind::New);
+        assert_eq!(continued.staged_rules()[0].from, "quick chip");
+        assert_eq!(continued.staged_rules()[1].kind, StagedRuleKind::Existing);
+        assert_eq!(
+            continued.staged_rules()[1]
+                .existing_entry
+                .as_ref()
+                .unwrap()
+                .id,
+            "inactive"
+        );
+        assert_eq!(continued.staged_rules()[2].kind, StagedRuleKind::Replacement);
+        assert_eq!(
+            continued.staged_rules()[2]
+                .existing_entry
+                .as_ref()
+                .unwrap()
+                .id,
+            "conflict"
+        );
+    }
+
+    #[test]
+    fn approving_no_rules_completes_with_the_precise_unchanged_reason() {
+        let fingerprint = RecognitionFingerprint::from_stable_id("recognition-current");
+
+        let no_safe_path = temp_path("review-no-safe");
+        let no_safe_store = TuningCheckpointStore::new(no_safe_path.clone());
+        let mut no_safe = no_safe_store
+            .start(CompatibilityEnvelope::current(fingerprint.clone()))
+            .unwrap();
+        no_safe.stage = TuningStage::Review;
+        no_safe.review = ReviewState::default();
+        no_safe_store.save(&no_safe).unwrap();
+        let no_safe = no_safe_store.continue_review(&no_safe).unwrap();
+        assert_eq!(no_safe.stage(), TuningStage::Result);
+        assert_eq!(
+            no_safe.unchanged_result_reason(),
+            Some(UnchangedResultReason::NoSafeCorrectionsFound)
+        );
+        assert!(!no_safe_path.exists());
+        assert!(no_safe.inference_results().is_empty());
+        assert!(no_safe.review().rows.is_empty());
+
+        let covered_store = TuningCheckpointStore::new(temp_path("review-covered"));
+        let mut covered = covered_store
+            .start(CompatibilityEnvelope::current(fingerprint.clone()))
+            .unwrap();
+        covered.stage = TuningStage::Review;
+        covered.inference_results = vec![candidate("T01", "quick chip", "quick ship")];
+        covered.review = ReviewState {
+            already_covered: vec![AlreadyCoveredRow {
+                from: "quick chip".into(),
+                to: "quick ship".into(),
+                supporting_phrase_ids: vec!["T01".into()],
+                existing_entry_id: "manual".into(),
+            }],
+            ..ReviewState::default()
+        };
+        covered_store.save(&covered).unwrap();
+        let covered = covered_store.continue_review(&covered).unwrap();
+        assert_eq!(
+            covered.unchanged_result_reason(),
+            Some(UnchangedResultReason::AlreadyCoveredByPersonalDictionary)
+        );
+
+        let declined_store = TuningCheckpointStore::new(temp_path("review-declined"));
+        let mut declined = declined_store
+            .start(CompatibilityEnvelope::current(fingerprint))
+            .unwrap();
+        declined.stage = TuningStage::Review;
+        declined.inference_results = vec![candidate("T01", "quick chip", "quick ship")];
+        declined.review = ReviewState {
+            rows: vec![ReviewRow {
+                id: "row-1".into(),
+                from: "quick chip".into(),
+                to: "quick ship".into(),
+                supporting_phrase_ids: vec!["T01".into()],
+                kind: ReviewRowKind::Candidate,
+                existing_entry: None,
+                decision: Some(ReviewDecision::Decline),
+            }],
+            ..ReviewState::default()
+        };
+        declined_store.save(&declined).unwrap();
+        let declined = declined_store.continue_review(&declined).unwrap();
+        assert_eq!(
+            declined.unchanged_result_reason(),
+            Some(UnchangedResultReason::CandidateCorrectionsFoundButNoneApproved)
+        );
     }
 }

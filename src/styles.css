@@ -309,6 +309,11 @@ body {
   color: var(--accent);
 }
 
+.tuning-stage.not_needed {
+  border-style: dashed;
+  color: var(--muted);
+}
+
 .tuning-stage.current {
   background: color-mix(in srgb, var(--accent-dim) 45%, transparent);
   border-color: var(--accent);
@@ -345,6 +350,47 @@ body {
   border-left: 3px solid var(--accent);
   background: var(--card);
   font-size: 1.05rem;
+}
+
+.tuning-review,
+.tuning-review-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.tuning-review-row {
+  padding: 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--card);
+}
+
+.tuning-review-row.covered {
+  border-color: var(--accent-dim);
+}
+
+.tuning-review-row h3,
+.tuning-review-explanations h3 {
+  margin: 0 0 0.3rem;
+  font-size: 0.82rem;
+}
+
+.tuning-review-mapping {
+  overflow-wrap: anywhere;
+}
+
+.tuning-review-actions {
+  margin-top: 0.5rem;
+}
+
+.tuning-review-explanations {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.tuning-review-explanations ul {
+  margin: 0;
 }
 
 @media (max-width: 620px) {

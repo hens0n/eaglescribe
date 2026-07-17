@@ -28,6 +28,7 @@ use state::{AppState, SharedState, StatusSnapshot, TuningSnapshot};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use stt::resolve_model_path;
+use tuning_session::ReviewDecision;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -99,6 +100,20 @@ fn tuning_retry_phrase(state: tauri::State<'_, SharedState>) -> AppResult<Tuning
 #[tauri::command]
 fn tuning_defer_phrase(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
     state.inner().tuning_defer_phrase()
+}
+
+#[tauri::command]
+fn tuning_review_decision(
+    row_id: String,
+    decision: ReviewDecision,
+    state: tauri::State<'_, SharedState>,
+) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_review_decision(&row_id, decision)
+}
+
+#[tauri::command]
+fn tuning_continue_review(state: tauri::State<'_, SharedState>) -> AppResult<TuningSnapshot> {
+    state.inner().tuning_continue_review()
 }
 
 #[tauri::command]
@@ -1141,6 +1156,8 @@ pub fn run() {
             tuning_stop_reading,
             tuning_retry_phrase,
             tuning_defer_phrase,
+            tuning_review_decision,
+            tuning_continue_review,
             tuning_leave,
             set_model_path,
             set_polish_mode,
