@@ -120,11 +120,19 @@ interface TuningSnapshot {
   staged_rule_count: number;
   verification_id: string | null;
   verification_text: string | null;
+  verification_position: number | null;
+  verification_total: number | null;
+  verification_attempt: number | null;
   result_rules: {
     from: string;
     to: string;
-    outcome: "kept";
-    dictionary_entry_id: string;
+    outcome:
+      | "kept"
+      | "could_not_verify"
+      | "target_not_corrected"
+      | "harmful_change"
+      | "rule_interaction";
+    dictionary_entry_id: string | null;
   }[];
   unchanged_result_reason:
     | "no_safe_corrections_found"
@@ -1246,30 +1254,55 @@ function applyTuningStatus(s: TuningSnapshot) {
     els.tuningPracticePrompt().hidden = false;
     els.tuningPracticePrompt().textContent = s.verification_text ?? "";
     els.tuningPhrasePosition().hidden = false;
-    els.tuningPhrasePosition().textContent = `Held-out phrase ${s.verification_id ?? ""}`;
+    els.tuningPhrasePosition().textContent = `Held-out Tuning Phrase ${s.verification_id ?? ""} · ${s.verification_position ?? 1} of ${s.verification_total ?? 1}`;
     els.btnTuningVerification().hidden = false;
     if (s.activity === "recording") {
-      message = "Read the different held-out phrase naturally, then stop.";
+      message = "Read the different held-out Tuning Phrase naturally, then stop.";
       els.btnTuningVerification().textContent = "Stop & verify rule";
     } else if (s.activity === "transcribing") {
       message = "Transcribing locally and verifying through the Tuning-only dictionary overlay…";
       els.btnTuningVerification().textContent = "Verifying…";
     } else {
-      message = "Read this distinct held-out phrase to verify the approved Correction Rule before it becomes active.";
+      message =
+        s.verification_attempt === 2
+          ? "The approved Correction Rule was not exercised. Read this held-out Tuning Phrase one final time."
+          : "Read this distinct held-out Tuning Phrase to verify the approved Correction Rules before any become active.";
       els.btnTuningVerification().textContent = "Start verification";
     }
   } else if (active && s.last_durable_stage === "result") {
     title = "Result";
     if (s.result_rules.length > 0) {
-      message = "The verified Correction Rule was kept in Personal Dictionary.";
+      const kept = s.result_rules.filter((rule) => rule.outcome === "kept").length;
+      const rolledBack = s.result_rules.length - kept;
+      message =
+        rolledBack === 0
+          ? `${kept} verified Correction ${kept === 1 ? "Rule was" : "Rules were"} kept in Personal Dictionary.`
+          : `${kept} kept and ${rolledBack} rolled back. Only successful Correction Rules changed Personal Dictionary.`;
       const result = els.tuningResult();
       result.hidden = false;
       for (const rule of s.result_rules) {
         const row = document.createElement("section");
         row.className = "tuning-review-row";
         const heading = document.createElement("h3");
-        heading.textContent = "Kept";
+        heading.textContent =
+          rule.outcome === "kept"
+            ? "Kept"
+            : rule.outcome === "could_not_verify"
+              ? "Rolled back — could not verify"
+              : rule.outcome === "target_not_corrected"
+                ? "Rolled back — did not correct the intended phrase"
+                : rule.outcome === "harmful_change"
+                  ? "Rolled back — changed other text"
+                  : "Rolled back — interacted with another rule";
         row.append(heading, mappingLine("Correction Rule", rule.from, rule.to));
+        if (rule.outcome === "kept") {
+          const openDictionary = document.createElement("button");
+          openDictionary.type = "button";
+          openDictionary.className = "secondary btn-sm";
+          openDictionary.textContent = "Open in Personal Dictionary";
+          openDictionary.addEventListener("click", () => void selectTab("library"));
+          row.appendChild(openDictionary);
+        }
         result.appendChild(row);
       }
     } else {
