@@ -24,8 +24,8 @@ use crate::tuning_diagnostics::{
 use crate::tuning_session::{
     self, ambiguous_phrase_ids, review_explanations, AlreadyCoveredRow, CheckpointState,
     CompatibilityEnvelope, CompletedTuningResult, ReadingPass, ReviewDecision, ReviewExplanation,
-    ReviewRow, TuningCheckpoint, TuningCheckpointStore, UnchangedResultReason,
-    VerificationRuleResult,
+    ReviewRow, TuningCheckpoint, TuningCheckpointStore, UnchangedResultReason, VerificationAdvance,
+    VerificationRuleOutcome, VerificationRuleResult,
 };
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -402,6 +402,10 @@ impl AppState {
             .as_ref()
             .filter(|checkpoint| checkpoint.stage() == TuningStage::Review)
             .map(TuningCheckpoint::review);
+        let verification_progress = g
+            .tuning_checkpoint
+            .as_ref()
+            .and_then(TuningCheckpoint::verification_progress);
         let verify_not_needed = g.tuning_terminal_result.is_some()
             || g.tuning_checkpoint.as_ref().is_some_and(|checkpoint| {
                 checkpoint.stage() == TuningStage::Result
@@ -448,16 +452,21 @@ impl AppState {
                 .as_ref()
                 .map(|checkpoint| checkpoint.staged_rules().len())
                 .unwrap_or(0),
-            verification_id: g
-                .tuning_checkpoint
+            verification_id: verification_progress
                 .as_ref()
-                .and_then(TuningCheckpoint::verification_progress)
                 .map(|progress| progress.verification_id),
-            verification_text: g
-                .tuning_checkpoint
+            verification_text: verification_progress
                 .as_ref()
-                .and_then(TuningCheckpoint::verification_progress)
                 .map(|progress| progress.phrase_text),
+            verification_position: verification_progress
+                .as_ref()
+                .map(|progress| progress.position),
+            verification_total: verification_progress
+                .as_ref()
+                .map(|progress| progress.total),
+            verification_attempt: verification_progress
+                .as_ref()
+                .map(|progress| progress.attempt),
             result_rules: g
                 .tuning_verified_result
                 .as_ref()
@@ -1342,10 +1351,8 @@ impl AppState {
                 .verification_progress()
                 .ok_or_else(|| AppError::from("Missing held-out verification phrase"))?;
             let phrase_id = checkpoint
-                .staged_rules()
-                .first()
-                .and_then(|rule| rule.supporting_phrase_ids.first())
-                .cloned()
+                .verification_phrase_id()
+                .map(str::to_owned)
                 .ok_or_else(|| AppError::from("Missing supporting Tuning Phrase"))?;
             let engine = g
                 .engine
@@ -1401,7 +1408,21 @@ impl AppState {
                         &dictionary_path,
                         unix_time_ms(),
                     ) {
-                        Ok((result, committed_dictionary)) => {
+                        Ok(VerificationAdvance::InProgress(continued)) => {
+                            drop(raw_transcript);
+                            append_phrase_diagnostic(
+                                &mut g,
+                                &checkpoint,
+                                TuningEventKind::VerificationAttempt,
+                                TuningStage::Verify,
+                                TuningOutcomeCode::Successful,
+                                &phrase_id,
+                                None,
+                            );
+                            g.tuning_checkpoint = Some(*continued);
+                            g.tuning_last_error = None;
+                        }
+                        Ok(VerificationAdvance::Complete(result, committed_dictionary)) => {
                             drop(raw_transcript);
                             let session_id = checkpoint.session_id().clone();
                             append_phrase_diagnostic(
@@ -1413,6 +1434,11 @@ impl AppState {
                                 &phrase_id,
                                 None,
                             );
+                            let kept = result
+                                .rules
+                                .iter()
+                                .filter(|rule| rule.outcome == VerificationRuleOutcome::Kept)
+                                .count();
                             append_tuning_diagnostic(
                                 &mut g,
                                 TuningDiagnosticEvent::new(
@@ -1422,7 +1448,7 @@ impl AppState {
                                     TuningStage::Verify,
                                     TuningOutcomeCode::Committed,
                                 )
-                                .with_count(TuningCountKind::ParticipatingRules, 1),
+                                .with_count(TuningCountKind::ParticipatingRules, kept as u64),
                             );
                             append_tuning_diagnostic(
                                 &mut g,
@@ -3112,6 +3138,9 @@ pub struct TuningSnapshot {
     pub staged_rule_count: usize,
     pub verification_id: Option<&'static str>,
     pub verification_text: Option<&'static str>,
+    pub verification_position: Option<usize>,
+    pub verification_total: Option<usize>,
+    pub verification_attempt: Option<u8>,
     pub result_rules: Vec<VerificationRuleResult>,
     pub unchanged_result_reason: Option<UnchangedResultReason>,
     pub stages: Vec<TuningStageSnapshot>,

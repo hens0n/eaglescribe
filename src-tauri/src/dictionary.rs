@@ -491,6 +491,14 @@ fn apply_ordered_mappings(text: &str, mappings: &[(&str, &str)]) -> String {
         })
 }
 
+/// Apply only a staged Tuning mapping set to an already-computed shared
+/// pre-overlay string. Verification uses this to score every rule against the
+/// same base dictionary result, including when several replacements shadow
+/// committed entries.
+pub(crate) fn apply_tuning_mappings(text: &str, mappings: &[(&str, &str)]) -> String {
+    apply_ordered_mappings(text, mappings)
+}
+
 fn parse_dictionary(data: &str) -> AppResult<(Dictionary, bool)> {
     let value: serde_json::Value = serde_json::from_str(data)
         .map_err(|e| AppError::from(format!("Parse dictionary failed: {e}")))?;

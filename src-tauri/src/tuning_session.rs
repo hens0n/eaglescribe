@@ -19,7 +19,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -142,12 +142,17 @@ pub struct VerificationProgress {
     pub probe_span_id: String,
     pub position: usize,
     pub total: usize,
+    pub attempt: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationRuleOutcome {
     Kept,
+    CouldNotVerify,
+    TargetNotCorrected,
+    HarmfulChange,
+    RuleInteraction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -155,12 +160,46 @@ pub struct VerificationRuleResult {
     pub from: String,
     pub to: String,
     pub outcome: VerificationRuleOutcome,
-    pub dictionary_entry_id: String,
+    pub dictionary_entry_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CompletedTuningResult {
     pub rules: Vec<VerificationRuleResult>,
+}
+
+#[derive(Debug, Clone)]
+pub enum VerificationAdvance {
+    InProgress(Box<TuningCheckpoint>),
+    Complete(CompletedTuningResult, Dictionary),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerificationRuleState {
+    successful_phrase_ids: Vec<String>,
+    not_exercised_attempts: BTreeMap<String, u8>,
+    terminal_outcome: Option<StoredVerificationOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredVerificationOutcome {
+    CouldNotVerify,
+    TargetNotCorrected,
+    HarmfulChange,
+    RuleInteraction,
+}
+
+impl From<StoredVerificationOutcome> for VerificationRuleOutcome {
+    fn from(value: StoredVerificationOutcome) -> Self {
+        match value {
+            StoredVerificationOutcome::CouldNotVerify => Self::CouldNotVerify,
+            StoredVerificationOutcome::TargetNotCorrected => Self::TargetNotCorrected,
+            StoredVerificationOutcome::HarmfulChange => Self::HarmfulChange,
+            StoredVerificationOutcome::RuleInteraction => Self::RuleInteraction,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +249,10 @@ pub struct TuningCheckpoint {
     review: ReviewState,
     #[serde(default)]
     staged_rules: Vec<StagedRule>,
+    #[serde(default)]
+    verification_queue: Vec<String>,
+    #[serde(default)]
+    verification_states: BTreeMap<String, VerificationRuleState>,
     #[serde(default)]
     unchanged_result_reason: Option<UnchangedResultReason>,
     /// Durable transaction marker written after successful scoring and before
@@ -266,31 +309,53 @@ impl TuningCheckpoint {
         self.verification_definition()
     }
 
+    pub fn verification_phrase_id(&self) -> Option<&str> {
+        self.verification_queue.first().map(String::as_str)
+    }
+
     fn verification_definition(&self) -> Option<VerificationProgress> {
-        if self.stage != TuningStage::Verify || self.staged_rules.len() != 1 {
+        if self.stage != TuningStage::Verify {
             return None;
         }
-        let rule = &self.staged_rules[0];
-        let phrase_id = rule.supporting_phrase_ids.first()?;
-        let inference = self.inference_results.iter().find(|result| {
-            result.phrase_id == *phrase_id
-                && matches!(
-                    &result.decision,
-                    crate::tuning::InferenceDecision::Candidate(candidate)
-                        if canonical_text(&candidate.from) == canonical_text(&rule.from)
-                            && canonical_text(&candidate.to) == canonical_text(&rule.to)
-                )
-        })?;
-        let crate::tuning::InferenceDecision::Candidate(candidate) = &inference.decision else {
-            return None;
-        };
+        let phrase_id = self.verification_queue.first()?;
         let phrase = builtin_corpus().phrase(phrase_id)?;
+        let attempt = self
+            .verification_states
+            .values()
+            .filter_map(|state| state.not_exercised_attempts.get(phrase_id))
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let probe_span_id = self
+            .staged_rules
+            .iter()
+            .filter(|rule| rule.supporting_phrase_ids.contains(phrase_id))
+            .find_map(|rule| self.probe_span_id(rule, phrase_id))?;
+        let total = distinct_supporting_phrases(&self.staged_rules).len();
+        let completed =
+            total.saturating_sub(self.verification_queue.iter().collect::<HashSet<_>>().len());
         Some(VerificationProgress {
             verification_id: phrase.verification_id,
             phrase_text: phrase.verification_text,
-            probe_span_id: candidate.probe_span_id.clone(),
-            position: 1,
-            total: 1,
+            probe_span_id,
+            position: completed.saturating_add(1).min(total),
+            total,
+            attempt,
+        })
+    }
+
+    fn probe_span_id(&self, rule: &StagedRule, phrase_id: &str) -> Option<String> {
+        self.inference_results.iter().find_map(|result| {
+            if result.phrase_id != phrase_id {
+                return None;
+            }
+            let crate::tuning::InferenceDecision::Candidate(candidate) = &result.decision else {
+                return None;
+            };
+            (canonical_text(&candidate.from) == canonical_text(&rule.from)
+                && canonical_text(&candidate.to) == canonical_text(&rule.to))
+            .then(|| candidate.probe_span_id.clone())
         })
     }
 
@@ -388,6 +453,89 @@ fn ambiguous_sources(groups: &[CandidateGroup]) -> HashSet<String> {
             (distinct_targets.len() > 1).then(|| group.canonical_from.clone())
         })
         .collect()
+}
+
+fn distinct_supporting_phrases(rules: &[StagedRule]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    rules
+        .iter()
+        .flat_map(|rule| rule.supporting_phrase_ids.iter())
+        .filter(|phrase_id| seen.insert((*phrase_id).clone()))
+        .cloned()
+        .collect()
+}
+
+fn interaction_participants(pre_overlay: &str, rules: &[&StagedRule]) -> HashSet<String> {
+    if rules.len() < 2 {
+        return HashSet::new();
+    }
+    if overlay_subset_is_safe(pre_overlay, rules) {
+        return HashSet::new();
+    }
+    if rules.len() >= usize::BITS as usize {
+        return rules.iter().map(|rule| rule.id.clone()).collect();
+    }
+    let mut minimal_unsafe_masks = Vec::<usize>::new();
+    let all_masks = 1usize << rules.len();
+    for size in 2..=rules.len() {
+        for mask in 1usize..all_masks {
+            if mask.count_ones() as usize != size
+                || minimal_unsafe_masks
+                    .iter()
+                    .any(|minimal| mask & minimal == *minimal)
+            {
+                continue;
+            }
+            let subset = rules
+                .iter()
+                .enumerate()
+                .filter_map(|(index, rule)| ((mask & (1usize << index)) != 0).then_some(*rule))
+                .collect::<Vec<_>>();
+            if !overlay_subset_is_safe(pre_overlay, &subset) {
+                minimal_unsafe_masks.push(mask);
+            }
+        }
+    }
+    let mut participants = HashSet::new();
+    for mask in minimal_unsafe_masks {
+        for (index, rule) in rules.iter().enumerate() {
+            if mask & (1usize << index) != 0 {
+                participants.insert(rule.id.clone());
+            }
+        }
+    }
+    participants
+}
+
+fn overlay_subset_is_safe(pre_overlay: &str, rules: &[&StagedRule]) -> bool {
+    let mappings = rules
+        .iter()
+        .map(|rule| (rule.from.as_str(), rule.to.as_str()))
+        .collect::<Vec<_>>();
+    let post_overlay = crate::dictionary::apply_tuning_mappings(pre_overlay, &mappings);
+    let before = crate::tuning::normalize_tokens(pre_overlay);
+    let mut replacements = Vec::new();
+    for rule in rules {
+        let source = crate::tuning::normalize_tokens(&rule.from);
+        let target = crate::tuning::normalize_tokens(&rule.to);
+        if source.is_empty() || source.len() > before.len() {
+            continue;
+        }
+        for (start, window) in before.windows(source.len()).enumerate() {
+            if window == source {
+                replacements.push((start, start + source.len(), target.clone()));
+            }
+        }
+    }
+    replacements.sort_by_key(|(start, end, _)| (*start, *end));
+    if replacements.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return false;
+    }
+    let mut expected = before;
+    for (start, end, target) in replacements.into_iter().rev() {
+        expected.splice(start..end, target);
+    }
+    expected == crate::tuning::normalize_tokens(&post_overlay)
 }
 
 pub fn ambiguous_phrase_ids(inference_results: &[SessionInferenceResult]) -> Vec<String> {
@@ -540,6 +688,8 @@ impl TuningCheckpointStore {
             inference_results: Vec::new(),
             review: ReviewState::default(),
             staged_rules: Vec::new(),
+            verification_queue: Vec::new(),
+            verification_states: BTreeMap::new(),
             unchanged_result_reason: None,
             pending_commit_verified_at_ms: None,
         };
@@ -716,6 +866,12 @@ impl TuningCheckpointStore {
             self.delete_checkpoint(checkpoint)?;
         } else {
             candidate.stage = TuningStage::Verify;
+            candidate.verification_queue = distinct_supporting_phrases(&candidate.staged_rules);
+            candidate.verification_states = candidate
+                .staged_rules
+                .iter()
+                .map(|rule| (rule.id.clone(), VerificationRuleState::default()))
+                .collect();
             candidate.unchanged_result_reason = None;
             self.save(&candidate)?;
         }
@@ -801,10 +957,9 @@ impl TuningCheckpointStore {
         Ok(candidate)
     }
 
-    /// Exercise the single staged Correction Rule through the production
-    /// dictionary matcher plus a Tuning-only overlay. A successful attempt is
-    /// committed in one atomic Personal Dictionary write; Result is returned
-    /// only after the unfinished checkpoint and all derived evidence are gone.
+    /// Exercise the current held-out row through the complete Tuning-only
+    /// overlay. Every rule is scored from the same pre-overlay text, while the
+    /// combined result is checked for overlap, cascade, and ordering effects.
     pub fn complete_verification_and_commit(
         &self,
         checkpoint: &TuningCheckpoint,
@@ -812,41 +967,124 @@ impl TuningCheckpointStore {
         dictionary: &Dictionary,
         dictionary_path: &Path,
         verified_at_ms: u64,
-    ) -> Result<(CompletedTuningResult, Dictionary), String> {
-        let progress = checkpoint.verification_definition().ok_or_else(|| {
-            "Exactly one Correction Rule must be ready for verification".to_owned()
-        })?;
-        let rule = checkpoint
-            .staged_rules
+    ) -> Result<VerificationAdvance, String> {
+        checkpoint
+            .verification_definition()
+            .ok_or_else(|| "A held-out Verification Pass row must be ready".to_owned())?;
+        let phrase_id = checkpoint
+            .verification_queue
             .first()
-            .ok_or_else(|| "No Correction Rule is staged for verification".to_owned())?;
-        let phrase_id = rule.supporting_phrase_ids.first().ok_or_else(|| {
-            "The staged Correction Rule has no supporting Tuning Phrase".to_owned()
-        })?;
+            .ok_or_else(|| "The Verification Pass has no pending held-out row".to_owned())?;
         let phrase = builtin_corpus().phrase(phrase_id).ok_or_else(|| {
             "The staged Correction Rule references an unknown Tuning Phrase".to_owned()
         })?;
+        let approved_rules = checkpoint.staged_rules.iter().collect::<Vec<_>>();
+        let mappings = approved_rules
+            .iter()
+            .map(|rule| (rule.from.as_str(), rule.to.as_str()))
+            .collect::<Vec<_>>();
         let overlay = dictionary.apply_tuning_overlay(
             raw_transcript,
             Some(&checkpoint.envelope.recognition_fingerprint),
-            &[(rule.from.as_str(), rule.to.as_str())],
+            &mappings,
         );
-        let outcome = score_verification_attempt(
-            phrase,
-            &progress.probe_span_id,
-            &rule.from,
-            &rule.to,
-            &overlay.pre_overlay,
-            &overlay.post_overlay,
-        );
-        if outcome != VerificationAttemptOutcome::Success {
-            return Err(format!("The Correction Rule was not verified: {outcome:?}"));
+        let interaction_ids = interaction_participants(&overlay.pre_overlay, &approved_rules);
+
+        let mut candidate = checkpoint.clone();
+        candidate.verification_queue.remove(0);
+        candidate.interrupted_attempt = false;
+        let mut retry_row = false;
+        for rule in approved_rules {
+            let state = candidate
+                .verification_states
+                .get_mut(&rule.id)
+                .ok_or_else(|| "A staged rule lost its Verification Pass state".to_owned())?;
+            if interaction_ids.contains(&rule.id) {
+                state.terminal_outcome = Some(StoredVerificationOutcome::RuleInteraction);
+                continue;
+            }
+            if state.terminal_outcome.is_some() {
+                continue;
+            }
+            let individual_post = crate::dictionary::apply_tuning_mappings(
+                &overlay.pre_overlay,
+                &[(rule.from.as_str(), rule.to.as_str())],
+            );
+            if rule.supporting_phrase_ids.contains(phrase_id) {
+                let already_succeeded = state.successful_phrase_ids.contains(phrase_id);
+                let probe_span_id = checkpoint
+                    .probe_span_id(rule, phrase_id)
+                    .ok_or_else(|| "The staged rule lost its supporting probe span".to_owned())?;
+                match score_verification_attempt(
+                    phrase,
+                    &probe_span_id,
+                    &rule.from,
+                    &rule.to,
+                    &overlay.pre_overlay,
+                    &individual_post,
+                ) {
+                    VerificationAttemptOutcome::Success => {
+                        if !state.successful_phrase_ids.contains(phrase_id) {
+                            state.successful_phrase_ids.push(phrase_id.clone());
+                        }
+                    }
+                    VerificationAttemptOutcome::NotExercised => {
+                        if already_succeeded {
+                            continue;
+                        }
+                        let attempts = state
+                            .not_exercised_attempts
+                            .entry(phrase_id.clone())
+                            .or_default();
+                        *attempts = attempts.saturating_add(1);
+                        if *attempts >= 2 {
+                            state.terminal_outcome =
+                                Some(StoredVerificationOutcome::CouldNotVerify);
+                        } else {
+                            retry_row = true;
+                        }
+                    }
+                    VerificationAttemptOutcome::TargetNotCorrected => {
+                        state.terminal_outcome =
+                            Some(StoredVerificationOutcome::TargetNotCorrected);
+                    }
+                    VerificationAttemptOutcome::HarmfulChange => {
+                        state.terminal_outcome = Some(StoredVerificationOutcome::HarmfulChange);
+                    }
+                }
+            } else if crate::tuning::normalize_tokens(&individual_post)
+                != crate::tuning::normalize_tokens(&overlay.pre_overlay)
+            {
+                state.terminal_outcome = Some(StoredVerificationOutcome::HarmfulChange);
+            }
+        }
+        if retry_row {
+            candidate.verification_queue.insert(0, phrase_id.clone());
         }
 
-        let mut prepared = checkpoint.clone();
-        prepared.pending_commit_verified_at_ms = Some(verified_at_ms);
-        self.save(&prepared)?;
-        self.finalize_pending_commit_checkpoint(&prepared, dictionary, dictionary_path)
+        if !candidate.verification_queue.is_empty() {
+            self.save(&candidate)?;
+            return Ok(VerificationAdvance::InProgress(Box::new(candidate)));
+        }
+        for rule in &candidate.staged_rules {
+            let state = candidate
+                .verification_states
+                .get_mut(&rule.id)
+                .ok_or_else(|| "A staged rule lost its terminal state".to_owned())?;
+            if state.terminal_outcome.is_none()
+                && !rule
+                    .supporting_phrase_ids
+                    .iter()
+                    .all(|phrase_id| state.successful_phrase_ids.contains(phrase_id))
+            {
+                state.terminal_outcome = Some(StoredVerificationOutcome::CouldNotVerify);
+            }
+        }
+        candidate.pending_commit_verified_at_ms = Some(verified_at_ms);
+        self.save(&candidate)?;
+        let (result, committed) =
+            self.finalize_pending_commit_checkpoint(&candidate, dictionary, dictionary_path)?;
+        Ok(VerificationAdvance::Complete(result, committed))
     }
 
     /// Reconcile the durable transaction marker left by a crash or interrupted
@@ -876,139 +1114,152 @@ impl TuningCheckpointStore {
         let verified_at_ms = checkpoint
             .pending_commit_verified_at_ms
             .ok_or_else(|| "The Tuning dictionary transaction is not prepared".to_owned())?;
-        let rule = checkpoint
-            .staged_rules
-            .first()
-            .filter(|_| checkpoint.staged_rules.len() == 1)
-            .ok_or_else(|| "Exactly one Correction Rule must be ready to commit".to_owned())?;
         let mut committed = dictionary.clone();
         let verified = VerifiedRecognitionFingerprint {
             fingerprint: checkpoint.envelope.recognition_fingerprint.clone(),
             verified_at_ms,
         };
-        let (dictionary_entry_id, dictionary_changed) = match rule.kind {
-            StagedRuleKind::New => {
-                if let Some(existing) = committed.entry_for_source(&rule.from) {
-                    let already_committed = existing.id == rule.id
-                        && existing.has_equivalent_mapping(&rule.from, &rule.to)
-                        && existing.origin == EntryOrigin::Tuning
-                        && existing.edit_state == EntryEditState::Unmodified
-                        && existing
-                            .verified_fingerprints
-                            .iter()
-                            .any(|stored| stored == &verified);
-                    if already_committed {
-                        (existing.id.clone(), false)
-                    } else {
-                        return Err("The staged dictionary key changed before commit".into());
-                    }
-                } else {
-                    committed.entries.push(DictEntry {
-                        id: rule.id.clone(),
-                        from: rule.from.clone(),
-                        to: rule.to.clone(),
-                        origin: EntryOrigin::Tuning,
-                        edit_state: EntryEditState::Unmodified,
-                        verified_fingerprints: vec![verified],
-                        version: 1,
-                    });
-                    committed.revision = committed.revision.saturating_add(1);
-                    (rule.id.clone(), true)
-                }
+        let mut dictionary_changed = false;
+        let mut results = Vec::with_capacity(checkpoint.staged_rules.len());
+        for rule in &checkpoint.staged_rules {
+            let state = checkpoint
+                .verification_states
+                .get(&rule.id)
+                .ok_or_else(|| "A staged rule lost its commit outcome".to_owned())?;
+            if let Some(outcome) = state.terminal_outcome {
+                results.push(VerificationRuleResult {
+                    from: rule.from.clone(),
+                    to: rule.to.clone(),
+                    outcome: outcome.into(),
+                    dictionary_entry_id: None,
+                });
+                continue;
             }
-            StagedRuleKind::Existing => {
-                let expected = rule.existing_entry.as_ref().ok_or_else(|| {
-                    "The existing staged rule lost its dictionary identity".to_owned()
-                })?;
-                if let Some(entry) = committed.entries.iter().find(|entry| {
-                    entry.id == expected.id
-                        && entry.version == expected.version.saturating_add(1)
-                        && entry.has_equivalent_mapping(&rule.from, &rule.to)
-                        && entry
-                            .verified_fingerprints
-                            .iter()
-                            .any(|stored| stored == &verified)
-                }) {
-                    (entry.id.clone(), false)
-                } else {
-                    let entry = committed
-                        .entries
-                        .iter_mut()
-                        .find(|entry| entry.id == expected.id && entry.version == expected.version)
-                        .ok_or_else(|| {
-                            "The staged dictionary key changed before commit".to_owned()
-                        })?;
-                    if !entry.has_equivalent_mapping(&rule.from, &rule.to) {
-                        return Err("The staged dictionary mapping changed before commit".into());
-                    }
-                    entry.verified_fingerprints.push(verified);
-                    entry.version = entry.version.saturating_add(1);
-                    let id = entry.id.clone();
-                    committed.revision = committed.revision.saturating_add(1);
-                    (id, true)
-                }
-            }
-            StagedRuleKind::Replacement => {
-                let expected = rule
-                    .existing_entry
-                    .as_ref()
-                    .ok_or_else(|| "The replacement lost its dictionary identity".to_owned())?;
-                if let Some(existing) = committed.entry_for_source(&rule.from) {
-                    let already_committed = existing.id == rule.id
-                        && existing.has_equivalent_mapping(&rule.from, &rule.to)
-                        && existing.origin == EntryOrigin::Tuning
-                        && existing.edit_state == EntryEditState::Unmodified
-                        && existing
-                            .verified_fingerprints
-                            .iter()
-                            .any(|stored| stored == &verified);
-                    if already_committed {
-                        (existing.id.clone(), false)
+            let (dictionary_entry_id, changed) = match rule.kind {
+                StagedRuleKind::New => {
+                    if let Some(existing) = committed.entry_for_source(&rule.from) {
+                        let already_committed = existing.id == rule.id
+                            && existing.has_equivalent_mapping(&rule.from, &rule.to)
+                            && existing.origin == EntryOrigin::Tuning
+                            && existing.edit_state == EntryEditState::Unmodified
+                            && existing
+                                .verified_fingerprints
+                                .iter()
+                                .any(|stored| stored == &verified);
+                        if already_committed {
+                            (existing.id.clone(), false)
+                        } else {
+                            return Err("The staged dictionary key changed before commit".into());
+                        }
                     } else {
-                        let index = committed
-                            .entries
-                            .iter()
-                            .position(|entry| {
-                                entry.id == expected.id && entry.version == expected.version
-                            })
-                            .ok_or_else(|| {
-                                "The staged dictionary key changed before commit".to_owned()
-                            })?;
-                        committed.entries.remove(index);
                         committed.entries.push(DictEntry {
                             id: rule.id.clone(),
                             from: rule.from.clone(),
                             to: rule.to.clone(),
                             origin: EntryOrigin::Tuning,
                             edit_state: EntryEditState::Unmodified,
-                            verified_fingerprints: vec![verified],
+                            verified_fingerprints: vec![verified.clone()],
                             version: 1,
                         });
                         committed.revision = committed.revision.saturating_add(1);
                         (rule.id.clone(), true)
                     }
-                } else {
-                    return Err("The staged dictionary key changed before commit".into());
                 }
-            }
-        };
+                StagedRuleKind::Existing => {
+                    let expected = rule.existing_entry.as_ref().ok_or_else(|| {
+                        "The existing staged rule lost its dictionary identity".to_owned()
+                    })?;
+                    if let Some(entry) = committed.entries.iter().find(|entry| {
+                        entry.id == expected.id
+                            && entry.version == expected.version.saturating_add(1)
+                            && entry.has_equivalent_mapping(&rule.from, &rule.to)
+                            && entry
+                                .verified_fingerprints
+                                .iter()
+                                .any(|stored| stored == &verified)
+                    }) {
+                        (entry.id.clone(), false)
+                    } else {
+                        let entry = committed
+                            .entries
+                            .iter_mut()
+                            .find(|entry| {
+                                entry.id == expected.id && entry.version == expected.version
+                            })
+                            .ok_or_else(|| {
+                                "The staged dictionary key changed before commit".to_owned()
+                            })?;
+                        if !entry.has_equivalent_mapping(&rule.from, &rule.to) {
+                            return Err(
+                                "The staged dictionary mapping changed before commit".into()
+                            );
+                        }
+                        entry.verified_fingerprints.push(verified.clone());
+                        entry.version = entry.version.saturating_add(1);
+                        let id = entry.id.clone();
+                        committed.revision = committed.revision.saturating_add(1);
+                        (id, true)
+                    }
+                }
+                StagedRuleKind::Replacement => {
+                    let expected = rule
+                        .existing_entry
+                        .as_ref()
+                        .ok_or_else(|| "The replacement lost its dictionary identity".to_owned())?;
+                    if let Some(existing) = committed.entry_for_source(&rule.from) {
+                        let already_committed = existing.id == rule.id
+                            && existing.has_equivalent_mapping(&rule.from, &rule.to)
+                            && existing.origin == EntryOrigin::Tuning
+                            && existing.edit_state == EntryEditState::Unmodified
+                            && existing
+                                .verified_fingerprints
+                                .iter()
+                                .any(|stored| stored == &verified);
+                        if already_committed {
+                            (existing.id.clone(), false)
+                        } else {
+                            let index = committed
+                                .entries
+                                .iter()
+                                .position(|entry| {
+                                    entry.id == expected.id && entry.version == expected.version
+                                })
+                                .ok_or_else(|| {
+                                    "The staged dictionary key changed before commit".to_owned()
+                                })?;
+                            committed.entries.remove(index);
+                            committed.entries.push(DictEntry {
+                                id: rule.id.clone(),
+                                from: rule.from.clone(),
+                                to: rule.to.clone(),
+                                origin: EntryOrigin::Tuning,
+                                edit_state: EntryEditState::Unmodified,
+                                verified_fingerprints: vec![verified.clone()],
+                                version: 1,
+                            });
+                            committed.revision = committed.revision.saturating_add(1);
+                            (rule.id.clone(), true)
+                        }
+                    } else {
+                        return Err("The staged dictionary key changed before commit".into());
+                    }
+                }
+            };
+            dictionary_changed |= changed;
+            results.push(VerificationRuleResult {
+                from: rule.from.clone(),
+                to: rule.to.clone(),
+                outcome: VerificationRuleOutcome::Kept,
+                dictionary_entry_id: Some(dictionary_entry_id),
+            });
+        }
         if dictionary_changed {
             committed
                 .save(dictionary_path)
                 .map_err(|error| error.to_string())?;
         }
         self.delete_checkpoint(checkpoint)?;
-        Ok((
-            CompletedTuningResult {
-                rules: vec![VerificationRuleResult {
-                    from: rule.from.clone(),
-                    to: rule.to.clone(),
-                    outcome: VerificationRuleOutcome::Kept,
-                    dictionary_entry_id,
-                }],
-            },
-            committed,
-        ))
+        Ok((CompletedTuningResult { rules: results }, committed))
     }
 
     fn save(&self, checkpoint: &TuningCheckpoint) -> Result<(), String> {
@@ -1120,10 +1371,19 @@ mod tests {
     }
 
     fn candidate(phrase_id: &str, from: &str, to: &str) -> SessionInferenceResult {
+        candidate_for_probe(phrase_id, &format!("{phrase_id}-P01"), from, to)
+    }
+
+    fn candidate_for_probe(
+        phrase_id: &str,
+        probe_span_id: &str,
+        from: &str,
+        to: &str,
+    ) -> SessionInferenceResult {
         SessionInferenceResult {
             phrase_id: phrase_id.into(),
             decision: InferenceDecision::Candidate(CandidateCorrection {
-                probe_span_id: format!("{phrase_id}-P01"),
+                probe_span_id: probe_span_id.into(),
                 from: from.into(),
                 to: to.into(),
                 state: CandidateState::Inactive,
@@ -1131,6 +1391,36 @@ mod tests {
             reading_reason_codes: [Vec::new(), Vec::new()],
             aggregate_reason_codes: Vec::new(),
         }
+    }
+
+    fn approved_checkpoint(
+        store: &TuningCheckpointStore,
+        fingerprint: &RecognitionFingerprint,
+        inference: Vec<SessionInferenceResult>,
+    ) -> TuningCheckpoint {
+        let mut checkpoint = store
+            .start(CompatibilityEnvelope::current(fingerprint.clone()))
+            .unwrap();
+        checkpoint.stage = TuningStage::Review;
+        checkpoint.inference_results = inference;
+        checkpoint.review = build_review(
+            &checkpoint.inference_results,
+            &Dictionary::default(),
+            fingerprint,
+        );
+        store.save(&checkpoint).unwrap();
+        for row_id in checkpoint
+            .review
+            .rows
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>()
+        {
+            checkpoint = store
+                .record_review_decision(&checkpoint, &row_id, ReviewDecision::Approve)
+                .unwrap();
+        }
+        store.continue_review(&checkpoint).unwrap()
     }
 
     fn dictionary_entry(
@@ -1148,6 +1438,17 @@ mod tests {
             edit_state: EntryEditState::Unmodified,
             verified_fingerprints,
             version: 1,
+        }
+    }
+
+    fn staged_rule(id: &str, from: &str, to: &str) -> StagedRule {
+        StagedRule {
+            id: id.into(),
+            from: from.into(),
+            to: to.into(),
+            supporting_phrase_ids: vec!["T01".into()],
+            kind: StagedRuleKind::New,
+            existing_entry: None,
         }
     }
 
@@ -1606,7 +1907,7 @@ mod tests {
             "the staged rule remains inactive in ordinary dictation"
         );
 
-        let (result, dictionary) = store
+        let completed = store
             .complete_verification_and_commit(
                 &checkpoint,
                 "The heavy blue boxes arrived on a quick chip.",
@@ -1615,12 +1916,15 @@ mod tests {
                 42,
             )
             .unwrap();
+        let VerificationAdvance::Complete(result, dictionary) = completed else {
+            panic!("the only held-out row should complete verification")
+        };
 
         assert_eq!(result.rules.len(), 1);
         assert_eq!(result.rules[0].outcome, VerificationRuleOutcome::Kept);
         assert!(!checkpoint_path.exists());
         let entry = &dictionary.entries[0];
-        assert_eq!(entry.id, result.rules[0].dictionary_entry_id);
+        assert_eq!(Some(entry.id.clone()), result.rules[0].dictionary_entry_id);
         assert_eq!(entry.origin, EntryOrigin::Tuning);
         assert_eq!(entry.edit_state, EntryEditState::Unmodified);
         assert_eq!(entry.version, 1);
@@ -1710,6 +2014,370 @@ mod tests {
             99
         );
         assert!(!checkpoint_path.exists());
+    }
+
+    #[test]
+    fn one_non_exercise_allows_exactly_one_retry_then_rolls_back() {
+        let checkpoint_path = temp_path("verify-retry-exhaustion");
+        let dictionary_path = checkpoint_path.with_file_name("dictionary.json");
+        let store = TuningCheckpointStore::new(checkpoint_path.clone());
+        let fingerprint = RecognitionFingerprint::from_stable_id("recognition-current");
+        let checkpoint = approved_checkpoint(
+            &store,
+            &fingerprint,
+            vec![candidate_for_probe(
+                "T05",
+                "T05-P02",
+                "up stairs",
+                "upstairs",
+            )],
+        );
+
+        let first = store
+            .complete_verification_and_commit(
+                &checkpoint,
+                "Upstairs, the good blue book remains on the desk.",
+                &Dictionary::default(),
+                &dictionary_path,
+                42,
+            )
+            .unwrap();
+        let VerificationAdvance::InProgress(retry) = first else {
+            panic!("the first non-exercise must allow another valid reading")
+        };
+        assert_eq!(retry.verification_progress().unwrap().attempt, 2);
+
+        let second = store
+            .complete_verification_and_commit(
+                &retry,
+                "Upstairs, the good blue book remains on the desk.",
+                &Dictionary::default(),
+                &dictionary_path,
+                43,
+            )
+            .unwrap();
+        let VerificationAdvance::Complete(result, dictionary) = second else {
+            panic!("the second non-exercise must be terminal")
+        };
+        assert_eq!(
+            result.rules[0].outcome,
+            VerificationRuleOutcome::CouldNotVerify
+        );
+        assert!(result.rules[0].dictionary_entry_id.is_none());
+        assert!(dictionary.entries.is_empty());
+        assert!(
+            !dictionary_path.exists(),
+            "all rollback leaves the dictionary untouched"
+        );
+        assert!(!checkpoint_path.exists());
+    }
+
+    #[test]
+    fn shared_row_retry_preserves_a_rule_that_already_succeeded() {
+        let checkpoint_path = temp_path("verify-shared-row-retry");
+        let dictionary_path = checkpoint_path.with_file_name("dictionary.json");
+        let store = TuningCheckpointStore::new(checkpoint_path);
+        let fingerprint = RecognitionFingerprint::from_stable_id("recognition-current");
+        let checkpoint = approved_checkpoint(
+            &store,
+            &fingerprint,
+            vec![
+                candidate("T01", "quick chip", "quick ship"),
+                candidate_for_probe("T01", "T01-P02", "heavy blew boxes", "heavy blue boxes"),
+            ],
+        );
+
+        let first = store
+            .complete_verification_and_commit(
+                &checkpoint,
+                "The heavy blue boxes arrived on a quick chip.",
+                &Dictionary::default(),
+                &dictionary_path,
+                41,
+            )
+            .unwrap();
+        let VerificationAdvance::InProgress(retry) = first else {
+            panic!("the second rule needs its one additional shared-row reading")
+        };
+        let second = store
+            .complete_verification_and_commit(
+                &retry,
+                "The heavy blew boxes arrived on a quick ship.",
+                &Dictionary::default(),
+                &dictionary_path,
+                42,
+            )
+            .unwrap();
+        let VerificationAdvance::Complete(result, dictionary) = second else {
+            panic!("both rules have now succeeded on their shared row")
+        };
+        assert!(result
+            .rules
+            .iter()
+            .all(|rule| rule.outcome == VerificationRuleOutcome::Kept));
+        assert_eq!(dictionary.entries.len(), 2);
+    }
+
+    #[test]
+    fn harmful_change_is_terminal_without_retry() {
+        let fingerprint = RecognitionFingerprint::from_stable_id("recognition-current");
+        let harmful_path = temp_path("verify-harmful");
+        let harmful_dictionary_path = harmful_path.with_file_name("dictionary.json");
+        let harmful_store = TuningCheckpointStore::new(harmful_path);
+        let harmful_checkpoint = approved_checkpoint(
+            &harmful_store,
+            &fingerprint,
+            vec![candidate("T01", "quick chip", "quick ship")],
+        );
+        let harmful = harmful_store
+            .complete_verification_and_commit(
+                &harmful_checkpoint,
+                "Quick chip and heavy blue boxes arrived on a quick chip.",
+                &Dictionary::default(),
+                &harmful_dictionary_path,
+                42,
+            )
+            .unwrap();
+        let VerificationAdvance::Complete(harmful_result, _) = harmful else {
+            panic!("harmful replacement must not be retried")
+        };
+        assert_eq!(
+            harmful_result.rules[0].outcome,
+            VerificationRuleOutcome::HarmfulChange
+        );
+    }
+
+    #[test]
+    fn complete_overlay_rolls_back_interacting_participants_together() {
+        let checkpoint_path = temp_path("verify-interaction");
+        let dictionary_path = checkpoint_path.with_file_name("dictionary.json");
+        let store = TuningCheckpointStore::new(checkpoint_path);
+        let fingerprint = RecognitionFingerprint::from_stable_id("recognition-current");
+        let checkpoint = approved_checkpoint(
+            &store,
+            &fingerprint,
+            vec![
+                candidate("T01", "quick chip", "quick ship"),
+                candidate_for_probe("T01", "T01-P02", "quick ship", "heavy blue boxes"),
+                candidate_for_probe("T05", "T05-P02", "up stairs", "upstairs"),
+            ],
+        );
+
+        let advance = store
+            .complete_verification_and_commit(
+                &checkpoint,
+                "The heavy blue boxes arrived on a quick chip.",
+                &Dictionary::default(),
+                &dictionary_path,
+                42,
+            )
+            .unwrap();
+        let VerificationAdvance::InProgress(unaffected) = advance else {
+            panic!("an unrelated rule must continue after interaction rollback")
+        };
+        assert_eq!(unaffected.verification_phrase_id(), Some("T05"));
+        let completed = store
+            .complete_verification_and_commit(
+                &unaffected,
+                "Up stairs, the good blue book remains on the desk.",
+                &Dictionary::default(),
+                &dictionary_path,
+                43,
+            )
+            .unwrap();
+        let VerificationAdvance::Complete(result, dictionary) = completed else {
+            panic!("the unaffected rule should complete normally")
+        };
+        assert_eq!(result.rules.len(), 3);
+        assert!(result.rules[..2]
+            .iter()
+            .all(|rule| rule.outcome == VerificationRuleOutcome::RuleInteraction));
+        assert_eq!(result.rules[2].outcome, VerificationRuleOutcome::Kept);
+        assert_eq!(dictionary.entries.len(), 1);
+    }
+
+    #[test]
+    fn interaction_detection_attributes_a_higher_order_cascade_to_all_participants() {
+        let first = staged_rule("first", "a b", "x");
+        let second = staged_rule("second", "c d", "y");
+        let third = staged_rule("third", "x y", "z");
+        let rules = [&first, &second, &third];
+
+        assert!(overlay_subset_is_safe("a b c d", &[&first, &third]));
+        assert!(overlay_subset_is_safe("a b c d", &[&second, &third]));
+        assert!(overlay_subset_is_safe("a b c d", &[&first, &second]));
+        assert_eq!(
+            interaction_participants("a b c d", &rules),
+            ["first", "second", "third"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn terminal_rule_remains_in_overlay_and_can_expose_a_later_interaction() {
+        let checkpoint_path = temp_path("verify-terminal-rule-overlay");
+        let dictionary_path = checkpoint_path.with_file_name("dictionary.json");
+        let store = TuningCheckpointStore::new(checkpoint_path);
+        let fingerprint = RecognitionFingerprint::from_stable_id("recognition-current");
+        let checkpoint = approved_checkpoint(
+            &store,
+            &fingerprint,
+            vec![
+                candidate("T01", "quick speedy chip", "quick ship"),
+                candidate_for_probe("T05", "T05-P02", "quick ship", "upstairs"),
+            ],
+        );
+        let first = store
+            .complete_verification_and_commit(
+                &checkpoint,
+                "Quick speedy chip and heavy blue boxes arrived on a quick speedy chip.",
+                &Dictionary::default(),
+                &dictionary_path,
+                41,
+            )
+            .unwrap();
+        let VerificationAdvance::InProgress(later_row) = first else {
+            panic!("the complete approved overlay still has a required Tuning Phrase")
+        };
+        let second = store
+            .complete_verification_and_commit(
+                &later_row,
+                "Quick speedy chip, the good blue book remains on the desk.",
+                &Dictionary::default(),
+                &dictionary_path,
+                42,
+            )
+            .unwrap();
+        let VerificationAdvance::Complete(result, dictionary) = second else {
+            panic!("every required held-out Tuning Phrase has now run")
+        };
+        assert!(result
+            .rules
+            .iter()
+            .all(|rule| rule.outcome == VerificationRuleOutcome::RuleInteraction));
+        assert!(dictionary.entries.is_empty());
+    }
+
+    #[test]
+    fn partial_success_commits_unaffected_rule_after_other_rule_exhausts_retry() {
+        let checkpoint_path = temp_path("verify-partial");
+        let dictionary_path = checkpoint_path.with_file_name("dictionary.json");
+        let store = TuningCheckpointStore::new(checkpoint_path);
+        let fingerprint = RecognitionFingerprint::from_stable_id("recognition-current");
+        let checkpoint = approved_checkpoint(
+            &store,
+            &fingerprint,
+            vec![
+                candidate("T01", "quick chip", "quick ship"),
+                candidate_for_probe("T05", "T05-P02", "up stairs", "upstairs"),
+            ],
+        );
+
+        let first = store
+            .complete_verification_and_commit(
+                &checkpoint,
+                "The heavy blue boxes arrived on a quick chip.",
+                &Dictionary::default(),
+                &dictionary_path,
+                40,
+            )
+            .unwrap();
+        let VerificationAdvance::InProgress(next) = first else {
+            panic!("a successful rule must wait for the remaining held-out rows")
+        };
+        assert_eq!(next.verification_phrase_id(), Some("T05"));
+        let second = store
+            .complete_verification_and_commit(
+                &next,
+                "Upstairs, the good blue book remains on the desk.",
+                &Dictionary::default(),
+                &dictionary_path,
+                41,
+            )
+            .unwrap();
+        let VerificationAdvance::InProgress(retry) = second else {
+            panic!("the unaffected kept rule remains staged during a retry")
+        };
+        let final_advance = store
+            .complete_verification_and_commit(
+                &retry,
+                "Upstairs, the good blue book remains on the desk.",
+                &Dictionary::default(),
+                &dictionary_path,
+                42,
+            )
+            .unwrap();
+        let VerificationAdvance::Complete(result, dictionary) = final_advance else {
+            panic!("all approved rules now have terminal outcomes")
+        };
+        assert_eq!(
+            result
+                .rules
+                .iter()
+                .map(|rule| rule.outcome)
+                .collect::<Vec<_>>(),
+            [
+                VerificationRuleOutcome::Kept,
+                VerificationRuleOutcome::CouldNotVerify,
+            ]
+        );
+        assert_eq!(dictionary.entries.len(), 1);
+        assert_eq!(dictionary.entries[0].from, "quick chip");
+    }
+
+    #[test]
+    fn coalesced_rule_cannot_be_kept_until_every_distinct_supporting_row_succeeds() {
+        let checkpoint_path = temp_path("verify-coalesced-unanimity");
+        let dictionary_path = checkpoint_path.with_file_name("dictionary.json");
+        let store = TuningCheckpointStore::new(checkpoint_path);
+        let fingerprint = RecognitionFingerprint::from_stable_id("recognition-current");
+        let checkpoint = approved_checkpoint(
+            &store,
+            &fingerprint,
+            vec![
+                candidate("T01", "quick chip", "quick ship"),
+                candidate_for_probe("T08", "T08-P01", "quick chip", "quick ship"),
+            ],
+        );
+        assert_eq!(checkpoint.staged_rules().len(), 1);
+        assert_eq!(
+            checkpoint.staged_rules()[0].supporting_phrase_ids,
+            ["T01", "T08"]
+        );
+
+        let first = store
+            .complete_verification_and_commit(
+                &checkpoint,
+                "The heavy blue boxes arrived on a quick chip.",
+                &Dictionary::default(),
+                &dictionary_path,
+                41,
+            )
+            .unwrap();
+        let VerificationAdvance::InProgress(second_row) = first else {
+            panic!("one supporting success cannot keep a coalesced rule")
+        };
+        assert_eq!(second_row.verification_phrase_id(), Some("T08"));
+
+        let second = store
+            .complete_verification_and_commit(
+                &second_row,
+                "The quick chip left the quiet yard before dawn.",
+                &Dictionary::default(),
+                &dictionary_path,
+                42,
+            )
+            .unwrap();
+        let VerificationAdvance::Complete(result, dictionary) = second else {
+            panic!("the second supporting row is terminal")
+        };
+        assert_eq!(
+            result.rules[0].outcome,
+            VerificationRuleOutcome::TargetNotCorrected
+        );
+        assert!(dictionary.entries.is_empty());
     }
 
     #[test]

@@ -383,7 +383,7 @@ pub fn normalize_text(text: &str) -> String {
     normalize_tokens(text).join(" ")
 }
 
-fn normalize_tokens(text: &str) -> Vec<String> {
+pub(crate) fn normalize_tokens(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -846,6 +846,19 @@ mod tests {
             ),
             VerificationAttemptOutcome::HarmfulChange,
             "a trigger away from the tagged span must not manufacture success",
+        );
+
+        assert_eq!(
+            score_verification_attempt(
+                phrase,
+                "T01-P01",
+                "quick chip",
+                "quick ship",
+                "The heavy blue boxes arrived on a quick chip",
+                "The heavy blue boxes arrived on a quick chip",
+            ),
+            VerificationAttemptOutcome::TargetNotCorrected,
+            "an exercised trigger left unchanged by production application is terminal",
         );
     }
 
